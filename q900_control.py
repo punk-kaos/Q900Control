@@ -52,9 +52,20 @@ SYNC = b"\xa5\xa5\xa5\xa5"
 SPECTRUM_PAYLOAD_LENGTH = 516
 SPECTRUM_BINS = 512
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
-# The Q900 FFT view is offset: the CAT-tuned carrier appears 13 kHz to the
-# right of the spectrum midpoint, independent of the selected span.
-FFT_TUNED_OFFSET_HZ = 13_000
+# The Q900 default IQ translation places the CAT-tuned carrier 12 kHz above
+# the stream reference. Use the same reference for the CAT spectrum cursor.
+FFT_TUNED_OFFSET_HZ = 12_000
+
+
+def set_interactive_qos() -> None:
+    """Keep latency-sensitive media workers out of macOS background QoS."""
+    if sys.platform != "darwin":
+        return
+    try:
+        system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        system.pthread_set_qos_class_self_np(0x21, 0)
+    except (AttributeError, OSError):
+        pass
 
 
 class Command(IntEnum):
@@ -377,12 +388,18 @@ class SDRReceiver:
 
     SAMPLE_RATE = 48_000
     BLOCK_FRAMES = 960
+    OUTPUT_PREROLL_BLOCKS = 13
+    SSB_OUTPUT_GAIN = 40.0
+    NFM_OUTPUT_GAIN = 3.0
 
     def __init__(self, output: Callable[[np.ndarray], None]) -> None:
         self._output = output
-        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=200)
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=32)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._input_blocks: deque[np.ndarray] = deque()
+        self._input_words = 0
+        self._input_lock = threading.Lock()
         self.mode = "USB"
         # Q900 network IQ places the CAT-tuned carrier near +12 kHz.
         self.offset_hz = 12_000
@@ -405,6 +422,9 @@ class SDRReceiver:
         if self._thread:
             self._thread.join(timeout=0.5)
         self._thread = None
+        with self._input_lock:
+            self._input_blocks.clear()
+            self._input_words = 0
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
@@ -414,26 +434,46 @@ class SDRReceiver:
     def feed(self, words: np.ndarray) -> None:
         if len(words) < 2:
             return
+        with self._input_lock:
+            self._input_blocks.append(words.copy())
+            self._input_words += len(words)
+            if self._input_words < self.BLOCK_FRAMES * 2:
+                return
+            blocks: list[np.ndarray] = []
+            remaining = self.BLOCK_FRAMES * 2
+            while remaining:
+                block = self._input_blocks.popleft()
+                if len(block) <= remaining:
+                    blocks.append(block)
+                    remaining -= len(block)
+                else:
+                    blocks.append(block[:remaining])
+                    self._input_blocks.appendleft(block[remaining:])
+                    remaining = 0
+            self._input_words -= self.BLOCK_FRAMES * 2
+            block = np.concatenate(blocks)
         try:
-            self._queue.put_nowait(words.copy())
+            self._queue.put_nowait(block)
         except queue.Full:
             pass
 
     def _run(self) -> None:
+        set_interactive_qos()
         phase = 0
-        pending = np.empty(0, dtype=np.int16)
         dc = 0j
+        previous = 1 + 0j
+        fm_dc = 0.0
+        fm_deemphasis = 0.0
+        ssb_previous_input = 0.0
+        ssb_previous_output = 0.0
+        output_pending: deque[np.ndarray] = deque()
         while not self._stop.is_set():
-            while len(pending) < self.BLOCK_FRAMES * 2:
-                try:
-                    words = self._queue.get(timeout=0.1)
-                except queue.Empty:
-                    break
-                if words is not None:
-                    pending = np.concatenate((pending, words))
-            if len(pending) < self.BLOCK_FRAMES * 2:
+            try:
+                words = self._queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
-            words, pending = pending[: self.BLOCK_FRAMES * 2], pending[self.BLOCK_FRAMES * 2 :]
+            if words is None:
+                continue
             iq = words.astype(np.float32).reshape(-1, 2) / 32768.0
             if self.swap_iq:
                 iq = iq[:, ::-1]
@@ -445,15 +485,47 @@ class SDRReceiver:
             signal -= dc
             count = len(signal)
             index = np.arange(count) + phase
-            direction = 1 if self.mode == "USB" else -1
-            shift = np.exp(-1j * direction * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
+            if self.mode == "NFM":
+                shift = np.exp(-1j * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
+                baseband = signal * shift
+                discriminator = np.angle(baseband * np.conj(np.concatenate(([previous], baseband[:-1]))))
+                previous = baseband[-1]
+                # Remove residual carrier offset, then apply a 300 us
+                # de-emphasis filter for intelligible narrow-FM audio.
+                fm_dc = 0.995 * fm_dc + 0.005 * float(np.mean(discriminator))
+                discriminator -= fm_dc
+                alpha = 1 - np.exp(-1 / (self.SAMPLE_RATE * 300e-6))
+                audio = np.empty_like(discriminator)
+                for sample_index, sample in enumerate(discriminator):
+                    fm_deemphasis += alpha * (sample - fm_deemphasis)
+                    audio[sample_index] = fm_deemphasis
+                audio = np.convolve(audio, np.ones(7, dtype=np.float32) / 7, mode="same")
+                gain = self.NFM_OUTPUT_GAIN
+            else:
+                # USB and LSB share the same suppressed-carrier frequency.
+                # Sideband content is carried in the complex samples around
+                # it, so both must translate the selected carrier to zero.
+                shift = np.exp(-1j * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
+                baseband = signal * shift
+                audio = np.convolve(baseband.real, np.ones(9, dtype=np.float32) / 9, mode="same")
+                # Remove residual carrier/DC without suppressing voice tones.
+                highpassed = np.empty_like(audio)
+                for sample_index, sample in enumerate(audio):
+                    filtered = sample - ssb_previous_input + 0.995 * ssb_previous_output
+                    ssb_previous_input = sample
+                    ssb_previous_output = filtered
+                    highpassed[sample_index] = filtered
+                audio = highpassed
+                gain = self.SSB_OUTPUT_GAIN
             phase += count
-            baseband = signal * shift
-            # A short moving average suppresses the residual image/high audio.
-            audio = np.convolve(baseband.real, np.ones(9, dtype=np.float32) / 9, mode="same")
-            rms = float(np.sqrt(np.mean(audio * audio)))
-            gain = min(200.0, 0.18 / max(rms, 0.0009))
-            self._output(np.clip(audio * gain, -1.0, 1.0).astype(np.float32))
+            # Keep SDR audio gain fixed. The previous block AGC could clamp
+            # weak USB/LSB speech after a stronger packet and sound as if the
+            # decoder was repeatedly muted.
+            output_pending.append(np.clip(audio * gain, -1.0, 1.0).astype(np.float32))
+            # macOS can defer a backgrounded GUI process for substantially
+            # longer than a normal UDP gap. Keep 260 ms ahead of playback.
+            if len(output_pending) >= self.OUTPUT_PREROLL_BLOCKS:
+                self._output(output_pending.popleft())
 
 
 class NetworkAudioMonitor:
@@ -523,6 +595,7 @@ class NetworkAudioMonitor:
         self._stream.start()
 
         def receive_loop() -> None:
+            set_interactive_qos()
             while not self._stop.is_set() and self._socket:
                 try:
                     packet, peer = self._socket.recvfrom(65_535)
@@ -1498,6 +1571,9 @@ class SpectrumWaterfall(QWidget):
         self._drag_center = 0
         self._last_drag_send = 0.0
         self._dragged = False
+        self._sdr_active = False
+        self._sdr_offset_hz = 0
+        self._sdr_mode = "USB"
 
     def set_state(self, state: RadioState) -> None:
         tuned_hz = state.vfo_b_hz if state.active_vfo_b else state.vfo_a_hz
@@ -1513,6 +1589,12 @@ class SpectrumWaterfall(QWidget):
         self._rows = self._rows[:140]
         self.update()
 
+    def set_sdr(self, active: bool, offset_hz: int, mode: str) -> None:
+        self._sdr_active = active
+        self._sdr_offset_hz = offset_hz
+        self._sdr_mode = mode
+        self.update()
+
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#080b10"))
@@ -1521,6 +1603,8 @@ class SpectrumWaterfall(QWidget):
         self._draw_spectrum(painter, width, spectrum_height)
         self._draw_waterfall(painter, width, spectrum_height, height - spectrum_height)
         self._draw_tuned_cursor(painter, width, height)
+        if self._sdr_active:
+            self._draw_sdr_cursor(painter, width, height)
 
     def _draw_tuned_cursor(self, painter: QPainter, width: int, height: int) -> None:
         """Render the active VFO and its mode-specific receive passband."""
@@ -1542,6 +1626,27 @@ class SpectrumWaterfall(QWidget):
         painter.setPen(QColor("#06111b"))
         label_x = min(max(8, int(x + 10)), max(8, width - 210))
         painter.drawText(label_x, 18, f"{self._mode.name}  {self._tuned_hz / 1_000_000:.3f} MHz")
+
+    def _draw_sdr_cursor(self, painter: QPainter, width: int, height: int) -> None:
+        """Show the host-selected I/Q signal relative to the CAT frequency."""
+        frequency = self._tuned_hz + self._sdr_offset_hz
+        x = self._frequency_to_x(frequency, width)
+        if self._sdr_mode == "NFM":
+            low_hz, high_hz = -2_500, 2_500
+        elif self._sdr_mode == "LSB":
+            low_hz, high_hz = -2_800, -300
+        else:
+            low_hz, high_hz = 300, 2_800
+        left = self._frequency_to_x(frequency + low_hz, width)
+        right = self._frequency_to_x(frequency + high_hz, width)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(238, 174, 99, 62))
+        painter.drawRect(QRectF(min(left, right), 0, max(2, abs(right - left)), height))
+        painter.setPen(QPen(QColor("#eeae63"), 2))
+        painter.drawLine(round(x), 0, round(x), height)
+        painter.setPen(QColor("#eeae63"))
+        label_x = min(max(8, int(x + 10)), max(8, width - 230))
+        painter.drawText(label_x, 38, f"SDR {self._sdr_mode}  {self._sdr_offset_hz:+d} Hz")
 
     def _frequency_to_x(self, frequency_hz: int, width: int) -> float:
         return width / 2 + (frequency_hz - self._display_center_hz) * width / self._span_hz
@@ -1594,17 +1699,22 @@ class SpectrumWaterfall(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for spectrum frames")
             return
         row_height = max(1, height // min(len(self._rows), 100))
-        image = QImage(width, row_height, QImage.Format.Format_RGB32)
+        # Build a one-pixel-high scanline and let Qt scale it vertically. The
+        # former nested Python loop wrote every pixel in each row height and
+        # can consume a full core while SDR media is active.
+        image = QImage(width, 1, QImage.Format.Format_RGB32)
         for row_number, bins in enumerate(self._rows[:height // row_height]):
             minimum, maximum = min(bins), max(bins)
             spread = max(1, maximum - minimum)
             for x in range(width):
                 index = int(x * (len(bins) - 1) / max(1, width - 1))
                 intensity = (bins[index] - minimum) * 255 // spread
-                color = QColor(intensity, 80 + intensity * 175 // 255, 40 + (255 - intensity) * 150 // 255)
-                for y in range(row_height):
-                    image.setPixelColor(x, y, color)
-            painter.drawImage(0, top + row_number * row_height, image)
+                image.setPixel(
+                    x,
+                    0,
+                    0xFF000000 | (intensity << 16) | ((80 + intensity * 175 // 255) << 8) | (40 + (255 - intensity) * 150 // 255),
+                )
+            painter.drawImage(QRectF(0, top + row_number * row_height, width, row_height), image)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.MouseButton.LeftButton:
@@ -1659,6 +1769,8 @@ class MainWindow(QMainWindow):
         self._last_ptt_network_status = ""
         self._sdr_active = False
         self._sdr_switch_pending = False
+        self._sdr_restore_pending = False
+        self._sdr_restore_attempts = 0
         self._ptt_meter_timer = QTimer(self)
         self._ptt_meter_timer.setInterval(100)
         self._ptt_meter_timer.timeout.connect(self.update_ptt_meter)
@@ -1668,6 +1780,9 @@ class MainWindow(QMainWindow):
         self._sdr_switch_timer = QTimer(self)
         self._sdr_switch_timer.setSingleShot(True)
         self._sdr_switch_timer.timeout.connect(self.sdr_switch_timeout)
+        self._sdr_restore_timer = QTimer(self)
+        self._sdr_restore_timer.setSingleShot(True)
+        self._sdr_restore_timer.timeout.connect(self.retry_normal_audio)
         self.tiles: dict[str, ControlTile] = {}
         self.signals.state_changed.connect(self.update_state)
         self.signals.connection_error.connect(self.show_error)
@@ -1739,7 +1854,7 @@ class MainWindow(QMainWindow):
         self.sdr_button = QPushButton("SDR Off")
         self.sdr_button.clicked.connect(self.toggle_sdr)
         self.sdr_mode_selector = QComboBox()
-        self.sdr_mode_selector.addItems(("USB", "LSB"))
+        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM"))
         self.sdr_mode_selector.setVisible(False)
         self.sdr_mode_selector.currentTextChanged.connect(self.set_sdr_mode)
         self.sdr_offset = QSpinBox()
@@ -1901,7 +2016,7 @@ class MainWindow(QMainWindow):
             self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
 
     def start_ptt(self) -> None:
-        if self._sdr_active or self._sdr_switch_pending:
+        if self._sdr_active or self._sdr_switch_pending or self._sdr_restore_pending:
             self.status.setText("SDR transmit is unavailable until the network IQ TX format is validated.")
             return
         if self._ptt_source == "rigctl":
@@ -2016,7 +2131,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.start_audio_default)
 
     def handle_rigctl_ptt(self, active: bool) -> None:
-        if active and (self._sdr_active or self._sdr_switch_pending):
+        if active and (self._sdr_active or self._sdr_switch_pending or self._sdr_restore_pending):
             self.rigctl_status.setText("rigctl: SDR IQ transmit is not implemented")
             return
         if not active:
@@ -2128,7 +2243,7 @@ class MainWindow(QMainWindow):
         if self._sdr_active:
             self.exit_sdr()
             return
-        if self._sdr_switch_pending or not self.client.state.connected:
+        if self._sdr_switch_pending or self._sdr_restore_pending or not self.client.state.connected:
             return
         if self.client.state.transport != "TCP":
             self.status.setText("SDR network IQ requires the TCP network transport.")
@@ -2155,9 +2270,11 @@ class MainWindow(QMainWindow):
 
     def set_sdr_mode(self, mode: str) -> None:
         self.sdr_receiver.mode = mode
+        self.spectrum.set_sdr(self._sdr_active, self.sdr_receiver.offset_hz, mode)
 
     def set_sdr_offset(self, offset_hz: int) -> None:
         self.sdr_receiver.offset_hz = offset_hz
+        self.spectrum.set_sdr(self._sdr_active, offset_hz, self.sdr_receiver.mode)
 
     def poll_sdr_stream(self) -> None:
         if not self._sdr_switch_pending:
@@ -2173,6 +2290,7 @@ class MainWindow(QMainWindow):
         self.sdr_button.setText("SDR On")
         self.sdr_mode_selector.setVisible(True)
         self.sdr_offset.setVisible(True)
+        self.spectrum.set_sdr(True, self.sdr_receiver.offset_hz, self.sdr_receiver.mode)
         self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. TX unavailable.")
 
     def sdr_switch_timeout(self) -> None:
@@ -2192,19 +2310,43 @@ class MainWindow(QMainWindow):
         self._sdr_active = False
         self.network_audio.set_iq_handler(None)
         self.sdr_receiver.stop()
+        self._sdr_restore_pending = True
+        self._sdr_restore_attempts = 0
+        self.sdr_button.setText("SDR Restoring")
+        self.sdr_mode_selector.setVisible(False)
+        self.sdr_offset.setVisible(False)
+        self.spectrum.set_sdr(False, 0, self.sdr_receiver.mode)
+        self.status.setText("SDR mode stopped; restoring normal network audio.")
+        self.retry_normal_audio()
+
+    def retry_normal_audio(self) -> None:
+        if not self._sdr_restore_pending:
+            return
+        if self.network_audio.stream_type == 0x67:
+            self._sdr_restore_pending = False
+            self.sdr_button.setText("SDR Off")
+            self.status.setText("Normal network audio restored.")
+            return
+        self._sdr_restore_attempts += 1
         try:
             self.client.set_stream_format(0)
         except (ConnectionError, OSError):
-            pass
-        self.sdr_button.setText("SDR Off")
-        self.sdr_mode_selector.setVisible(False)
-        self.sdr_offset.setVisible(False)
-        self.status.setText("SDR mode stopped; restoring normal network audio.")
+            self._sdr_restore_pending = False
+            self.sdr_button.setText("SDR Off")
+            return
+        if self._sdr_restore_attempts >= 4:
+            self._sdr_restore_pending = False
+            self.sdr_button.setText("SDR Off")
+            self.status.setText("Normal audio was requested but no 0x67 stream was observed.")
+            return
+        self._sdr_restore_timer.start(400)
 
     def toggle_connection(self) -> None:
         if self.client.state.connected or self.client.state.listening:
             if self._sdr_active or self._sdr_switch_pending:
                 self.exit_sdr()
+            self._sdr_restore_timer.stop()
+            self._sdr_restore_pending = False
             self.client.disconnect()
             self.network_audio.stop()
             self._network_audio_timer.stop()
@@ -2439,6 +2581,8 @@ class MainWindow(QMainWindow):
         self.rigctl.stop()
         if self._sdr_active or self._sdr_switch_pending:
             self.exit_sdr()
+        self._sdr_restore_timer.stop()
+        self._sdr_restore_pending = False
         self.stop_ptt()
         self.audio.stop()
         self.network_audio.stop()
