@@ -8,8 +8,12 @@ qpmrpancatweb_1.15.html, the USB CAT reference application.
 from __future__ import annotations
 
 from collections import deque
+import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
+import multiprocessing as mp
+import queue
+import signal
 import socket
 import sys
 import threading
@@ -35,6 +39,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QComboBox,
     QScrollArea,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -82,6 +87,12 @@ class Mode(IntEnum):
     NFM = 6
     DIGI = 7
     PKT = 8
+
+
+# Q900 CAT mode values. The Q900 user manual includes FT8/data/custom-digital
+# operation; DIGI and PKT are valid CAT selections (7 and 8), not merely
+# status values.
+SELECTABLE_MODES = tuple(Mode)
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -238,6 +249,22 @@ class UsbAudioMonitor:
             if device["max_output_channels"] > 0 and "q900" not in device["name"].lower()
         ]
 
+    @staticmethod
+    def microphone_devices() -> list[tuple[int, str]]:
+        return [
+            (index, device["name"])
+            for index, device in enumerate(sd.query_devices())
+            if device["max_input_channels"] > 0 and "q900" not in device["name"].lower()
+        ]
+
+    @staticmethod
+    def q900_output_devices() -> list[tuple[int, str]]:
+        return [
+            (index, device["name"])
+            for index, device in enumerate(sd.query_devices())
+            if device["max_output_channels"] > 0 and "q900" in device["name"].lower()
+        ]
+
     def start(self, input_device: int, output_device: int) -> None:
         self.stop()
         input_info = sd.query_devices(input_device, "input")
@@ -312,6 +339,460 @@ class UsbAudioMonitor:
         return self._input_stream is not None and self._output_stream is not None
 
 
+class NetworkAudioMonitor:
+    """Receive Q900 UDP/8000 signed-16 PCM and play it locally."""
+
+    SAMPLE_RATE = 48_000
+    BLOCK_SIZE = 960
+
+    def __init__(self, signals: RadioSignals) -> None:
+        self.signals = signals
+        self._socket: socket.socket | None = None
+        self._stream: sd.OutputStream | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._queue: deque[np.ndarray] = deque()
+        self._queue_lock = threading.Lock()
+        self._queued_frames = 0
+        self._packet_count = 0
+        self._last_packet_size = 0
+        self._format = "waiting"
+        self._stats_lock = threading.Lock()
+
+    def start(self, output_device: int, port: int = 8000) -> None:
+        self.stop()
+        output_info = sd.query_devices(output_device, "output")
+        output_channels = min(2, output_info["max_output_channels"])
+        max_queued_frames = self.SAMPLE_RATE * 2
+
+        def output_callback(outdata, frames, timing, status):  # type: ignore[no-untyped-def]
+            outdata.fill(0)
+            offset = 0
+            with self._queue_lock:
+                while offset < frames and self._queue:
+                    block = self._queue[0]
+                    count = min(frames - offset, len(block))
+                    outdata[offset : offset + count, :] = block[:count, np.newaxis]
+                    offset += count
+                    if count == len(block):
+                        self._queue.popleft()
+                    else:
+                        self._queue[0] = block[count:]
+                    self._queued_frames -= count
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Do not share UDP/8000. On macOS SO_REUSEADDR allows another local
+        # process to bind the same port and consume the radio's datagrams.
+        # A bind conflict must fail visibly rather than leave us "waiting".
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            sock.close()
+            raise
+        sock.settimeout(0.25)
+        self._socket = sock
+        self._stop.clear()
+        self._stream = sd.OutputStream(
+            device=output_device,
+            samplerate=self.SAMPLE_RATE,
+            blocksize=self.BLOCK_SIZE,
+            channels=output_channels,
+            dtype="float32",
+            latency="high",
+            callback=output_callback,
+        )
+        self._stream.start()
+
+        def receive_loop() -> None:
+            while not self._stop.is_set() and self._socket:
+                try:
+                    packet, peer = self._socket.recvfrom(65_535)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                # Network captures show Q900 RX audio as a 7-byte CAT-like
+                # envelope, a 16-bit control word (44), then 48 duplicated
+                # stereo S16LE frames: A5 A5 A5 A5 67 21 00 2C 00 ...
+                if packet.startswith(b"\xa5\xa5\xa5\xa5\x67\x21\x00"):
+                    packet = packet[9:]
+                    audio_format = "Q900 framed S16LE stereo"
+                else:
+                    audio_format = "S16LE"
+                # Also accept unframed PCM from firmware variants.
+                if len(packet) < 2 or len(packet) % 2:
+                    continue
+                samples = np.frombuffer(packet, dtype="<i2").astype(np.float32) / 32768.0
+                if audio_format.startswith("Q900 framed") or (len(packet) >= 3_840 and len(packet) % 4 == 0):
+                    mono = samples.reshape(-1, 2).mean(axis=1)
+                    if not audio_format.startswith("Q900 framed"):
+                        audio_format += " stereo"
+                else:
+                    mono = samples
+                    audio_format += " mono"
+                with self._queue_lock:
+                    while self._queue and self._queued_frames + len(mono) > max_queued_frames:
+                        self._queued_frames -= len(self._queue.popleft())
+                    self._queue.append(mono)
+                    self._queued_frames += len(mono)
+                with self._stats_lock:
+                    first_packet = self._packet_count == 0
+                    self._packet_count += 1
+                    self._last_packet_size = len(packet)
+                    self._format = audio_format
+                if first_packet:
+                    print(
+                        f"Q900 UDP audio from {peer[0]}:{peer[1]}: {len(packet)} bytes, "
+                        f"{audio_format}, first 16 bytes={packet[:16].hex()}"
+                    )
+
+        self._thread = threading.Thread(target=receive_loop, name="q900-udp-audio", daemon=True)
+        self._thread.start()
+        self.signals.audio_state_changed.emit(f"Network RX audio: listening on UDP/{port} -> {output_info['name']}")
+
+    def stop(self) -> None:
+        self._stop.set()
+        sock, self._socket = self._socket, None
+        if sock:
+            sock.close()
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+        self._stream = None
+        with self._queue_lock:
+            self._queue.clear()
+            self._queued_frames = 0
+        with self._stats_lock:
+            self._packet_count = 0
+            self._last_packet_size = 0
+            self._format = "waiting"
+
+    def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
+        """Send from the same UDP/8000 socket used by the Q900 media session."""
+        if not self._socket:
+            raise ConnectionError("Network audio receiver is not running")
+        self._socket.sendto(payload, target)
+
+    @property
+    def socket(self) -> socket.socket:
+        if not self._socket:
+            raise ConnectionError("Network audio receiver is not running")
+        return self._socket
+
+    @property
+    def running(self) -> bool:
+        return self._stream is not None
+
+    @property
+    def status(self) -> str:
+        with self._stats_lock:
+            if not self._packet_count:
+                return "UDP waiting"
+            return f"UDP {self._packet_count} pkts  {self._last_packet_size} B  {self._format}"
+
+
+def udp_audio_sender(
+    audio_queue: mp.Queue,
+    udp_socket: socket.socket,
+    target: tuple[str, int],
+    stop: mp.Event,
+    keyed: mp.Event,
+    packets: mp.Value,
+    underruns: mp.Value,
+    late_ms: mp.Value,
+) -> None:
+    """Pace TX audio outside the GUI process and its contended Python GIL."""
+    packet_bytes = 96 * 2 * 2
+    preroll_bytes = 9_600 * 2 * 2
+    pending = bytearray()
+    while len(pending) < preroll_bytes and not stop.is_set():
+        try:
+            pending.extend(audio_queue.get(timeout=0.05))
+        except queue.Empty:
+            continue
+    while not keyed.wait(0.05) and not stop.is_set():
+        pass
+
+    period = 0.002
+
+    def next_payload() -> bytes:
+        while len(pending) < packet_bytes:
+            try:
+                # Capture arrives in 20 ms blocks through a feeder pipe. At
+                # block boundaries get_nowait() can race that feeder and turn
+                # available audio into a false underrun. Wait no longer than
+                # one native packet before substituting silence.
+                pending.extend(audio_queue.get(timeout=period))
+            except queue.Empty:
+                break
+        if len(pending) < packet_bytes:
+            underruns.value += 1
+            return bytes(packet_bytes)
+        payload = bytes(pending[:packet_bytes])
+        del pending[:packet_bytes]
+        return payload
+
+    # Put 20 ms into the radio's TX ring before paced delivery. The host wake
+    # delay is below one packet now, but the firmware/network path still has
+    # several milliseconds of variance that a two-packet cushion cannot hide.
+    for _ in range(10):
+        try:
+            udp_socket.sendto(next_payload(), target)
+        except OSError:
+            pass
+        packets.value += 1
+
+    mach_time = mach_wait = None
+    ticks_per_second = 0.0
+    if sys.platform == "darwin":
+        class TimebaseInfo(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+        try:
+            system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            info = TimebaseInfo()
+            system.mach_timebase_info(ctypes.byref(info))
+            system.mach_absolute_time.restype = ctypes.c_uint64
+            system.mach_wait_until.argtypes = (ctypes.c_uint64,)
+            system.pthread_set_qos_class_self_np(0x21, 0)
+            mach_time = system.mach_absolute_time
+            mach_wait = system.mach_wait_until
+            ticks_per_second = 1_000_000_000 * info.denom / info.numer
+        except (AttributeError, OSError):
+            mach_time = mach_wait = None
+    deadline = mach_time() if mach_time else time.monotonic()
+    while not stop.is_set():
+        try:
+            udp_socket.sendto(next_payload(), target)
+        except OSError:
+            pass
+        packets.value += 1
+        if mach_time and mach_wait:
+            deadline += int(period * ticks_per_second)
+            mach_wait(deadline)
+            lateness = (mach_time() - deadline) / ticks_per_second
+            late_ms.value = max(late_ms.value, lateness * 1000)
+            if lateness > period:
+                # Do not catch up by sending several packets back-to-back.
+                # A stale Mach deadline drains the capture buffer and makes
+                # one delayed wake appear as a run of audio underruns.
+                deadline = mach_time()
+        else:
+            deadline += period
+            remaining = deadline - time.monotonic()
+            if remaining < 0:
+                late_ms.value = max(late_ms.value, -remaining * 1000)
+                deadline = time.monotonic()
+            else:
+                time.sleep(remaining)
+
+
+class TransmitAudioRouter:
+    """Route computer microphone audio to USB playback or the network audio port."""
+
+    SAMPLE_RATE = 48_000
+    BLOCK_SIZE = 960
+    NETWORK_SAMPLE_RATE = 48_000
+    NETWORK_PACKET_SAMPLES = 96
+    NETWORK_PREROLL_SAMPLES = 9_600
+
+    def __init__(self, signals: RadioSignals) -> None:
+        self.signals = signals
+        self._input_stream: sd.InputStream | None = None
+        self._output_stream: sd.OutputStream | None = None
+        self._udp_socket: socket.socket | None = None
+        self._udp_target: tuple[str, int] | None = None
+        self._level = 0.0
+        self._level_lock = threading.Lock()
+        self._output_level = 0.0
+        self._usb_queue: deque[np.ndarray] = deque()
+        self._usb_queue_lock = threading.Lock()
+        self._usb_queued_frames = 0
+        self._mp = mp.get_context("spawn")
+        self._udp_queue: mp.Queue | None = None
+        self._udp_sender: mp.Process | None = None
+        self._udp_stop: mp.Event | None = None
+        self._udp_keyed: mp.Event | None = None
+        self._udp_packets: mp.Value | None = None
+        self._udp_underruns: mp.Value | None = None
+        self._udp_late_ms: mp.Value | None = None
+        self._udp_clipped: mp.Value | None = None
+
+    def start_usb(self, microphone: int, q900_output: int) -> None:
+        self.stop()
+        output_info = sd.query_devices(q900_output, "output")
+        output_channels = min(2, output_info["max_output_channels"])
+        max_queued_frames = self.SAMPLE_RATE * 2
+
+        def input_callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
+            with self._level_lock:
+                self._level = float(np.max(np.abs(indata[:, 0])))
+            mono = indata[:, 0].copy()
+            with self._usb_queue_lock:
+                while self._usb_queue and self._usb_queued_frames + frames > max_queued_frames:
+                    self._usb_queued_frames -= len(self._usb_queue.popleft())
+                self._usb_queue.append(mono)
+                self._usb_queued_frames += frames
+
+        def output_callback(outdata, frames, timing, status):  # type: ignore[no-untyped-def]
+            outdata.fill(0)
+            offset = 0
+            with self._usb_queue_lock:
+                while offset < frames and self._usb_queue:
+                    block = self._usb_queue[0]
+                    count = min(frames - offset, len(block))
+                    # q900_output is explicitly the Q900 speaker/output
+                    # interface (device 0 here), not its microphone input.
+                    outdata[offset : offset + count, :] = block[:count, np.newaxis]
+                    offset += count
+                    if count == len(block):
+                        self._usb_queue.popleft()
+                    else:
+                        self._usb_queue[0] = block[count:]
+                    self._usb_queued_frames -= count
+            with self._level_lock:
+                self._output_level = float(np.max(np.abs(outdata[:, 0])))
+
+        self._input_stream = sd.InputStream(
+            device=microphone,
+            samplerate=self.SAMPLE_RATE,
+            blocksize=self.BLOCK_SIZE,
+            channels=1,
+            dtype="float32",
+            latency="high",
+            callback=input_callback,
+        )
+        self._output_stream = sd.OutputStream(
+            device=q900_output,
+            samplerate=self.SAMPLE_RATE,
+            blocksize=self.BLOCK_SIZE,
+            channels=output_channels,
+            dtype="float32",
+            latency="high",
+            callback=output_callback,
+        )
+        self._output_stream.start()
+        self._input_stream.start()
+        self.signals.audio_state_changed.emit("PTT audio: microphone -> Q900 USB speaker/output")
+
+    def start_udp(self, microphone: int, target: tuple[str, int], network_audio: NetworkAudioMonitor) -> None:
+        self.stop()
+        self._udp_target = target
+        self._udp_queue = self._mp.Queue(maxsize=50)
+        self._udp_stop = self._mp.Event()
+        self._udp_keyed = self._mp.Event()
+        self._udp_packets = self._mp.Value("L", 0, lock=False)
+        self._udp_underruns = self._mp.Value("L", 0, lock=False)
+        self._udp_late_ms = self._mp.Value("d", 0.0, lock=False)
+        self._udp_clipped = self._mp.Value("L", 0, lock=False)
+
+        def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
+            pcm = np.clip(indata[:, 0], -1, 1)
+            with self._level_lock:
+                self._level = float(np.max(np.abs(pcm)))
+                self._output_level = self._level
+            if self._udp_clipped and np.any(np.abs(pcm) >= 0.98):
+                self._udp_clipped.value += 1
+            samples = (pcm * 32767).astype("<i2")
+            # Firmware consumes 48 kHz stereo frames from the network ring.
+            # Duplicate mono microphone samples as interleaved L/R words.
+            payload = np.repeat(samples, 2).tobytes()
+            if self._udp_queue:
+                try:
+                    self._udp_queue.put_nowait(payload)
+                except queue.Full:
+                    pass
+
+        self._input_stream = sd.InputStream(
+            device=microphone,
+            samplerate=self.NETWORK_SAMPLE_RATE,
+            blocksize=self.BLOCK_SIZE,
+            channels=1,
+            dtype="float32",
+            latency="high",
+            callback=callback,
+        )
+        self._udp_sender = self._mp.Process(
+            target=udp_audio_sender,
+            args=(
+                self._udp_queue,
+                network_audio.socket,
+                target,
+                self._udp_stop,
+                self._udp_keyed,
+                self._udp_packets,
+                self._udp_underruns,
+                self._udp_late_ms,
+            ),
+            name="q900-udp-tx",
+            daemon=True,
+        )
+        self._udp_sender.start()
+        self._input_stream.start()
+        time.sleep(self.NETWORK_PREROLL_SAMPLES / self.NETWORK_SAMPLE_RATE)
+        self.signals.audio_state_changed.emit(
+            f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} (48 kHz stereo S16LE)"
+        )
+
+    def network_ptt_started(self) -> None:
+        """Start UDP delivery only after CAT PTT has enabled the radio's TX ring."""
+        if self._udp_keyed:
+            self._udp_keyed.set()
+
+    def stop(self) -> None:
+        if self._udp_stop:
+            self._udp_stop.set()
+        if self._udp_keyed:
+            self._udp_keyed.set()
+        if self._udp_sender:
+            self._udp_sender.join(timeout=0.5)
+            if self._udp_sender.is_alive():
+                self._udp_sender.terminate()
+                self._udp_sender.join(timeout=0.5)
+        self._udp_sender = None
+        self._udp_queue = None
+        self._udp_stop = None
+        self._udp_keyed = None
+        for stream in (self._input_stream, self._output_stream):
+            if stream:
+                stream.stop()
+                stream.close()
+        self._input_stream = None
+        self._output_stream = None
+        if self._udp_socket:
+            self._udp_socket.close()
+        self._udp_socket = None
+        self._udp_target = None
+        with self._usb_queue_lock:
+            self._usb_queue.clear()
+            self._usb_queued_frames = 0
+        with self._level_lock:
+            self._level = 0.0
+            self._output_level = 0.0
+
+    @property
+    def running(self) -> bool:
+        return self._input_stream is not None or self._output_stream is not None
+
+    @property
+    def level(self) -> float:
+        with self._level_lock:
+            return self._level
+
+    @property
+    def output_level(self) -> float:
+        with self._level_lock:
+            return self._output_level
+
+    @property
+    def network_status(self) -> str:
+        packets = self._udp_packets.value if self._udp_packets else 0
+        underruns = self._udp_underruns.value if self._udp_underruns else 0
+        late_ms = self._udp_late_ms.value if self._udp_late_ms else 0.0
+        clipped = self._udp_clipped.value if self._udp_clipped else 0
+        return f"UDP {packets} pkts  gaps {underruns}  late {late_ms:.1f} ms  clip {clipped}"
+
+
 class RadioClient:
     """TCP/8081 control listener using source-backed CAT commands only."""
 
@@ -320,6 +801,8 @@ class RadioClient:
         self.signals = signals
         self._listener: socket.socket | None = None
         self._socket: socket.socket | serial.Serial | None = None
+        self._tcp_peer: tuple[str, int] | None = None
+        self._digital_mode_locks: dict[bool, Mode] = {}
         self._stop = threading.Event()
         self._listen_thread: threading.Thread | None = None
         self._thread: threading.Thread | None = None
@@ -348,14 +831,16 @@ class RadioClient:
 
     def disconnect(self) -> None:
         self._stop.set()
+        self._digital_mode_locks.clear()
         listener, self._listener = self._listener, None
         if listener:
             listener.close()
         sock, self._socket = self._socket, None
+        self._tcp_peer = None
         if sock:
             try:
                 if isinstance(sock, socket.socket):
-                    self._write(sock, set_ptt(False))
+                    self._write(sock, encode_frame(Command.PTT, b"\x01"))
                 else:
                     # Keep hardware PTT lines inactive before closing USB.
                     sock.dtr = False
@@ -375,6 +860,15 @@ class RadioClient:
                 raise ConnectionError("Radio is not connected")
             self._write(self._socket, data)
 
+    def set_ptt(self, active: bool) -> None:
+        self.send(encode_frame(Command.PTT, bytes((0 if active else 1,))))
+        self.state.ptt = active
+        self._emit_state()
+
+    @property
+    def udp_target(self) -> tuple[str, int] | None:
+        return (self._tcp_peer[0], 8000) if self._tcp_peer else None
+
     @staticmethod
     def _write(transport: socket.socket | serial.Serial, data: bytes) -> None:
         if isinstance(transport, socket.socket):
@@ -387,15 +881,26 @@ class RadioClient:
         try:
             # Do not open pyserial with its default modem-control state: some
             # Q900 USB adapters wire DTR/RTS to PTT and can key on open.
-            device = serial.Serial(port=None, baudrate=baudrate, timeout=0.1, write_timeout=1)
-            device.rtscts = False
-            device.dsrdtr = False
+            device = serial.Serial(
+                port=None,
+                baudrate=baudrate,
+                timeout=0.1,
+                write_timeout=1,
+                rtscts=False,
+                dsrdtr=False,
+            )
+            # These states are applied by pyserial as part of open(), before
+            # the receive loop emits a single CAT request.
             device.dtr = False
             device.rts = False
             device.port = port
             device.open()
             device.dtr = False
             device.rts = False
+            # Let the USB CDC line state settle before CAT polling begins.
+            # This avoids a status/spectrum request racing the radio's serial
+            # control-line transition immediately after enumeration.
+            time.sleep(0.25)
             self._socket = device
             self._stop.clear()
             self.state.transport = "USB"
@@ -412,7 +917,7 @@ class RadioClient:
     def _accept_loop(self) -> None:
         while not self._stop.is_set() and self._listener:
             try:
-                sock, _address = self._listener.accept()
+                sock, address = self._listener.accept()
             except TimeoutError:
                 continue
             except OSError:
@@ -422,10 +927,11 @@ class RadioClient:
             if previous:
                 previous.close()
             sock.settimeout(0.1)
+            self._tcp_peer = (address[0], 8000)
             try:
                 # The reference application releases PTT repeatedly on every connection.
                 for _ in range(5):
-                    self.send(set_ptt(False))
+                    self.send(encode_frame(Command.PTT, b"\x01"))
                     time.sleep(0.06)
             except OSError:
                 sock.close()
@@ -452,10 +958,18 @@ class RadioClient:
         self._emit_state()
 
     def set_mode(self, mode: Mode) -> None:
+        active_vfo_b = self.state.active_vfo_b
         if self.state.active_vfo_b:
             self.state.vfo_b_mode = mode
         else:
             self.state.vfo_a_mode = mode
+        # Firmware status reporting is unstable in DIGI/PKT, despite the
+        # radio retaining the selected mode. Keep the operator's selection
+        # from being overwritten by those transient status bytes.
+        if mode in (Mode.DIGI, Mode.PKT):
+            self._digital_mode_locks[active_vfo_b] = mode
+        else:
+            self._digital_mode_locks.pop(active_vfo_b, None)
         self.send(encode_frame(Command.SET_MODES, bytes((self.state.vfo_a_mode, self.state.vfo_b_mode))))
         self._emit_state()
 
@@ -530,13 +1044,25 @@ class RadioClient:
         if len(data) < 24:
             return
         self.state.ptt = data[0] == 1
-        if data[1] in Mode._value2member_map_:
-            self.state.vfo_a_mode = Mode(data[1])
-        if data[2] in Mode._value2member_map_:
-            self.state.vfo_b_mode = Mode(data[2])
+        for vfo_b, raw_mode in ((False, data[1]), (True, data[2])):
+            if raw_mode not in Mode._value2member_map_:
+                continue
+            reported_mode = Mode(raw_mode)
+            # A digital mode selected before the app connects must receive the
+            # same protection as one selected in the UI. Once it appears in a
+            # status frame, ignore the firmware's subsequent unstable bytes.
+            if reported_mode in (Mode.DIGI, Mode.PKT):
+                self._digital_mode_locks.setdefault(vfo_b, reported_mode)
+            mode = self._digital_mode_locks.get(vfo_b, reported_mode)
+            if vfo_b:
+                self.state.vfo_b_mode = mode
+            else:
+                self.state.vfo_a_mode = mode
         self.state.vfo_a_hz = int.from_bytes(data[3:7], "big")
         self.state.vfo_b_hz = int.from_bytes(data[7:11], "big")
-        self.state.active_vfo_b = data[11] == 1
+        # The reference client does not apply status[11] as an A/B update.
+        # Firmware reports this byte inconsistently during digital modes; the
+        # active VFO is changed only by the operator's CAT command.
         self.state.span_index = data[16] if data[16] < len(SPAN_HZ) else 2
         self.state.utc = tuple(data[18:21])
         self.state.status_flags = data[21]
@@ -557,6 +1083,11 @@ QPushButton#tile:hover { background: #122334; border-color: #42c7d7; }
 QPushButton#tile:disabled { border-color: #183142; color: #687780; }
 QLabel#tileTitle { color: #dce4ed; font: 700 16px "Menlo"; }
 QLabel#tileValue { color: #50d9e8; font: 14px "Menlo"; }
+QFrame#sliderTile { background: #0d1724; border: 1px solid #1f6b82; border-radius: 7px; min-width: 105px; min-height: 58px; }
+QFrame#sliderTile:hover { background: #122334; border-color: #42c7d7; }
+QSlider::groove:horizontal { background: #07111f; height: 5px; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: #34b8ca; border-radius: 2px; }
+QSlider::handle:horizontal { background: #dce5ed; width: 12px; margin: -5px 0; border-radius: 6px; }
 QLineEdit#frequency { background: #061322; border: none; color: #65eaf2; font: 700 52px "Menlo"; letter-spacing: 7px; padding: 8px; }
 QLabel#meterLabel { color: #aab0bc; font-size: 13px; }
 QFrame#bar { background: #111317; border-radius: 4px; min-height: 10px; }
@@ -617,6 +1148,32 @@ class ControlTile(QPushButton):
 
     def set_value(self, value: str) -> None:
         self.value.setText(value)
+
+
+class SliderTile(QFrame):
+    def __init__(self, title: str, value: int, minimum: int, maximum: int) -> None:
+        super().__init__()
+        self.setObjectName("sliderTile")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        title_label = QLabel(title)
+        title_label.setObjectName("tileTitle")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.value = QLabel(str(value))
+        self.value.setObjectName("tileValue")
+        self.value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(minimum, maximum)
+        self.slider.setValue(value)
+        self.slider.valueChanged.connect(lambda number: self.value.setText(str(number)))
+        layout.addWidget(title_label)
+        layout.addWidget(self.value)
+        layout.addWidget(self.slider)
+
+    def set_value(self, value: str) -> None:
+        number = int(value)
+        if number != self.slider.value():
+            self.slider.setValue(number)
 
 
 class SpectrumWaterfall(QWidget):
@@ -790,7 +1347,16 @@ class MainWindow(QMainWindow):
         self.signals = RadioSignals()
         self.client = RadioClient(self.signals)
         self.audio = UsbAudioMonitor(self.signals)
-        self.tiles: dict[str, ControlTile] = {}
+        self.network_audio = NetworkAudioMonitor(self.signals)
+        self.tx_audio = TransmitAudioRouter(self.signals)
+        self._last_ptt_network_status = ""
+        self._ptt_meter_timer = QTimer(self)
+        self._ptt_meter_timer.setInterval(100)
+        self._ptt_meter_timer.timeout.connect(self.update_ptt_meter)
+        self._network_audio_timer = QTimer(self)
+        self._network_audio_timer.setInterval(500)
+        self._network_audio_timer.timeout.connect(self.update_network_audio_status)
+        self.tiles: dict[str, ControlTile | SliderTile] = {}
         self.signals.state_changed.connect(self.update_state)
         self.signals.connection_error.connect(self.show_error)
         self.signals.audio_state_changed.connect(self.show_audio_state)
@@ -814,6 +1380,7 @@ class MainWindow(QMainWindow):
         self.spectrum.tune_requested.connect(self.tune)
         layout.addWidget(self.spectrum, 1)
         layout.addLayout(self._audio_panel())
+        layout.addLayout(self._ptt_panel())
         self.status = QLabel("Listener stopped. Start TCP listening or connect over USB.")
         self.status.setStyleSheet("color: #9aaab5; padding: 4px 10px")
         layout.addWidget(self.status)
@@ -845,7 +1412,7 @@ class MainWindow(QMainWindow):
         header.addWidget(self.connect_button)
         header.addStretch()
         self.mode_selector = QComboBox()
-        for mode in Mode:
+        for mode in SELECTABLE_MODES:
             self.mode_selector.addItem(mode.name, mode)
         self.mode_selector.currentIndexChanged.connect(self.select_mode)
         self.mode_selector.setToolTip("Operating mode for the active VFO")
@@ -893,9 +1460,16 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
         for index, (title, value, action) in enumerate(controls):
-            tile = ControlTile(title, value)
+            if isinstance(action, tuple):
+                _field, _command, minimum, maximum = action
+                tile = SliderTile(title, int(value) if value.isdigit() else minimum, minimum, maximum)
+                tile.slider.sliderReleased.connect(
+                    lambda action=action, tile=tile: self.set_slider_control(action, tile.slider.value())
+                )
+            else:
+                tile = ControlTile(title, value)
             self.tiles[title] = tile
-            if action is not None:
+            if action is not None and not isinstance(action, tuple):
                 tile.clicked.connect(lambda checked=False, action=action: self.activate_control(action))
             grid.addWidget(tile, index // 14, index % 14)
         area = QScrollArea()
@@ -921,8 +1495,37 @@ class MainWindow(QMainWindow):
         audio.addWidget(self.audio_output)
         audio.addWidget(refresh)
         audio.addWidget(self.audio_button)
+        self.network_audio_status = QLabel("")
+        self.network_audio_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
+        audio.addWidget(self.network_audio_status)
         audio.addStretch()
         return audio
+
+    def _ptt_panel(self) -> QHBoxLayout:
+        panel = QHBoxLayout()
+        panel.addWidget(QLabel("PTT Microphone"))
+        self.microphone = QComboBox()
+        self.tx_output = QComboBox()
+        self.refresh_transmit_devices()
+        refresh = QPushButton("Refresh PTT Devices")
+        refresh.clicked.connect(self.refresh_transmit_devices)
+        self.ptt_button = QPushButton("Hold To Talk")
+        self.ptt_button.setStyleSheet(
+            "background: #132535; border: 1px solid #3689a3; border-radius: 10px; "
+            "color: #dce5ed; font: 700 16px Menlo; padding: 10px 24px;"
+        )
+        self.ptt_button.pressed.connect(self.start_ptt)
+        self.ptt_button.released.connect(self.stop_ptt)
+        self.ptt_level = QLabel("MIC 0%  TX 0%")
+        self.ptt_level.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
+        panel.addWidget(self.microphone)
+        panel.addWidget(QLabel("USB TX device"))
+        panel.addWidget(self.tx_output)
+        panel.addWidget(refresh)
+        panel.addWidget(self.ptt_button)
+        panel.addWidget(self.ptt_level)
+        panel.addStretch()
+        return panel
 
     def refresh_audio_devices(self) -> None:
         current_input = self.audio_input.currentData() if hasattr(self, "audio_input") else None
@@ -944,11 +1547,109 @@ class MainWindow(QMainWindow):
         if current_output is not None:
             self.audio_output.setCurrentIndex(max(0, self.audio_output.findData(current_output)))
 
+    def refresh_transmit_devices(self) -> None:
+        current_microphone = self.microphone.currentData() if hasattr(self, "microphone") else None
+        current_output = self.tx_output.currentData() if hasattr(self, "tx_output") else None
+        if not hasattr(self, "microphone"):
+            return
+        self.microphone.clear()
+        self.tx_output.clear()
+        for index, name in UsbAudioMonitor.microphone_devices():
+            self.microphone.addItem(name, index)
+        for index, name in UsbAudioMonitor.q900_output_devices():
+            self.tx_output.addItem(name, index)
+        if self.microphone.count() == 0:
+            self.microphone.addItem("No computer microphone found", None)
+        if self.tx_output.count() == 0:
+            self.tx_output.addItem("No Q900 USB TX device found", None)
+        if current_microphone is not None:
+            self.microphone.setCurrentIndex(max(0, self.microphone.findData(current_microphone)))
+        if current_output is not None:
+            self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
+
+    def start_ptt(self) -> None:
+        if not self.client.state.connected:
+            self.status.setText("Connect the radio before using PTT.")
+            return
+        microphone = self.microphone.currentData()
+        if microphone is None:
+            self.status.setText("Select a computer microphone before using PTT.")
+            return
+        try:
+            if self.client.state.transport == "USB":
+                output = self.tx_output.currentData()
+                if output is None:
+                    self.status.setText("Select the Q900 USB transmit-audio device before using PTT.")
+                    return
+                self.tx_audio.start_usb(microphone, output)
+            else:
+                target = self.client.udp_target
+                if target is None:
+                    self.status.setText("No inbound radio address is available for network PTT audio.")
+                    return
+                if not self.network_audio.running:
+                    self.status.setText("Start network receive audio before using network PTT.")
+                    return
+                self.tx_audio.start_udp(microphone, target, self.network_audio)
+            # Audio must be established before the transmitter is keyed.
+            self.client.set_ptt(True)
+            if self.client.state.transport == "TCP":
+                self.tx_audio.network_ptt_started()
+            self._ptt_meter_timer.start()
+            self.ptt_button.setText("TRANSMITTING")
+            self.ptt_button.setStyleSheet(
+                "background: #6b1e2b; border: 1px solid #ff667a; border-radius: 10px; "
+                "color: white; font: 700 16px Menlo; padding: 10px 24px;"
+            )
+        except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
+            self.tx_audio.stop()
+            self.show_error(f"PTT: {error}")
+
+    def stop_ptt(self) -> None:
+        if not self.tx_audio.running and not self.client.state.ptt:
+            return
+        try:
+            # Release first so no microphone data continues after unkeying.
+            self.client.set_ptt(False)
+        except (ConnectionError, OSError, serial.SerialException):
+            pass
+        if self.client.state.transport == "TCP":
+            self._last_ptt_network_status = self.tx_audio.network_status
+        self.tx_audio.stop()
+        self._ptt_meter_timer.stop()
+        self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_status}")
+        self.ptt_button.setText("Hold To Talk")
+        self.ptt_button.setStyleSheet(
+            "background: #132535; border: 1px solid #3689a3; border-radius: 10px; "
+            "color: #dce5ed; font: 700 16px Menlo; padding: 10px 24px;"
+        )
+
+    def update_ptt_meter(self) -> None:
+        level = min(1.0, getattr(self.tx_audio, "level", 0.0))
+        output_level = min(1.0, getattr(self.tx_audio, "output_level", 0.0))
+        status = self.tx_audio.network_status if self.client.state.transport == "TCP" else ""
+        self.ptt_level.setText(
+            f"MIC {round(level * 100):d}%  TX {round(output_level * 100):d}%  {status}"
+        )
+
     def toggle_audio(self) -> None:
-        if self.audio.running:
+        if self.audio.running or self.network_audio.running:
             self.audio.stop()
+            self.network_audio.stop()
             self.audio_button.setText("Start Audio")
-            self.status.setText("USB audio monitor stopped.")
+            self.status.setText("Receive audio monitor stopped.")
+            return
+        if self.client.state.transport == "TCP":
+            output_device = self.audio_output.currentData()
+            if output_device is None:
+                self.status.setText("Select a local speaker output.")
+                return
+            try:
+                self.network_audio.start(output_device)
+                self.audio_button.setText("Stop Audio")
+                self._network_audio_timer.start()
+            except (OSError, sd.PortAudioError) as error:
+                self.show_error(f"Network audio: {error}")
             return
         input_device = self.audio_input.currentData()
         output_device = self.audio_output.currentData()
@@ -962,21 +1663,38 @@ class MainWindow(QMainWindow):
             self.show_error(f"Audio: {error}")
 
     def start_audio_default(self) -> None:
-        """Start receive monitoring when the Q900 and a local speaker exist."""
-        if self.audio_input.currentData() is None or self.audio_output.currentData() is None:
+        """Start USB or network receive monitoring after a radio connects."""
+        if self.audio_output.currentData() is None:
             return
         try:
-            self.audio.start(self.audio_input.currentData(), self.audio_output.currentData())
+            if self.client.state.transport == "TCP":
+                self.network_audio.start(self.audio_output.currentData())
+                self._network_audio_timer.start()
+            elif self.audio_input.currentData() is not None:
+                self.audio.start(self.audio_input.currentData(), self.audio_output.currentData())
+            else:
+                return
             self.audio_button.setText("Stop Audio")
-        except sd.PortAudioError as error:
-            self.status.setText(f"USB audio not started: {error}")
+        except (OSError, sd.PortAudioError) as error:
+            self.status.setText(f"Receive audio not started: {error}")
 
     def show_audio_state(self, message: str) -> None:
         self.status.setText(message)
 
+    def update_network_audio_status(self) -> None:
+        if self.network_audio.running:
+            self.network_audio_status.setText(self.network_audio.status)
+        else:
+            self._network_audio_timer.stop()
+            self.network_audio_status.setText("")
+
     def toggle_connection(self) -> None:
         if self.client.state.connected or self.client.state.listening:
             self.client.disconnect()
+            self.network_audio.stop()
+            self._network_audio_timer.stop()
+            self.network_audio_status.setText("")
+            self.audio_button.setText("Start Audio")
         elif self.transport.currentIndex() == 1:
             port = self.serial_port.currentData()
             if not port:
@@ -985,6 +1703,19 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Opening USB serial port {port} at 115200 baud...")
             threading.Thread(target=self.client.connect_usb, args=(port,), daemon=True).start()
         else:
+            output_device = self.audio_output.currentData()
+            if output_device is None:
+                self.status.setText("Select a local speaker output before starting the TCP listener.")
+                return
+            try:
+                # The radio may begin sending UDP as soon as its TCP session
+                # completes. Bind the media port before accepting that session.
+                self.network_audio.start(output_device)
+                self._network_audio_timer.start()
+                self.audio_button.setText("Stop Audio")
+            except (OSError, sd.PortAudioError) as error:
+                self.show_error(f"Network audio: {error}")
+                return
             self.status.setText("Starting TCP/8081 listener. Waiting for radio connection...")
             self.client.start_listener(self.host.text().strip() or "0.0.0.0")
 
@@ -1068,13 +1799,7 @@ class MainWindow(QMainWindow):
             self.status.setText("Wait for the radio to connect before changing controls.")
             return
         try:
-            if isinstance(action, tuple):
-                field, command, minimum, maximum = action
-                current = getattr(self.client.state, field)
-                value, accepted = QInputDialog.getInt(self, field.replace("_", " ").title(), "Value", current, minimum, maximum)
-                if accepted:
-                    self.client.set_value(field, command, value)
-            elif action == "agc":
+            if action == "agc":
                 labels = ("Off", "Fast", "Mid", "Slow", "SSlow", "Auto")
                 self.client.set_value("agc", Command.AGC, (self.client.state.agc + 1) % len(labels))
             elif action == "preamp":
@@ -1095,6 +1820,16 @@ class MainWindow(QMainWindow):
                     self.client.state.cw_sidetone_hz = value
                     self.client.send(encode_frame(Command.CW_SIDETONE, bytes((round(value / 10),))))
                     self.client._emit_state()
+        except (ConnectionError, OSError) as error:
+            self.show_error(str(error))
+
+    def set_slider_control(self, action: tuple[str, Command, int, int], value: int) -> None:
+        if not self.client.state.connected:
+            self.status.setText("Wait for the radio to connect before changing controls.")
+            return
+        field, command, _minimum, _maximum = action
+        try:
+            self.client.set_value(field, command, value)
         except (ConnectionError, OSError) as error:
             self.show_error(str(error))
 
@@ -1130,8 +1865,8 @@ class MainWindow(QMainWindow):
         self.tiles["AGC"].set_value(("Off", "Fast", "Mid", "Slow", "SSlow", "Auto")[state.agc])
         self.tiles["AMP"].set_value("On" if state.preamp else "Off")
         self.tiles["SVOL"].set_value(str(state.speaker_volume))
-        self.tiles["NB"].set_value("Off" if state.noise_blanker == 0 else str(state.noise_blanker))
-        self.tiles["NR"].set_value("Off" if state.noise_reduction == 0 else str(state.noise_reduction))
+        self.tiles["NB"].set_value(str(state.noise_blanker))
+        self.tiles["NR"].set_value(str(state.noise_reduction))
         self.tiles["SPLIT"].set_value("On" if state.split else "Off")
         self.tiles["A/B"].set_value("Frequency B" if state.active_vfo_b else "Frequency A")
         self.tiles["ATU"].set_value(("Off", "On", "Scan")[state.atu])
@@ -1142,12 +1877,23 @@ class MainWindow(QMainWindow):
         self.spectrum.set_state(state)
         if state.connected and state.transport == "USB" and not self.audio.running:
             QTimer.singleShot(0, self.start_audio_default)
+        if state.connected and state.transport == "TCP" and not self.network_audio.running:
+            QTimer.singleShot(0, self.start_audio_default)
+        # Keep UDP/8000 bound while the TCP listener waits for a radio. Some
+        # firmware starts media before the first status frame reaches the UI.
+        if not state.connected and not state.listening and self.network_audio.running:
+            self.network_audio.stop()
+            self._network_audio_timer.stop()
+            self.network_audio_status.setText("")
+            self.audio_button.setText("Start Audio")
 
     def show_error(self, message: str) -> None:
         self.status.setText(f"Connection error: {message}")
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.stop_ptt()
         self.audio.stop()
+        self.network_audio.stop()
         self.client.disconnect()
         event.accept()
 
@@ -1155,6 +1901,17 @@ class MainWindow(QMainWindow):
 def self_test() -> None:
     assert crc16_ccitt(bytes.fromhex("0339")) == 0xEF26
     assert encode_frame(Command.STATUS).hex() == "a5a5a5a5030bf937"
+    assert encode_frame(Command.PTT, b"\x00").hex() == "a5a5a5a504070089cb"
+    assert encode_frame(Command.PTT, b"\x01").hex() == "a5a5a5a504070199ea"
+    captured_audio = bytes.fromhex("a5a5a5a56721002c00") + bytes(192)
+    assert captured_audio.startswith(b"\xa5\xa5\xa5\xa5\x67\x21\x00")
+    assert len(captured_audio[9:]) == 192
+    raw_tx = np.zeros(96, dtype="<i2").tobytes()
+    assert len(raw_tx) == 192
+    mono_tx = np.arange(96, dtype="<i2")
+    stereo_tx = np.repeat(mono_tx, 2)
+    assert len(stereo_tx.tobytes()) == 384
+    assert np.array_equal(stereo_tx[0::2], stereo_tx[1::2])
     cat = encode_frame(Command.SET_FREQUENCIES, b"\x01\x02")
     spectrum_raw = bytes((0, 0)) + bytes(range(256)) * 2
     spectrum = SYNC + spectrum_raw + crc16_ccitt(spectrum_raw).to_bytes(2, "big")
@@ -1180,6 +1937,11 @@ def main() -> None:
     app.setFont(QFont("Arial", 10))
     window = MainWindow()
     window.show()
+    # Let Ctrl+C exit through Qt so it cannot interrupt a paint callback and
+    # leave the audio/network worker cleanup unfinished.
+    signal.signal(signal.SIGINT, lambda _signal, _frame: app.quit())
+    signal_timer = QTimer()
+    signal_timer.start(100)
     sys.exit(app.exec())
 
 
