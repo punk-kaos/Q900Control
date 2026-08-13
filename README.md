@@ -67,6 +67,23 @@ mapping has not been confirmed: `REF`, `DISP`, `RIT`, and `XIT`.
 
 ## Audio And PTT
 
+### SDR Receive
+
+The `SDR Off` button beside the radio mode selector enables network I/Q receive.
+It is independent of the Q900 CAT operating-mode selector. When enabled, the
+app requests the alternate stream and only activates SDR after it observes a
+Q900 UDP packet with type `0x68`.
+
+The SDR mode selector currently provides host-side `USB` and `LSB`
+demodulation. I/Q packets are decoded as 48 kHz interleaved signed PCM16LE
+complex frames and processed on a worker thread before being sent through the
+normal selected speaker or rigctl virtual-microphone output.
+
+SDR is currently **RX only**. PTT is intentionally rejected while SDR is
+active because the Q900 PC-to-radio network I/Q transport has not yet been
+validated. Exiting SDR restores the known normal network audio stream before
+ordinary PTT can be used.
+
 ### GUI PTT
 
 Use `Hold To Talk` with the selected physical microphone.

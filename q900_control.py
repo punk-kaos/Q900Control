@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QScrollArea,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -85,6 +86,7 @@ class Command(IntEnum):
     CW_SIDETONE = 0x31
     CW_TXRX_DELAY = 0x32
     CW_SPEED = 0x35
+    USB_FORMAT = 0x33
     SPECTRUM = 0x39
 
 
@@ -236,6 +238,7 @@ class RadioSignals(QObject):
     audio_state_changed = pyqtSignal(str)
     rigctl_clients_changed = pyqtSignal(int)
     rigctl_ptt_requested = pyqtSignal(bool)
+    sdr_stream_changed = pyqtSignal(bool)
 
 
 class UsbAudioMonitor:
@@ -369,6 +372,90 @@ class UsbAudioMonitor:
         return self._input_stream is not None and self._output_stream is not None
 
 
+class SDRReceiver:
+    """Worker-based 48 kHz complex I/Q USB/LSB receive demodulator."""
+
+    SAMPLE_RATE = 48_000
+    BLOCK_FRAMES = 960
+
+    def __init__(self, output: Callable[[np.ndarray], None]) -> None:
+        self._output = output
+        self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=200)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.mode = "USB"
+        # Q900 network IQ places the CAT-tuned carrier near +12 kHz.
+        self.offset_hz = 12_000
+        self.swap_iq = False
+        self.invert_q = False
+
+    def start(self) -> None:
+        if self._thread:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="q900-sdr-rx", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        self._thread = None
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def feed(self, words: np.ndarray) -> None:
+        if len(words) < 2:
+            return
+        try:
+            self._queue.put_nowait(words.copy())
+        except queue.Full:
+            pass
+
+    def _run(self) -> None:
+        phase = 0
+        pending = np.empty(0, dtype=np.int16)
+        dc = 0j
+        while not self._stop.is_set():
+            while len(pending) < self.BLOCK_FRAMES * 2:
+                try:
+                    words = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    break
+                if words is not None:
+                    pending = np.concatenate((pending, words))
+            if len(pending) < self.BLOCK_FRAMES * 2:
+                continue
+            words, pending = pending[: self.BLOCK_FRAMES * 2], pending[self.BLOCK_FRAMES * 2 :]
+            iq = words.astype(np.float32).reshape(-1, 2) / 32768.0
+            if self.swap_iq:
+                iq = iq[:, ::-1]
+            signal = iq[:, 0] + 1j * iq[:, 1] * (-1 if self.invert_q else 1)
+            # Do not subtract each packet's mean: at a 1 ms packet size that
+            # removes/modulates wanted low-frequency SSB audio. Track only the
+            # slowly varying I/Q DC component across full audio blocks.
+            dc = 0.995 * dc + 0.005 * np.mean(signal)
+            signal -= dc
+            count = len(signal)
+            index = np.arange(count) + phase
+            direction = 1 if self.mode == "USB" else -1
+            shift = np.exp(-1j * direction * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
+            phase += count
+            baseband = signal * shift
+            # A short moving average suppresses the residual image/high audio.
+            audio = np.convolve(baseband.real, np.ones(9, dtype=np.float32) / 9, mode="same")
+            rms = float(np.sqrt(np.mean(audio * audio)))
+            gain = min(200.0, 0.18 / max(rms, 0.0009))
+            self._output(np.clip(audio * gain, -1.0, 1.0).astype(np.float32))
+
+
 class NetworkAudioMonitor:
     """Receive Q900 UDP/8000 signed-16 PCM and play it locally."""
 
@@ -388,6 +475,8 @@ class NetworkAudioMonitor:
         self._last_packet_size = 0
         self._format = "waiting"
         self._stats_lock = threading.Lock()
+        self._iq_handler: Callable[[np.ndarray], None] | None = None
+        self._stream_type = 0
 
     def start(self, output_device: int, port: int = 8000) -> None:
         self.stop()
@@ -441,10 +530,22 @@ class NetworkAudioMonitor:
                     continue
                 except OSError:
                     break
-                # Network captures show Q900 RX audio as a 7-byte CAT-like
-                # envelope, a 16-bit control word (44), then 48 duplicated
-                # stereo S16LE frames: A5 A5 A5 A5 67 21 00 2C 00 ...
-                if packet.startswith(b"\xa5\xa5\xa5\xa5\x67\x21\x00"):
+                packet_type = packet[4] if packet.startswith(SYNC) and len(packet) >= 9 else 0
+                if packet_type == 0x68:
+                    payload = packet[9:]
+                    if len(payload) % 2:
+                        continue
+                    handler = self._iq_handler
+                    if handler:
+                        handler(np.frombuffer(payload, dtype="<i2"))
+                    with self._stats_lock:
+                        self._packet_count += 1
+                        self._last_packet_size = len(payload)
+                        self._format = "Q900 IQ S16LE"
+                        self._stream_type = packet_type
+                    continue
+                # Normal radio audio is duplicated stereo S16LE.
+                if packet_type == 0x67:
                     packet = packet[9:]
                     audio_format = "Q900 framed S16LE stereo"
                 else:
@@ -470,6 +571,7 @@ class NetworkAudioMonitor:
                     self._packet_count += 1
                     self._last_packet_size = len(packet)
                     self._format = audio_format
+                    self._stream_type = packet_type
                 if first_packet:
                     print(
                         f"Q900 UDP audio from {peer[0]}:{peer[1]}: {len(packet)} bytes, "
@@ -479,6 +581,21 @@ class NetworkAudioMonitor:
         self._thread = threading.Thread(target=receive_loop, name="q900-udp-audio", daemon=True)
         self._thread.start()
         self.signals.audio_state_changed.emit(f"Network RX audio: listening on UDP/{port} -> {output_info['name']}")
+
+    def set_iq_handler(self, handler: Callable[[np.ndarray], None] | None) -> None:
+        self._iq_handler = handler
+
+    def enqueue_audio(self, samples: np.ndarray) -> None:
+        with self._queue_lock:
+            while self._queue and self._queued_frames + len(samples) > self.SAMPLE_RATE * 2:
+                self._queued_frames -= len(self._queue.popleft())
+            self._queue.append(samples)
+            self._queued_frames += len(samples)
+
+    @property
+    def stream_type(self) -> int:
+        with self._stats_lock:
+            return self._stream_type
 
     def stop(self) -> None:
         self._stop.set()
@@ -496,6 +613,7 @@ class NetworkAudioMonitor:
             self._packet_count = 0
             self._last_packet_size = 0
             self._format = "waiting"
+            self._stream_type = 0
 
     def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
         """Send from the same UDP/8000 socket used by the Q900 media session."""
@@ -1075,6 +1193,9 @@ class RadioClient:
         self.state.ptt = active
         self._emit_state()
 
+    def set_stream_format(self, value: int) -> None:
+        self.send(encode_frame(Command.USB_FORMAT, bytes((value,))))
+
     @property
     def udp_target(self) -> tuple[str, int] | None:
         return (self._tcp_peer[0], 8000) if self._tcp_peer else None
@@ -1530,17 +1651,23 @@ class MainWindow(QMainWindow):
         self.client = RadioClient(self.signals)
         self.audio = UsbAudioMonitor(self.signals)
         self.network_audio = NetworkAudioMonitor(self.signals)
+        self.sdr_receiver = SDRReceiver(self.network_audio.enqueue_audio)
         self.tx_audio = TransmitAudioRouter(self.signals)
         self.rigctl = RigctlServer(self.client, self.signals)
         self._ptt_source: str | None = None
         self._virtual_receive_active = False
         self._last_ptt_network_status = ""
+        self._sdr_active = False
+        self._sdr_switch_pending = False
         self._ptt_meter_timer = QTimer(self)
         self._ptt_meter_timer.setInterval(100)
         self._ptt_meter_timer.timeout.connect(self.update_ptt_meter)
         self._network_audio_timer = QTimer(self)
         self._network_audio_timer.setInterval(500)
         self._network_audio_timer.timeout.connect(self.update_network_audio_status)
+        self._sdr_switch_timer = QTimer(self)
+        self._sdr_switch_timer.setSingleShot(True)
+        self._sdr_switch_timer.timeout.connect(self.sdr_switch_timeout)
         self.tiles: dict[str, ControlTile] = {}
         self.signals.state_changed.connect(self.update_state)
         self.signals.connection_error.connect(self.show_error)
@@ -1609,6 +1736,22 @@ class MainWindow(QMainWindow):
         self.mode_selector.currentIndexChanged.connect(self.select_mode)
         self.mode_selector.setToolTip("Operating mode for the active VFO")
         header.addWidget(self.mode_selector)
+        self.sdr_button = QPushButton("SDR Off")
+        self.sdr_button.clicked.connect(self.toggle_sdr)
+        self.sdr_mode_selector = QComboBox()
+        self.sdr_mode_selector.addItems(("USB", "LSB"))
+        self.sdr_mode_selector.setVisible(False)
+        self.sdr_mode_selector.currentTextChanged.connect(self.set_sdr_mode)
+        self.sdr_offset = QSpinBox()
+        self.sdr_offset.setRange(-24_000, 24_000)
+        self.sdr_offset.setSingleStep(100)
+        self.sdr_offset.setSuffix(" Hz")
+        self.sdr_offset.setValue(self.sdr_receiver.offset_hz)
+        self.sdr_offset.valueChanged.connect(self.set_sdr_offset)
+        self.sdr_offset.setVisible(False)
+        header.addWidget(self.sdr_button)
+        header.addWidget(self.sdr_mode_selector)
+        header.addWidget(self.sdr_offset)
         self.vfo_badge = QLabel("A")
         self.vfo_badge.setStyleSheet("background: #477fd5; border-radius: 15px; padding: 8px; font-weight: bold")
         header.addWidget(self.vfo_badge)
@@ -1758,6 +1901,9 @@ class MainWindow(QMainWindow):
             self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
 
     def start_ptt(self) -> None:
+        if self._sdr_active or self._sdr_switch_pending:
+            self.status.setText("SDR transmit is unavailable until the network IQ TX format is validated.")
+            return
         if self._ptt_source == "rigctl":
             self.status.setText("Rigctl virtual audio is transmitting.")
             return
@@ -1870,6 +2016,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.start_audio_default)
 
     def handle_rigctl_ptt(self, active: bool) -> None:
+        if active and (self._sdr_active or self._sdr_switch_pending):
+            self.rigctl_status.setText("rigctl: SDR IQ transmit is not implemented")
+            return
         if not active:
             if self._ptt_source != "rigctl":
                 return
@@ -1975,8 +2124,87 @@ class MainWindow(QMainWindow):
             self._network_audio_timer.stop()
             self.network_audio_status.setText("")
 
+    def toggle_sdr(self) -> None:
+        if self._sdr_active:
+            self.exit_sdr()
+            return
+        if self._sdr_switch_pending or not self.client.state.connected:
+            return
+        if self.client.state.transport != "TCP":
+            self.status.setText("SDR network IQ requires the TCP network transport.")
+            return
+        if self._ptt_source:
+            self.status.setText("Release PTT before entering SDR mode.")
+            return
+        if not self.network_audio.running:
+            self.start_audio_default()
+        if not self.network_audio.running:
+            self.status.setText("Start network receive audio before entering SDR mode.")
+            return
+        try:
+            # 0 selects the known normal stream; 1 requests the alternate IQ
+            # stream. We only enable SDR after observing a 0x68 packet.
+            self.client.set_stream_format(0)
+            self.client.set_stream_format(1)
+            self._sdr_switch_pending = True
+            self.sdr_button.setText("SDR Starting")
+            self._sdr_switch_timer.start(2000)
+            self.poll_sdr_stream()
+        except (ConnectionError, OSError) as error:
+            self.show_error(f"SDR: {error}")
+
+    def set_sdr_mode(self, mode: str) -> None:
+        self.sdr_receiver.mode = mode
+
+    def set_sdr_offset(self, offset_hz: int) -> None:
+        self.sdr_receiver.offset_hz = offset_hz
+
+    def poll_sdr_stream(self) -> None:
+        if not self._sdr_switch_pending:
+            return
+        if self.network_audio.stream_type != 0x68:
+            QTimer.singleShot(50, self.poll_sdr_stream)
+            return
+        self._sdr_switch_timer.stop()
+        self._sdr_switch_pending = False
+        self._sdr_active = True
+        self.network_audio.set_iq_handler(self.sdr_receiver.feed)
+        self.sdr_receiver.start()
+        self.sdr_button.setText("SDR On")
+        self.sdr_mode_selector.setVisible(True)
+        self.sdr_offset.setVisible(True)
+        self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. TX unavailable.")
+
+    def sdr_switch_timeout(self) -> None:
+        if not self._sdr_switch_pending:
+            return
+        self._sdr_switch_pending = False
+        self.sdr_button.setText("SDR Off")
+        try:
+            self.client.set_stream_format(0)
+        except (ConnectionError, OSError):
+            pass
+        self.status.setText("SDR IQ stream was not detected; restored normal audio.")
+
+    def exit_sdr(self) -> None:
+        self._sdr_switch_timer.stop()
+        self._sdr_switch_pending = False
+        self._sdr_active = False
+        self.network_audio.set_iq_handler(None)
+        self.sdr_receiver.stop()
+        try:
+            self.client.set_stream_format(0)
+        except (ConnectionError, OSError):
+            pass
+        self.sdr_button.setText("SDR Off")
+        self.sdr_mode_selector.setVisible(False)
+        self.sdr_offset.setVisible(False)
+        self.status.setText("SDR mode stopped; restoring normal network audio.")
+
     def toggle_connection(self) -> None:
         if self.client.state.connected or self.client.state.listening:
+            if self._sdr_active or self._sdr_switch_pending:
+                self.exit_sdr()
             self.client.disconnect()
             self.network_audio.stop()
             self._network_audio_timer.stop()
@@ -2209,6 +2437,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.rigctl.stop()
+        if self._sdr_active or self._sdr_switch_pending:
+            self.exit_sdr()
         self.stop_ptt()
         self.audio.stop()
         self.network_audio.stop()
