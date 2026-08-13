@@ -38,6 +38,8 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QScrollArea,
     QSlider,
     QVBoxLayout,
@@ -59,7 +61,13 @@ class Command(IntEnum):
     SET_FREQUENCIES = 0x09
     SET_MODES = 0x0A
     STATUS = 0x0B
+    POWER = 0x0C
     SPEAKER_VOLUME = 0x0D
+    HEADPHONE_VOLUME = 0x0E
+    MIC_GAIN = 0x0F
+    COMPRESSOR = 0x10
+    TX_BASS = 0x11
+    TX_TREBLE = 0x12
     RF_GAIN = 0x13
     IF_GAIN = 0x14
     SQUELCH = 0x15
@@ -69,10 +77,13 @@ class Command(IntEnum):
     NOISE_BLANKER = 0x1A
     ACTIVE_VFO = 0x1B
     SPLIT = 0x1C
+    NOISE_BLANKER_THRESHOLD = 0x1F
+    PEAK_THRESHOLD = 0x20
     ATU = 0x21
     SPAN = 0x22
     TX_POWER = 0x2C
     CW_SIDETONE = 0x31
+    CW_TXRX_DELAY = 0x32
     CW_SPEED = 0x35
     SPECTRUM = 0x39
 
@@ -208,6 +219,14 @@ class RadioState:
     tx_power_high: bool = False
     cw_sidetone_hz: int = 600
     cw_speed: int = 26
+    headphone_volume: int = 0
+    mic_gain: int = 6
+    compressor: int = 9
+    tx_bass: int = 20
+    tx_treble: int = 20
+    noise_blanker_threshold: int = 7
+    peak_threshold: int = 15
+    cw_txrx_delay: int = 100
 
 
 class RadioSignals(QObject):
@@ -215,6 +234,8 @@ class RadioSignals(QObject):
     spectrum_received = pyqtSignal(bytes)
     connection_error = pyqtSignal(str)
     audio_state_changed = pyqtSignal(str)
+    rigctl_clients_changed = pyqtSignal(int)
+    rigctl_ptt_requested = pyqtSignal(bool)
 
 
 class UsbAudioMonitor:
@@ -264,6 +285,15 @@ class UsbAudioMonitor:
             for index, device in enumerate(sd.query_devices())
             if device["max_output_channels"] > 0 and "q900" in device["name"].lower()
         ]
+
+    @staticmethod
+    def named_device(name: str, direction: str) -> int | None:
+        key = name.casefold()
+        for index, device in enumerate(sd.query_devices()):
+            channels = device[f"max_{direction}_channels"]
+            if channels > 0 and device["name"].casefold() == key:
+                return index
+        return None
 
     def start(self, input_device: int, output_device: int) -> None:
         self.stop()
@@ -793,6 +823,186 @@ class TransmitAudioRouter:
         return f"UDP {packets} pkts  gaps {underruns}  late {late_ms:.1f} ms  clip {clipped}"
 
 
+class RigctlServer:
+    """Local Hamlib rigctl subset backed by the application's radio state."""
+
+    LEVELS = {
+        "AF": ("speaker_volume", Command.SPEAKER_VOLUME, 0, 30),
+        "RF": ("rf_gain", Command.RF_GAIN, 0, 100),
+        "SQL": ("squelch", Command.SQUELCH, 0, 20),
+        "MICGAIN": ("mic_gain", Command.MIC_GAIN, 0, 100),
+    }
+
+    def __init__(self, client: RadioClient, signals: RadioSignals) -> None:
+        self.client = client
+        self.signals = signals
+        self._listener: socket.socket | None = None
+        self._stop = threading.Event()
+        self._clients: set[socket.socket] = set()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def client_count(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def start(self, port: int = 4532) -> None:
+        if self._listener:
+            return
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            listener.bind(("127.0.0.1", port))
+        except OSError:
+            listener.close()
+            raise
+        listener.listen()
+        listener.settimeout(0.5)
+        self._listener = listener
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._accept_loop, name="rigctl", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        listener, self._listener = self._listener, None
+        if listener:
+            listener.close()
+        with self._lock:
+            clients, self._clients = tuple(self._clients), set()
+        for client in clients:
+            client.close()
+        self.signals.rigctl_ptt_requested.emit(False)
+        self.signals.rigctl_clients_changed.emit(0)
+
+    @staticmethod
+    def _reply(sock: socket.socket, *lines: str) -> None:
+        sock.sendall(("\n".join(lines) + "\n").encode())
+
+    @staticmethod
+    def _ok(sock: socket.socket) -> None:
+        sock.sendall(b"RPRT 0\n")
+
+    @staticmethod
+    def _error(sock: socket.socket, code: int = -11) -> None:
+        sock.sendall(f"RPRT {code}\n".encode())
+
+    def _accept_loop(self) -> None:
+        while not self._stop.is_set() and self._listener:
+            try:
+                sock, _address = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            sock.settimeout(0.5)
+            with self._lock:
+                self._clients.add(sock)
+                count = len(self._clients)
+            self.signals.rigctl_clients_changed.emit(count)
+            threading.Thread(target=self._client_loop, args=(sock,), name="rigctl-client", daemon=True).start()
+
+    def _client_loop(self, sock: socket.socket) -> None:
+        buffer = bytearray()
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = sock.recv(1024)
+                except TimeoutError:
+                    continue
+                if not data:
+                    break
+                buffer.extend(data)
+                while b"\n" in buffer:
+                    raw, _, buffer = buffer.partition(b"\n")
+                    self._handle(sock, raw.decode(errors="ignore").strip())
+        except OSError:
+            pass
+        finally:
+            with self._lock:
+                self._clients.discard(sock)
+                count = len(self._clients)
+            sock.close()
+            if count == 0:
+                self.signals.rigctl_ptt_requested.emit(False)
+            self.signals.rigctl_clients_changed.emit(count)
+
+    def _handle(self, sock: socket.socket, line: str) -> None:
+        if not line:
+            return
+        if line.startswith("\\"):
+            command, *arguments = line.split(None, 1)
+            args = arguments[0] if arguments else ""
+        else:
+            command, args = line[0], line[1:].strip()
+        state = self.client.state
+        try:
+            if command == "q":
+                self._ok(sock)
+                sock.close()
+            elif command in ("f", "\\get_freq"):
+                self._reply(sock, str(state.vfo_b_hz if state.active_vfo_b else state.vfo_a_hz))
+            elif command in ("F", "\\set_freq"):
+                self.client.tune(int(float(args)))
+                self._ok(sock)
+            elif command in ("m", "\\get_mode"):
+                mode = state.vfo_b_mode if state.active_vfo_b else state.vfo_a_mode
+                rigctl_mode = "FM" if mode == Mode.NFM else mode.name
+                self._reply(sock, rigctl_mode, "2400")
+            elif command in ("M", "\\set_mode"):
+                mode_name = args.split()[0].upper()
+                self.client.set_mode(Mode.NFM if mode_name == "FM" else Mode[mode_name])
+                self._ok(sock)
+            elif command in ("t", "\\get_ptt"):
+                self._reply(sock, str(int(state.ptt)))
+            elif command in ("T", "\\set_ptt"):
+                active = bool(int(args))
+                self.signals.rigctl_ptt_requested.emit(active)
+                self._ok(sock)
+            elif command in ("v", "\\get_vfo"):
+                self._reply(sock, "VFOB" if state.active_vfo_b else "VFOA")
+            elif command in ("V", "\\set_vfo"):
+                self.client.select_vfo(args.upper() == "VFOB")
+                self._ok(sock)
+            elif command in ("s", "\\get_split_vfo"):
+                self._reply(sock, str(int(state.split)), "VFOB" if state.active_vfo_b else "VFOA")
+            elif command in ("S", "\\set_split_vfo"):
+                self.client.set_split(bool(int(args.split()[0])))
+                self._ok(sock)
+            elif command in ("l", "\\get_level") and args.upper() in self.LEVELS:
+                field, _cat, _minimum, _maximum = self.LEVELS[args.upper()]
+                self._reply(sock, str(getattr(state, field)))
+            elif command in ("L", "\\set_level") and len(args.split()) == 2:
+                level, value = args.split()
+                field, cat, minimum, maximum = self.LEVELS[level.upper()]
+                self.client.set_value(field, cat, max(minimum, min(maximum, int(float(value)))))
+                self._ok(sock)
+            elif command == "\\chk_vfo":
+                self._reply(sock, "0")
+            elif command == "\\get_info":
+                self._reply(sock, "Q900 Control rigctl relay")
+            elif command == "\\dump_state":
+                modes = "0x1ff"
+                self._reply(
+                    sock,
+                    "0", "2", "0",
+                    f"100000.000000 2000000000.000000 {modes} -1 -1 0x1 0x1",
+                    "0 0 0 0 0 0 0",
+                    f"100000.000000 2000000000.000000 {modes} 1 100 0x1 0x1",
+                    "0 0 0 0 0 0 0",
+                    *[f"{modes} {step}" for step in (1, 10, 100, 1000, 5000, 10000)],
+                    "0 0",
+                    "0xc 2400", "0x2 500", "0x1 6000", "0x20 12000", "0 0",
+                    "0", "0", "0", "0", "", "", "0x0", "0x0", "0x1", "0x0", "0x0", "0x0",
+                    "vfo_ops=0x0", "ptt_type=0x1", "done",
+                )
+            else:
+                self._ok(sock)
+        except (ConnectionError, KeyError, OSError, ValueError):
+            self._error(sock)
+
+
 class RadioClient:
     """TCP/8081 control listener using source-backed CAT commands only."""
 
@@ -1083,8 +1293,6 @@ QPushButton#tile:hover { background: #122334; border-color: #42c7d7; }
 QPushButton#tile:disabled { border-color: #183142; color: #687780; }
 QLabel#tileTitle { color: #dce4ed; font: 700 16px "Menlo"; }
 QLabel#tileValue { color: #50d9e8; font: 14px "Menlo"; }
-QFrame#sliderTile { background: #0d1724; border: 1px solid #1f6b82; border-radius: 7px; min-width: 105px; min-height: 58px; }
-QFrame#sliderTile:hover { background: #122334; border-color: #42c7d7; }
 QSlider::groove:horizontal { background: #07111f; height: 5px; border-radius: 2px; }
 QSlider::sub-page:horizontal { background: #34b8ca; border-radius: 2px; }
 QSlider::handle:horizontal { background: #dce5ed; width: 12px; margin: -5px 0; border-radius: 6px; }
@@ -1148,32 +1356,6 @@ class ControlTile(QPushButton):
 
     def set_value(self, value: str) -> None:
         self.value.setText(value)
-
-
-class SliderTile(QFrame):
-    def __init__(self, title: str, value: int, minimum: int, maximum: int) -> None:
-        super().__init__()
-        self.setObjectName("sliderTile")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
-        title_label = QLabel(title)
-        title_label.setObjectName("tileTitle")
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.value = QLabel(str(value))
-        self.value.setObjectName("tileValue")
-        self.value.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(minimum, maximum)
-        self.slider.setValue(value)
-        self.slider.valueChanged.connect(lambda number: self.value.setText(str(number)))
-        layout.addWidget(title_label)
-        layout.addWidget(self.value)
-        layout.addWidget(self.slider)
-
-    def set_value(self, value: str) -> None:
-        number = int(value)
-        if number != self.slider.value():
-            self.slider.setValue(number)
 
 
 class SpectrumWaterfall(QWidget):
@@ -1349,6 +1531,9 @@ class MainWindow(QMainWindow):
         self.audio = UsbAudioMonitor(self.signals)
         self.network_audio = NetworkAudioMonitor(self.signals)
         self.tx_audio = TransmitAudioRouter(self.signals)
+        self.rigctl = RigctlServer(self.client, self.signals)
+        self._ptt_source: str | None = None
+        self._virtual_receive_active = False
         self._last_ptt_network_status = ""
         self._ptt_meter_timer = QTimer(self)
         self._ptt_meter_timer.setInterval(100)
@@ -1356,10 +1541,12 @@ class MainWindow(QMainWindow):
         self._network_audio_timer = QTimer(self)
         self._network_audio_timer.setInterval(500)
         self._network_audio_timer.timeout.connect(self.update_network_audio_status)
-        self.tiles: dict[str, ControlTile | SliderTile] = {}
+        self.tiles: dict[str, ControlTile] = {}
         self.signals.state_changed.connect(self.update_state)
         self.signals.connection_error.connect(self.show_error)
         self.signals.audio_state_changed.connect(self.show_audio_state)
+        self.signals.rigctl_clients_changed.connect(self.update_rigctl_status)
+        self.signals.rigctl_ptt_requested.connect(self.handle_rigctl_ptt)
         left_tune = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
         left_tune.setContext(Qt.ShortcutContext.ApplicationShortcut)
         left_tune.activated.connect(lambda: self.keyboard_tune(-1))
@@ -1384,6 +1571,11 @@ class MainWindow(QMainWindow):
         self.status = QLabel("Listener stopped. Start TCP listening or connect over USB.")
         self.status.setStyleSheet("color: #9aaab5; padding: 4px 10px")
         layout.addWidget(self.status)
+        try:
+            self.rigctl.start()
+        except OSError as error:
+            self.rigctl_status.setText(f"rigctl: unavailable ({error})")
+            self.rigctl_status.setStyleSheet("color: #eeae63; font: 13px Menlo")
 
     def _top_panel(self) -> QHBoxLayout:
         top = QHBoxLayout()
@@ -1443,16 +1635,18 @@ class MainWindow(QMainWindow):
 
     def _control_bank(self) -> QScrollArea:
         controls = [
-            ("POWER", "Power", None), ("RFG", "48", ("rf_gain", Command.RF_GAIN, 0, 100)),
+            ("POWER", "Wake", "power"), ("RFG", "48", ("rf_gain", Command.RF_GAIN, 0, 100)),
             ("IFG", "50", ("if_gain", Command.IF_GAIN, 0, 80)), ("SQL", "0", ("squelch", Command.SQUELCH, 0, 20)),
             ("AGC", "Slow", "agc"), ("AMP", "Off", "preamp"), ("SVOL", "0", ("speaker_volume", Command.SPEAKER_VOLUME, 0, 30)),
-            ("HVOL", "0", None), ("MIC", "6", None), ("CMP", "9", None), ("BAS", "20", None),
-            ("TRB", "20", None), ("SPLIT", "Off", "split"), ("A/B", "Frequency A", "vfo"),
+            ("HVOL", "0", ("headphone_volume", Command.HEADPHONE_VOLUME, 5, 80)), ("MIC", "6", ("mic_gain", Command.MIC_GAIN, 0, 100)),
+            ("CMP", "9", ("compressor", Command.COMPRESSOR, 0, 14)), ("BAS", "20", ("tx_bass", Command.TX_BASS, 0, 40)),
+            ("TRB", "20", ("tx_treble", Command.TX_TREBLE, 0, 40)), ("SPLIT", "Off", "split"), ("A/B", "Frequency A", "vfo"),
             ("NB", "Off", ("noise_blanker", Command.NOISE_BLANKER, 0, 5)), ("NR", "On", ("noise_reduction", Command.NOISE_REDUCTION, 0, 5)),
-            ("NBL", "7", None), ("PEAK", "15", None), ("ATU", "Off", "atu"), ("SPAN", "12 kHz", "span"),
+            ("NBL", "7", ("noise_blanker_threshold", Command.NOISE_BLANKER_THRESHOLD, 0, 255)),
+            ("PEAK", "15", ("peak_threshold", Command.PEAK_THRESHOLD, 0, 255)), ("ATU", "Off", "atu"), ("SPAN", "12 kHz", "span"),
             ("REF", "17", None), ("PWR", "Low", "tx_power"), ("TONE", "600 Hz", "tone"),
             ("SPEED", "26", ("cw_speed", Command.CW_SPEED, 5, 48)), ("DISP", "Display", None),
-            ("RIT", "0", None), ("XIT", "0", None), ("LTIME", "100", None),
+            ("RIT", "0", None), ("XIT", "0", None), ("LTIME", "100", ("cw_txrx_delay", Command.CW_TXRX_DELAY, 0, 255)),
         ]
         content = QWidget()
         grid = QGridLayout(content)
@@ -1460,16 +1654,9 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
         for index, (title, value, action) in enumerate(controls):
-            if isinstance(action, tuple):
-                _field, _command, minimum, maximum = action
-                tile = SliderTile(title, int(value) if value.isdigit() else minimum, minimum, maximum)
-                tile.slider.sliderReleased.connect(
-                    lambda action=action, tile=tile: self.set_slider_control(action, tile.slider.value())
-                )
-            else:
-                tile = ControlTile(title, value)
+            tile = ControlTile(title, value)
             self.tiles[title] = tile
-            if action is not None and not isinstance(action, tuple):
+            if action is not None:
                 tile.clicked.connect(lambda checked=False, action=action: self.activate_control(action))
             grid.addWidget(tile, index // 14, index % 14)
         area = QScrollArea()
@@ -1498,6 +1685,9 @@ class MainWindow(QMainWindow):
         self.network_audio_status = QLabel("")
         self.network_audio_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
         audio.addWidget(self.network_audio_status)
+        self.rigctl_status = QLabel("rigctl: listening on 127.0.0.1:4532")
+        self.rigctl_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
+        audio.addWidget(self.rigctl_status)
         audio.addStretch()
         return audio
 
@@ -1568,6 +1758,9 @@ class MainWindow(QMainWindow):
             self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
 
     def start_ptt(self) -> None:
+        if self._ptt_source == "rigctl":
+            self.status.setText("Rigctl virtual audio is transmitting.")
+            return
         if not self.client.state.connected:
             self.status.setText("Connect the radio before using PTT.")
             return
@@ -1593,6 +1786,7 @@ class MainWindow(QMainWindow):
                 self.tx_audio.start_udp(microphone, target, self.network_audio)
             # Audio must be established before the transmitter is keyed.
             self.client.set_ptt(True)
+            self._ptt_source = "gui"
             if self.client.state.transport == "TCP":
                 self.tx_audio.network_ptt_started()
             self._ptt_meter_timer.start()
@@ -1606,7 +1800,7 @@ class MainWindow(QMainWindow):
             self.show_error(f"PTT: {error}")
 
     def stop_ptt(self) -> None:
-        if not self.tx_audio.running and not self.client.state.ptt:
+        if self._ptt_source != "gui":
             return
         try:
             # Release first so no microphone data continues after unkeying.
@@ -1616,6 +1810,7 @@ class MainWindow(QMainWindow):
         if self.client.state.transport == "TCP":
             self._last_ptt_network_status = self.tx_audio.network_status
         self.tx_audio.stop()
+        self._ptt_source = None
         self._ptt_meter_timer.stop()
         self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_status}")
         self.ptt_button.setText("Hold To Talk")
@@ -1623,6 +1818,98 @@ class MainWindow(QMainWindow):
             "background: #132535; border: 1px solid #3689a3; border-radius: 10px; "
             "color: #dce5ed; font: 700 16px Menlo; padding: 10px 24px;"
         )
+
+    def update_rigctl_status(self, count: int) -> None:
+        if count:
+            label = f"rigctl: {count} client{'s' if count != 1 else ''}, virtual audio ready"
+            color = "#71db8d"
+            self.start_virtual_receive_audio()
+        else:
+            label = "rigctl: listening on 127.0.0.1:4532"
+            color = "#8ba0ae"
+            if self._ptt_source == "rigctl":
+                self.handle_rigctl_ptt(False)
+            self.stop_virtual_receive_audio()
+        self.rigctl_status.setText(label)
+        self.rigctl_status.setStyleSheet(f"color: {color}; font: 13px Menlo")
+
+    def start_virtual_receive_audio(self) -> None:
+        if not self.client.state.connected or self._virtual_receive_active:
+            return
+        output = UsbAudioMonitor.named_device("Virtual Desktop Mic", "output")
+        if output is None:
+            self.rigctl_status.setText("rigctl: client connected, Virtual Desktop Mic unavailable")
+            return
+        try:
+            # The standard receive monitor auto-starts on the selected local
+            # speaker. A rigctl client explicitly takes ownership of RX and
+            # redirects that stream into its virtual microphone device.
+            self.audio.stop()
+            self.network_audio.stop()
+            self._network_audio_timer.stop()
+            if self.client.state.transport == "TCP":
+                self.network_audio.start(output)
+                self._network_audio_timer.start()
+            else:
+                input_device = self.audio_input.currentData()
+                if input_device is None:
+                    return
+                self.audio.start(input_device, output)
+            self._virtual_receive_active = True
+        except (OSError, sd.PortAudioError) as error:
+            self.rigctl_status.setText(f"rigctl virtual RX: {error}")
+
+    def stop_virtual_receive_audio(self) -> None:
+        if not self._virtual_receive_active:
+            return
+        self.audio.stop()
+        self.network_audio.stop()
+        self._network_audio_timer.stop()
+        self._virtual_receive_active = False
+        if self.client.state.connected:
+            QTimer.singleShot(0, self.start_audio_default)
+
+    def handle_rigctl_ptt(self, active: bool) -> None:
+        if not active:
+            if self._ptt_source != "rigctl":
+                return
+            try:
+                self.client.set_ptt(False)
+            except (ConnectionError, OSError, serial.SerialException):
+                pass
+            self.tx_audio.stop()
+            self._ptt_source = None
+            return
+        if self._ptt_source:
+            return
+        if not self.client.state.connected:
+            return
+        microphone = UsbAudioMonitor.named_device("Virtual Desktop Speakers", "input")
+        if microphone is None:
+            self.rigctl_status.setText("rigctl: Virtual Desktop Speakers unavailable")
+            return
+        try:
+            if self.client.state.transport == "TCP":
+                target = self.client.udp_target
+                if target is None:
+                    return
+                if not self.network_audio.running:
+                    self.start_virtual_receive_audio()
+                if not self.network_audio.running:
+                    return
+                self.tx_audio.start_udp(microphone, target, self.network_audio)
+            else:
+                output = self.tx_output.currentData()
+                if output is None:
+                    return
+                self.tx_audio.start_usb(microphone, output)
+            self.client.set_ptt(True)
+            self._ptt_source = "rigctl"
+            if self.client.state.transport == "TCP":
+                self.tx_audio.network_ptt_started()
+        except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
+            self.tx_audio.stop()
+            self.rigctl_status.setText(f"rigctl PTT: {error}")
 
     def update_ptt_meter(self) -> None:
         level = min(1.0, getattr(self.tx_audio, "level", 0.0))
@@ -1799,7 +2086,39 @@ class MainWindow(QMainWindow):
             self.status.setText("Wait for the radio to connect before changing controls.")
             return
         try:
-            if action == "agc":
+            if isinstance(action, tuple):
+                field, command, minimum, maximum = action
+                current = getattr(self.client.state, field)
+                dialog = QDialog(self)
+                dialog.setWindowTitle(field.replace("_", " ").title())
+                layout = QVBoxLayout(dialog)
+                value_label = QLabel(str(current))
+                value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                value_label.setStyleSheet("color: #50d9e8; font: 700 24px Menlo")
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(minimum, maximum)
+                slider.setValue(current)
+                slider.valueChanged.connect(lambda value: value_label.setText(str(value)))
+                buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+                buttons.accepted.connect(dialog.accept)
+                buttons.rejected.connect(dialog.reject)
+                layout.addWidget(value_label)
+                layout.addWidget(slider)
+                layout.addWidget(buttons)
+                if dialog.exec() == QDialog.DialogCode.Accepted:
+                    self.client.set_value(field, command, slider.value())
+            elif action == "power":
+                message = "Put the radio into standby? CAT control will be unavailable until it is woken locally or reconnected."
+                choice, accepted = QInputDialog.getItem(self, "Radio Power", message, ("Wake", "Standby"), 0, False)
+                if not accepted:
+                    return
+                if choice == "Standby":
+                    self.client.send(encode_frame(Command.POWER, b"\x00"))
+                    self.tiles["POWER"].set_value("Standby")
+                else:
+                    self.client.send(encode_frame(Command.POWER, b"\x01"))
+                    self.tiles["POWER"].set_value("Wake")
+            elif action == "agc":
                 labels = ("Off", "Fast", "Mid", "Slow", "SSlow", "Auto")
                 self.client.set_value("agc", Command.AGC, (self.client.state.agc + 1) % len(labels))
             elif action == "preamp":
@@ -1820,16 +2139,6 @@ class MainWindow(QMainWindow):
                     self.client.state.cw_sidetone_hz = value
                     self.client.send(encode_frame(Command.CW_SIDETONE, bytes((round(value / 10),))))
                     self.client._emit_state()
-        except (ConnectionError, OSError) as error:
-            self.show_error(str(error))
-
-    def set_slider_control(self, action: tuple[str, Command, int, int], value: int) -> None:
-        if not self.client.state.connected:
-            self.status.setText("Wait for the radio to connect before changing controls.")
-            return
-        field, command, _minimum, _maximum = action
-        try:
-            self.client.set_value(field, command, value)
         except (ConnectionError, OSError) as error:
             self.show_error(str(error))
 
@@ -1874,6 +2183,14 @@ class MainWindow(QMainWindow):
         self.tiles["PWR"].set_value("High" if state.tx_power_high else "Low")
         self.tiles["TONE"].set_value(f"{state.cw_sidetone_hz} Hz")
         self.tiles["SPEED"].set_value(str(state.cw_speed))
+        self.tiles["HVOL"].set_value(str(state.headphone_volume))
+        self.tiles["MIC"].set_value(str(state.mic_gain))
+        self.tiles["CMP"].set_value(str(state.compressor))
+        self.tiles["BAS"].set_value(str(state.tx_bass))
+        self.tiles["TRB"].set_value(str(state.tx_treble))
+        self.tiles["NBL"].set_value(str(state.noise_blanker_threshold))
+        self.tiles["PEAK"].set_value(str(state.peak_threshold))
+        self.tiles["LTIME"].set_value(str(state.cw_txrx_delay))
         self.spectrum.set_state(state)
         if state.connected and state.transport == "USB" and not self.audio.running:
             QTimer.singleShot(0, self.start_audio_default)
@@ -1891,6 +2208,7 @@ class MainWindow(QMainWindow):
         self.status.setText(f"Connection error: {message}")
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        self.rigctl.stop()
         self.stop_ptt()
         self.audio.stop()
         self.network_audio.stop()
