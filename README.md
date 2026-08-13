@@ -79,10 +79,13 @@ demodulation. I/Q packets are decoded as 48 kHz interleaved signed PCM16LE
 complex frames and processed on a worker thread before being sent through the
 normal selected speaker or rigctl virtual-microphone output.
 
-SDR is currently **RX only**. PTT is intentionally rejected while SDR is
-active because the Q900 PC-to-radio network I/Q transport has not yet been
-validated. Exiting SDR restores the known normal network audio stream before
-ordinary PTT can be used.
+SDR mode also supports experimental network I/Q transmit. Before SDR PTT, the
+application uses the firmware's extended CAT control `F2 29 02 04` to select
+the `DIG I/Q` transmit source, then sends 48 kHz interleaved complex S16LE on
+UDP/8000. Releasing PTT restores the normal `DIGITAL` source with
+`F2 29 02 03`; SDR exit, disconnect, errors, and shutdown also perform this
+restore. Use low power and an external receiver or dummy load while validating
+the inferred I/Q orientation and carrier offset.
 
 ### GUI PTT
 
@@ -91,6 +94,8 @@ Use `Hold To Talk` with the selected physical microphone.
 - USB transport sends microphone audio to the selected Q900 USB TX-output
   device.
 - Network transport sends raw Q900 UDP audio to the radio on UDP/8000.
+- SDR network transport sends 192-byte I/Q packets every 1 ms after selecting
+  the radio's undocumented `DIG I/Q` TX source.
 
 Network TX uses 48 kHz, stereo, signed 16-bit little-endian PCM. A mono
 microphone source is duplicated into interleaved left/right samples. The

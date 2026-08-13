@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QComboBox,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QScrollArea,
@@ -99,6 +100,15 @@ class Command(IntEnum):
     CW_SPEED = 0x35
     USB_FORMAT = 0x33
     SPECTRUM = 0x39
+    EXTENDED_CONTROL = 0xF2
+
+
+class TxAudioSource(IntEnum):
+    MIC = 0
+    LINE_L = 1
+    LINE_R = 2
+    DIGITAL = 3
+    DIGITAL_IQ = 4
 
 
 class Mode(IntEnum):
@@ -833,6 +843,136 @@ def udp_audio_sender(
                 time.sleep(remaining)
 
 
+def udp_iq_sender(
+    audio_queue: mp.Queue,
+    udp_socket: socket.socket,
+    target: tuple[str, int],
+    stop: mp.Event,
+    keyed: mp.Event,
+    packets: mp.Value,
+    underruns: mp.Value,
+    late_ms: mp.Value,
+    clipped: mp.Value,
+    mode: str,
+    offset_hz: int,
+    swap_iq: bool,
+    invert_q: bool,
+) -> None:
+    """Encode 48 kHz microphone audio into inferred raw network I/Q."""
+    frames_per_packet = 48
+    packet_bytes = frames_per_packet * 2 * 2
+    preroll_bytes = 9_600 * 2
+    pending = bytearray()
+    while len(pending) < preroll_bytes and not stop.is_set():
+        try:
+            pending.extend(audio_queue.get(timeout=0.05))
+        except queue.Empty:
+            continue
+    while not keyed.wait(0.05) and not stop.is_set():
+        pass
+
+    phase = 0.0
+    previous = 0.0
+    ssb_dc = 0.0
+    period = 0.001
+    mach_time = mach_wait = None
+    ticks_per_second = 0.0
+    if sys.platform == "darwin":
+        class TimebaseInfo(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+        try:
+            system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            info = TimebaseInfo()
+            system.mach_timebase_info(ctypes.byref(info))
+            system.mach_absolute_time.restype = ctypes.c_uint64
+            system.mach_wait_until.argtypes = (ctypes.c_uint64,)
+            system.pthread_set_qos_class_self_np(0x21, 0)
+            mach_time = system.mach_absolute_time
+            mach_wait = system.mach_wait_until
+            ticks_per_second = 1_000_000_000 * info.denom / info.numer
+        except (AttributeError, OSError):
+            mach_time = mach_wait = None
+
+    def next_payload() -> bytes:
+        nonlocal phase, previous, ssb_dc
+        needed = frames_per_packet * 2
+        while len(pending) < needed:
+            try:
+                pending.extend(audio_queue.get(timeout=period))
+            except queue.Empty:
+                break
+        if len(pending) < needed:
+            underruns.value += 1
+            return bytes(packet_bytes)
+        audio = np.frombuffer(bytes(pending[:needed]), dtype="<i2").astype(np.float32) / 32768.0
+        del pending[:needed]
+        # Remove microphone DC. SSB/AM need envelope headroom, while NFM must
+        # retain enough excursion to reach a usable voice deviation.
+        ssb_dc = 0.995 * ssb_dc + 0.005 * float(np.mean(audio))
+        audio = audio - ssb_dc
+        count = len(audio)
+        if mode in ("USB", "LSB"):
+            # Analytic approximation: real audio plus a one-sample derivative
+            # quadrature term. It is intentionally simple but preserves the
+            # required single-sideband sign relationship for initial testing.
+            ssb_audio = np.clip(audio, -0.45, 0.45)
+            quadrature = np.empty_like(ssb_audio)
+            quadrature[0] = ssb_audio[0] - previous
+            quadrature[1:] = ssb_audio[1:] - ssb_audio[:-1]
+            previous = float(ssb_audio[-1])
+            quadrature *= 12.0
+            baseband = ssb_audio + 1j * (quadrature if mode == "USB" else -quadrature)
+        elif mode == "AM":
+            baseband = 0.55 + np.clip(audio, -0.45, 0.45).astype(np.complex64)
+        else:  # NFM
+            # Consumer microphones are commonly well below full scale. Lift
+            # the modulation to approximately +/-2.25 kHz deviation before
+            # limiting, rather than treating 0.45 full scale as peak FM.
+            fm_audio = np.clip(audio * 3.0, -0.9, 0.9)
+            phase += np.cumsum(fm_audio * (2 * np.pi * 2_500 / 48_000))
+            baseband = np.exp(1j * phase)
+            phase = float(phase[-1] % (2 * np.pi))
+        index = np.arange(count)
+        carrier = np.exp(1j * 2 * np.pi * offset_hz * index / 48_000)
+        iq = np.clip(baseband * carrier * 0.35, -1.0, 1.0)
+        if np.any(np.abs(iq) >= 0.98):
+            clipped.value += 1
+        words = np.empty(count * 2, dtype="<i2")
+        i_words = (iq.real * 32767).astype("<i2")
+        q_words = (iq.imag * 32767).astype("<i2")
+        if invert_q:
+            q_words = -q_words
+        if swap_iq:
+            words[0::2], words[1::2] = q_words, i_words
+        else:
+            words[0::2], words[1::2] = i_words, q_words
+        return words.tobytes()
+
+    deadline = mach_time() if mach_time else time.monotonic()
+    while not stop.is_set():
+        try:
+            udp_socket.sendto(next_payload(), target)
+        except OSError:
+            pass
+        packets.value += 1
+        if mach_time and mach_wait:
+            deadline += int(period * ticks_per_second)
+            mach_wait(deadline)
+            lateness = (mach_time() - deadline) / ticks_per_second
+            late_ms.value = max(late_ms.value, lateness * 1000)
+            if lateness > period:
+                deadline = mach_time()
+        else:
+            deadline += period
+            remaining = deadline - time.monotonic()
+            if remaining < 0:
+                late_ms.value = max(late_ms.value, -remaining * 1000)
+                deadline = time.monotonic()
+            else:
+                time.sleep(remaining)
+
+
 class TransmitAudioRouter:
     """Route computer microphone audio to USB playback or the network audio port."""
 
@@ -978,6 +1118,63 @@ class TransmitAudioRouter:
         time.sleep(self.NETWORK_PREROLL_SAMPLES / self.NETWORK_SAMPLE_RATE)
         self.signals.audio_state_changed.emit(
             f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} (48 kHz stereo S16LE)"
+        )
+
+    def start_iq_udp(
+        self,
+        microphone: int,
+        target: tuple[str, int],
+        network_audio: NetworkAudioMonitor,
+        mode: str,
+        offset_hz: int,
+        swap_iq: bool,
+        invert_q: bool,
+    ) -> None:
+        self.stop()
+        self._udp_target = target
+        self._udp_queue = self._mp.Queue(maxsize=50)
+        self._udp_stop = self._mp.Event()
+        self._udp_keyed = self._mp.Event()
+        self._udp_packets = self._mp.Value("L", 0, lock=False)
+        self._udp_underruns = self._mp.Value("L", 0, lock=False)
+        self._udp_late_ms = self._mp.Value("d", 0.0, lock=False)
+        self._udp_clipped = self._mp.Value("L", 0, lock=False)
+
+        def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
+            pcm = np.clip(indata[:, 0], -1, 1)
+            with self._level_lock:
+                self._level = float(np.max(np.abs(pcm)))
+                self._output_level = self._level
+            if self._udp_queue:
+                try:
+                    self._udp_queue.put_nowait((pcm * 32767).astype("<i2").tobytes())
+                except queue.Full:
+                    pass
+
+        self._input_stream = sd.InputStream(
+            device=microphone,
+            samplerate=self.NETWORK_SAMPLE_RATE,
+            blocksize=self.BLOCK_SIZE,
+            channels=1,
+            dtype="float32",
+            latency="high",
+            callback=callback,
+        )
+        self._udp_sender = self._mp.Process(
+            target=udp_iq_sender,
+            args=(
+                self._udp_queue, network_audio.socket, target, self._udp_stop, self._udp_keyed,
+                self._udp_packets, self._udp_underruns, self._udp_late_ms, self._udp_clipped, mode, offset_hz,
+                swap_iq, invert_q,
+            ),
+            name="q900-iq-tx",
+            daemon=True,
+        )
+        self._udp_sender.start()
+        self._input_stream.start()
+        time.sleep(self.NETWORK_PREROLL_SAMPLES / self.NETWORK_SAMPLE_RATE)
+        self.signals.audio_state_changed.emit(
+            f"SDR TX: microphone -> Q900 UDP {target[0]}:{target[1]} ({mode} I/Q, {offset_hz:+d} Hz)"
         )
 
     def network_ptt_started(self) -> None:
@@ -1293,6 +1490,11 @@ class RadioClient:
 
     def set_stream_format(self, value: int) -> None:
         self.send(encode_frame(Command.USB_FORMAT, bytes((value,))))
+
+    def set_tx_audio_source(self, source: TxAudioSource) -> None:
+        # Undocumented F2 action 29: operation 02 directly assigns the TX
+        # source. Value 04 bypasses the radio modulator and consumes stereo IQ.
+        self.send(encode_frame(Command.EXTENDED_CONTROL, bytes((0x29, 0x02, int(source)))))
 
     @property
     def udp_target(self) -> tuple[str, int] | None:
@@ -1798,6 +2000,10 @@ class MainWindow(QMainWindow):
         self._sdr_switch_pending = False
         self._sdr_restore_pending = False
         self._sdr_restore_attempts = 0
+        self._sdr_tx_offset_hz = 12_000
+        self._sdr_tx_swap_iq = False
+        self._sdr_tx_invert_q = False
+        self._sdr_tx_source_selected = False
         self._ptt_meter_timer = QTimer(self)
         self._ptt_meter_timer.setInterval(100)
         self._ptt_meter_timer.timeout.connect(self.update_ptt_meter)
@@ -1891,9 +2097,13 @@ class MainWindow(QMainWindow):
         self.sdr_offset.setValue(self.sdr_receiver.offset_hz)
         self.sdr_offset.valueChanged.connect(self.set_sdr_offset)
         self.sdr_offset.setVisible(False)
+        self.sdr_tx_calibrate = QPushButton("SDR TX Cal")
+        self.sdr_tx_calibrate.setVisible(False)
+        self.sdr_tx_calibrate.clicked.connect(self.configure_sdr_tx)
         header.addWidget(self.sdr_button)
         header.addWidget(self.sdr_mode_selector)
         header.addWidget(self.sdr_offset)
+        header.addWidget(self.sdr_tx_calibrate)
         self.vfo_badge = QLabel("A")
         self.vfo_badge.setStyleSheet("background: #477fd5; border-radius: 15px; padding: 8px; font-weight: bold")
         header.addWidget(self.vfo_badge)
@@ -2043,8 +2253,8 @@ class MainWindow(QMainWindow):
             self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
 
     def start_ptt(self) -> None:
-        if self._sdr_active or self._sdr_switch_pending or self._sdr_restore_pending:
-            self.status.setText("SDR transmit is unavailable until the network IQ TX format is validated.")
+        if self._sdr_switch_pending or self._sdr_restore_pending:
+            self.status.setText("Wait for the SDR stream transition to complete before transmitting.")
             return
         if self._ptt_source == "rigctl":
             self.status.setText("Rigctl virtual audio is transmitting.")
@@ -2058,6 +2268,9 @@ class MainWindow(QMainWindow):
             return
         try:
             if self.client.state.transport == "USB":
+                if self._sdr_active:
+                    self.status.setText("SDR IQ TX currently requires the network transport.")
+                    return
                 output = self.tx_output.currentData()
                 if output is None:
                     self.status.setText("Select the Q900 USB transmit-audio device before using PTT.")
@@ -2071,7 +2284,19 @@ class MainWindow(QMainWindow):
                 if not self.network_audio.running:
                     self.status.setText("Start network receive audio before using network PTT.")
                     return
-                self.tx_audio.start_udp(microphone, target, self.network_audio)
+                if self._sdr_active:
+                    self.select_sdr_tx_source()
+                    self.tx_audio.start_iq_udp(
+                        microphone,
+                        target,
+                        self.network_audio,
+                        self.sdr_receiver.mode,
+                        self._sdr_tx_offset_hz,
+                        self._sdr_tx_swap_iq,
+                        self._sdr_tx_invert_q,
+                    )
+                else:
+                    self.tx_audio.start_udp(microphone, target, self.network_audio)
             # Audio must be established before the transmitter is keyed.
             self.client.set_ptt(True)
             self._ptt_source = "gui"
@@ -2084,7 +2309,12 @@ class MainWindow(QMainWindow):
                 "color: white; font: 700 16px Menlo; padding: 10px 24px;"
             )
         except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
+            try:
+                self.client.set_ptt(False)
+            except (ConnectionError, OSError, serial.SerialException):
+                pass
             self.tx_audio.stop()
+            self.restore_normal_tx_source()
             self.show_error(f"PTT: {error}")
 
     def stop_ptt(self) -> None:
@@ -2098,6 +2328,7 @@ class MainWindow(QMainWindow):
         if self.client.state.transport == "TCP":
             self._last_ptt_network_status = self.tx_audio.network_status
         self.tx_audio.stop()
+        self.restore_normal_tx_source()
         self._ptt_source = None
         self._ptt_meter_timer.stop()
         self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_status}")
@@ -2158,8 +2389,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.start_audio_default)
 
     def handle_rigctl_ptt(self, active: bool) -> None:
-        if active and (self._sdr_active or self._sdr_switch_pending or self._sdr_restore_pending):
-            self.rigctl_status.setText("rigctl: SDR IQ transmit is not implemented")
+        if active and (self._sdr_switch_pending or self._sdr_restore_pending):
+            self.rigctl_status.setText("rigctl: SDR stream transition in progress")
             return
         if not active:
             if self._ptt_source != "rigctl":
@@ -2169,6 +2400,7 @@ class MainWindow(QMainWindow):
             except (ConnectionError, OSError, serial.SerialException):
                 pass
             self.tx_audio.stop()
+            self.restore_normal_tx_source()
             self._ptt_source = None
             return
         if self._ptt_source:
@@ -2188,7 +2420,19 @@ class MainWindow(QMainWindow):
                     self.start_virtual_receive_audio()
                 if not self.network_audio.running:
                     return
-                self.tx_audio.start_udp(microphone, target, self.network_audio)
+                if self._sdr_active:
+                    self.select_sdr_tx_source()
+                    self.tx_audio.start_iq_udp(
+                        microphone,
+                        target,
+                        self.network_audio,
+                        self.sdr_receiver.mode,
+                        self._sdr_tx_offset_hz,
+                        self._sdr_tx_swap_iq,
+                        self._sdr_tx_invert_q,
+                    )
+                else:
+                    self.tx_audio.start_udp(microphone, target, self.network_audio)
             else:
                 output = self.tx_output.currentData()
                 if output is None:
@@ -2199,13 +2443,37 @@ class MainWindow(QMainWindow):
             if self.client.state.transport == "TCP":
                 self.tx_audio.network_ptt_started()
         except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
+            try:
+                self.client.set_ptt(False)
+            except (ConnectionError, OSError, serial.SerialException):
+                pass
             self.tx_audio.stop()
+            self.restore_normal_tx_source()
             self.rigctl_status.setText(f"rigctl PTT: {error}")
+
+    def select_sdr_tx_source(self) -> None:
+        if self._sdr_tx_source_selected:
+            return
+        self.client.set_tx_audio_source(TxAudioSource.DIGITAL_IQ)
+        self._sdr_tx_source_selected = True
+        # Give the radio's audio callback one block to observe the new source.
+        time.sleep(0.05)
+
+    def restore_normal_tx_source(self) -> None:
+        if not self._sdr_tx_source_selected:
+            return
+        try:
+            self.client.set_tx_audio_source(TxAudioSource.DIGITAL)
+        except (ConnectionError, OSError, serial.SerialException):
+            pass
+        self._sdr_tx_source_selected = False
 
     def update_ptt_meter(self) -> None:
         level = min(1.0, getattr(self.tx_audio, "level", 0.0))
         output_level = min(1.0, getattr(self.tx_audio, "output_level", 0.0))
         status = self.tx_audio.network_status if self.client.state.transport == "TCP" else ""
+        if self._sdr_tx_source_selected:
+            status = f"TXSRC DIG I/Q  {status}"
         self.ptt_level.setText(
             f"MIC {round(level * 100):d}%  TX {round(output_level * 100):d}%  {status}"
         )
@@ -2303,6 +2571,50 @@ class MainWindow(QMainWindow):
         self.sdr_receiver.offset_hz = offset_hz
         self.spectrum.set_sdr(self._sdr_active, offset_hz, self.sdr_receiver.mode)
 
+    def configure_sdr_tx(self) -> None:
+        if self._ptt_source:
+            self.status.setText("Release PTT before changing SDR TX calibration.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("SDR TX Calibration")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Use low power and an external receiver. Change one setting per test."))
+        offset = QComboBox()
+        for value in (12_000, 0, -12_000):
+            offset.addItem(f"{value:+d} Hz", value)
+        offset.setCurrentIndex(max(0, offset.findData(self._sdr_tx_offset_hz)))
+        swap = QCheckBox("Swap I/Q")
+        swap.setChecked(self._sdr_tx_swap_iq)
+        invert = QCheckBox("Invert Q")
+        invert.setChecked(self._sdr_tx_invert_q)
+        current = QLabel("")
+
+        def describe() -> None:
+            current.setText(
+                f"TX: {self.sdr_receiver.mode}, {offset.currentText()}, "
+                f"{'Q,I' if swap.isChecked() else 'I,Q'}, "
+                f"{'-Q' if invert.isChecked() else '+Q'}"
+            )
+
+        offset.currentIndexChanged.connect(describe)
+        swap.toggled.connect(describe)
+        invert.toggled.connect(describe)
+        describe()
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(QLabel("Carrier offset"))
+        layout.addWidget(offset)
+        layout.addWidget(swap)
+        layout.addWidget(invert)
+        layout.addWidget(current)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._sdr_tx_offset_hz = int(offset.currentData())
+            self._sdr_tx_swap_iq = swap.isChecked()
+            self._sdr_tx_invert_q = invert.isChecked()
+            self.status.setText(f"SDR TX calibration set: {current.text()}")
+
     def poll_sdr_stream(self) -> None:
         if not self._sdr_switch_pending:
             return
@@ -2317,8 +2629,9 @@ class MainWindow(QMainWindow):
         self.sdr_button.setText("SDR On")
         self.sdr_mode_selector.setVisible(True)
         self.sdr_offset.setVisible(True)
+        self.sdr_tx_calibrate.setVisible(True)
         self.spectrum.set_sdr(True, self.sdr_receiver.offset_hz, self.sdr_receiver.mode)
-        self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. TX unavailable.")
+        self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. SDR TX source ready on PTT.")
 
     def sdr_switch_timeout(self) -> None:
         if not self._sdr_switch_pending:
@@ -2332,6 +2645,11 @@ class MainWindow(QMainWindow):
         self.status.setText("SDR IQ stream was not detected; restored normal audio.")
 
     def exit_sdr(self) -> None:
+        if self._ptt_source == "gui":
+            self.stop_ptt()
+        elif self._ptt_source == "rigctl":
+            self.handle_rigctl_ptt(False)
+        self.restore_normal_tx_source()
         self._sdr_switch_timer.stop()
         self._sdr_switch_pending = False
         self._sdr_active = False
@@ -2342,6 +2660,7 @@ class MainWindow(QMainWindow):
         self.sdr_button.setText("SDR Restoring")
         self.sdr_mode_selector.setVisible(False)
         self.sdr_offset.setVisible(False)
+        self.sdr_tx_calibrate.setVisible(False)
         self.spectrum.set_sdr(False, 0, self.sdr_receiver.mode)
         self.status.setText("SDR mode stopped; restoring normal network audio.")
         self.retry_normal_audio()
@@ -2372,6 +2691,7 @@ class MainWindow(QMainWindow):
         if self.client.state.connected or self.client.state.listening:
             if self._sdr_active or self._sdr_switch_pending:
                 self.exit_sdr()
+            self.restore_normal_tx_source()
             self._sdr_restore_timer.stop()
             self._sdr_restore_pending = False
             self.client.disconnect()
@@ -2606,11 +2926,15 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         self.rigctl.stop()
+        if self._ptt_source == "gui":
+            self.stop_ptt()
+        elif self._ptt_source == "rigctl":
+            self.handle_rigctl_ptt(False)
         if self._sdr_active or self._sdr_switch_pending:
             self.exit_sdr()
+        self.restore_normal_tx_source()
         self._sdr_restore_timer.stop()
         self._sdr_restore_pending = False
-        self.stop_ptt()
         self.audio.stop()
         self.network_audio.stop()
         self.client.disconnect()
@@ -2622,6 +2946,8 @@ def self_test() -> None:
     assert encode_frame(Command.STATUS).hex() == "a5a5a5a5030bf937"
     assert encode_frame(Command.PTT, b"\x00").hex() == "a5a5a5a504070089cb"
     assert encode_frame(Command.PTT, b"\x01").hex() == "a5a5a5a504070199ea"
+    assert encode_frame(Command.EXTENDED_CONTROL, b"\x29\x02\x04").hex() == "a5a5a5a506f2290204901d"
+    assert encode_frame(Command.EXTENDED_CONTROL, b"\x29\x02\x03").hex() == "a5a5a5a506f2290203e0fa"
     captured_audio = bytes.fromhex("a5a5a5a56721002c00") + bytes(192)
     assert captured_audio.startswith(b"\xa5\xa5\xa5\xa5\x67\x21\x00")
     assert len(captured_audio[9:]) == 192
@@ -2631,6 +2957,10 @@ def self_test() -> None:
     stereo_tx = np.repeat(mono_tx, 2)
     assert len(stereo_tx.tobytes()) == 384
     assert np.array_equal(stereo_tx[0::2], stereo_tx[1::2])
+    iq_tx = np.empty(48 * 2, dtype="<i2")
+    iq_tx[0::2] = 100
+    iq_tx[1::2] = -100
+    assert len(iq_tx.tobytes()) == 192
     cat = encode_frame(Command.SET_FREQUENCIES, b"\x01\x02")
     spectrum_raw = bytes((0, 0)) + bytes(range(256)) * 2
     spectrum = SYNC + spectrum_raw + crc16_ccitt(spectrum_raw).to_bytes(2, "big")
