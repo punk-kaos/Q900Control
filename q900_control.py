@@ -391,6 +391,7 @@ class SDRReceiver:
     OUTPUT_PREROLL_BLOCKS = 13
     SSB_OUTPUT_GAIN = 40.0
     NFM_OUTPUT_GAIN = 3.0
+    AM_OUTPUT_GAIN = 24.0
 
     def __init__(self, output: Callable[[np.ndarray], None]) -> None:
         self._output = output
@@ -464,6 +465,8 @@ class SDRReceiver:
         previous = 1 + 0j
         fm_dc = 0.0
         fm_deemphasis = 0.0
+        am_history = np.zeros(64, dtype=np.complex64)
+        am_taps = self._lowpass_taps(4_500, 65)
         ssb_previous_input = 0.0
         ssb_previous_output = 0.0
         output_pending: deque[np.ndarray] = deque()
@@ -501,6 +504,21 @@ class SDRReceiver:
                     audio[sample_index] = fm_deemphasis
                 audio = np.convolve(audio, np.ones(7, dtype=np.float32) / 7, mode="same")
                 gain = self.NFM_OUTPUT_GAIN
+            elif self.mode == "AM":
+                shift = np.exp(-1j * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
+                baseband = signal * shift
+                # Isolate the selected AM channel before envelope detection.
+                # Taking |I+jQ| across the whole 48 kHz stream demodulates
+                # every nearby carrier/noise source into an audible buzz.
+                combined = np.concatenate((am_history, baseband))
+                baseband = np.convolve(combined, am_taps, mode="valid")
+                am_history = combined[-64:]
+                envelope = np.abs(baseband)
+                # The carrier is the envelope DC term. Removing the block
+                # mean makes AM audio available immediately on entry rather
+                # than waiting seconds for a slow DC follower to settle.
+                audio = envelope - np.mean(envelope)
+                gain = self.AM_OUTPUT_GAIN
             else:
                 # USB and LSB share the same suppressed-carrier frequency.
                 # Sideband content is carried in the complex samples around
@@ -526,6 +544,13 @@ class SDRReceiver:
             # longer than a normal UDP gap. Keep 260 ms ahead of playback.
             if len(output_pending) >= self.OUTPUT_PREROLL_BLOCKS:
                 self._output(output_pending.popleft())
+
+    @staticmethod
+    def _lowpass_taps(cutoff_hz: float, count: int) -> np.ndarray:
+        index = np.arange(count, dtype=np.float32) - (count - 1) / 2
+        taps = 2 * cutoff_hz / SDRReceiver.SAMPLE_RATE * np.sinc(2 * cutoff_hz * index / SDRReceiver.SAMPLE_RATE)
+        taps *= np.hamming(count)
+        return (taps / np.sum(taps)).astype(np.float32)
 
 
 class NetworkAudioMonitor:
@@ -1633,6 +1658,8 @@ class SpectrumWaterfall(QWidget):
         x = self._frequency_to_x(frequency, width)
         if self._sdr_mode == "NFM":
             low_hz, high_hz = -2_500, 2_500
+        elif self._sdr_mode == "AM":
+            low_hz, high_hz = -4_000, 4_000
         elif self._sdr_mode == "LSB":
             low_hz, high_hz = -2_800, -300
         else:
@@ -1854,7 +1881,7 @@ class MainWindow(QMainWindow):
         self.sdr_button = QPushButton("SDR Off")
         self.sdr_button.clicked.connect(self.toggle_sdr)
         self.sdr_mode_selector = QComboBox()
-        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM"))
+        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM", "AM"))
         self.sdr_mode_selector.setVisible(False)
         self.sdr_mode_selector.currentTextChanged.connect(self.set_sdr_mode)
         self.sdr_offset = QSpinBox()
