@@ -100,15 +100,6 @@ class Command(IntEnum):
     CW_SPEED = 0x35
     USB_FORMAT = 0x33
     SPECTRUM = 0x39
-    EXTENDED_CONTROL = 0xF2
-
-
-class TxAudioSource(IntEnum):
-    MIC = 0
-    LINE_L = 1
-    LINE_R = 2
-    DIGITAL = 3
-    DIGITAL_IQ = 4
 
 
 class Mode(IntEnum):
@@ -843,6 +834,87 @@ def udp_audio_sender(
                 time.sleep(remaining)
 
 
+IQ_SAMPLE_RATE = 48_000
+IQ_TX_LEVEL = 0.8
+IQ_FM_DEVIATION = 2_500
+IQ_PRE_EMPHASIS_ALPHA = 1.0 - float(np.exp(-1.0 / (48_000 * 750e-6)))
+_HILBERT_LEN = 127
+_HILBERT_DELAY = (_HILBERT_LEN - 1) // 2
+_hilbert_index = np.arange(_HILBERT_LEN, dtype=np.float32) - _HILBERT_DELAY
+_HILBERT_TAPS = np.zeros(_HILBERT_LEN, dtype=np.float32)
+_hilbert_odd = (np.abs(_hilbert_index) % 2) == 1
+_HILBERT_TAPS[_hilbert_odd] = 2.0 / (np.pi * _hilbert_index[_hilbert_odd])
+_HILBERT_TAPS *= np.blackman(_HILBERT_LEN).astype(np.float32)
+
+
+class IqEncoderState:
+    """Streaming DSP state for encode_iq_block()."""
+
+    __slots__ = ("phase", "level", "ssb_dc", "pre_prev", "hilbert_state", "sample_count")
+
+    def __init__(self) -> None:
+        self.phase = 0.0
+        self.level = 0.0
+        self.ssb_dc = 0.0
+        self.pre_prev = 0.0
+        self.hilbert_state = np.zeros(_HILBERT_LEN - 1, dtype=np.float32)
+        self.sample_count = 0
+
+
+def encode_iq_block(state: IqEncoderState, audio: np.ndarray, mode: str, offset_hz: int) -> np.ndarray:
+    """Encode a 48 kHz mono audio block into complex I/Q samples.
+
+    The Q900's network upconverter mirrors (conjugates) the complex baseband,
+    so the returned samples are pre-conjugated; demodulation that simulates the
+    radio must conjugate them back. Swap/invert calibration then stacks on top.
+    """
+    count = len(audio)
+    if mode in ("USB", "LSB"):
+        state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
+        ssb_audio = np.clip(audio - state.ssb_dc, -0.45, 0.45)
+        # The 63-tap Hilbert needs 31 future samples, so the streaming state
+        # keeps the previous 62 samples and the whole output lags 31 behind.
+        combined = np.concatenate((state.hilbert_state, ssb_audio))
+        quadrature = np.convolve(combined, _HILBERT_TAPS, mode="valid")
+        in_phase = combined[_HILBERT_DELAY : _HILBERT_DELAY + count]
+        state.hilbert_state = combined[-(_HILBERT_LEN - 1):]
+        baseband = in_phase + 1j * (quadrature if mode == "USB" else -quadrature)
+    elif mode == "AM":
+        state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
+        baseband = 0.55 + np.clip(audio - state.ssb_dc, -0.45, 0.45).astype(np.complex64)
+    else:  # NFM
+        state.level = 0.95 * state.level + 0.05 * float(np.max(np.abs(audio)))
+        fm_gain = float(np.clip(0.9 / max(state.level, 1e-4), 3.0, 20.0))
+        fm_audio = np.clip(audio * fm_gain, -0.9, 0.9)
+        previous = np.concatenate((np.array([state.pre_prev]), fm_audio[:-1]))
+        emphasized = np.clip(fm_audio + IQ_PRE_EMPHASIS_ALPHA * (fm_audio - previous), -0.9, 0.9)
+        state.pre_prev = float(fm_audio[-1])
+        state.phase += np.cumsum(emphasized * (2 * np.pi * IQ_FM_DEVIATION / IQ_SAMPLE_RATE))
+        baseband = np.exp(1j * state.phase)
+        state.phase = float(state.phase[-1] % (2 * np.pi))
+    index = np.arange(state.sample_count, state.sample_count + count)
+    state.sample_count += count
+    carrier = np.exp(1j * 2 * np.pi * offset_hz * index / IQ_SAMPLE_RATE)
+    iq = np.conj(baseband * carrier)
+    real = np.clip(iq.real, -1.0, 1.0) * IQ_TX_LEVEL
+    imag = np.clip(iq.imag, -1.0, 1.0) * IQ_TX_LEVEL
+    return real + 1j * imag
+
+
+def pack_iq_words(iq: np.ndarray, swap_iq: bool, invert_q: bool) -> bytes:
+    """Serialize complex I/Q samples as interleaved signed 16-bit words."""
+    i_words = (iq.real * 32767).astype("<i2")
+    q_words = (iq.imag * 32767).astype("<i2")
+    if invert_q:
+        q_words = -q_words
+    if swap_iq:
+        i_words, q_words = q_words, i_words
+    words = np.empty(len(iq) * 2, dtype="<i2")
+    words[0::2] = i_words
+    words[1::2] = q_words
+    return words.tobytes()
+
+
 def udp_iq_sender(
     audio_queue: mp.Queue,
     udp_socket: socket.socket,
@@ -860,7 +932,6 @@ def udp_iq_sender(
 ) -> None:
     """Encode 48 kHz microphone audio into inferred raw network I/Q."""
     frames_per_packet = 48
-    packet_bytes = frames_per_packet * 2 * 2
     preroll_bytes = 9_600 * 2
     pending = bytearray()
     while len(pending) < preroll_bytes and not stop.is_set():
@@ -871,9 +942,7 @@ def udp_iq_sender(
     while not keyed.wait(0.05) and not stop.is_set():
         pass
 
-    phase = 0.0
-    previous = 0.0
-    ssb_dc = 0.0
+    state = IqEncoderState()
     period = 0.001
     mach_time = mach_wait = None
     ticks_per_second = 0.0
@@ -895,7 +964,6 @@ def udp_iq_sender(
             mach_time = mach_wait = None
 
     def next_payload() -> bytes:
-        nonlocal phase, previous, ssb_dc
         needed = frames_per_packet * 2
         while len(pending) < needed:
             try:
@@ -904,50 +972,16 @@ def udp_iq_sender(
                 break
         if len(pending) < needed:
             underruns.value += 1
-            return bytes(packet_bytes)
-        audio = np.frombuffer(bytes(pending[:needed]), dtype="<i2").astype(np.float32) / 32768.0
-        del pending[:needed]
-        # Remove microphone DC. SSB/AM need envelope headroom, while NFM must
-        # retain enough excursion to reach a usable voice deviation.
-        ssb_dc = 0.995 * ssb_dc + 0.005 * float(np.mean(audio))
-        audio = audio - ssb_dc
-        count = len(audio)
-        if mode in ("USB", "LSB"):
-            # Analytic approximation: real audio plus a one-sample derivative
-            # quadrature term. It is intentionally simple but preserves the
-            # required single-sideband sign relationship for initial testing.
-            ssb_audio = np.clip(audio, -0.45, 0.45)
-            quadrature = np.empty_like(ssb_audio)
-            quadrature[0] = ssb_audio[0] - previous
-            quadrature[1:] = ssb_audio[1:] - ssb_audio[:-1]
-            previous = float(ssb_audio[-1])
-            quadrature *= 12.0
-            baseband = ssb_audio + 1j * (quadrature if mode == "USB" else -quadrature)
-        elif mode == "AM":
-            baseband = 0.55 + np.clip(audio, -0.45, 0.45).astype(np.complex64)
-        else:  # NFM
-            # Consumer microphones are commonly well below full scale. Lift
-            # the modulation to approximately +/-2.25 kHz deviation before
-            # limiting, rather than treating 0.45 full scale as peak FM.
-            fm_audio = np.clip(audio * 3.0, -0.9, 0.9)
-            phase += np.cumsum(fm_audio * (2 * np.pi * 2_500 / 48_000))
-            baseband = np.exp(1j * phase)
-            phase = float(phase[-1] % (2 * np.pi))
-        index = np.arange(count)
-        carrier = np.exp(1j * 2 * np.pi * offset_hz * index / 48_000)
-        iq = np.clip(baseband * carrier * 0.35, -1.0, 1.0)
-        if np.any(np.abs(iq) >= 0.98):
-            clipped.value += 1
-        words = np.empty(count * 2, dtype="<i2")
-        i_words = (iq.real * 32767).astype("<i2")
-        q_words = (iq.imag * 32767).astype("<i2")
-        if invert_q:
-            q_words = -q_words
-        if swap_iq:
-            words[0::2], words[1::2] = q_words, i_words
+            # Carry the carrier continuously through a scheduling gap rather
+            # than zeroing it: a zero packet pops the FM discriminator.
+            audio = np.zeros(frames_per_packet, dtype=np.float32)
         else:
-            words[0::2], words[1::2] = i_words, q_words
-        return words.tobytes()
+            audio = np.frombuffer(bytes(pending[:needed]), dtype="<i2").astype(np.float32) / 32768.0
+            del pending[:needed]
+        if np.any(np.abs(audio) >= 0.98):
+            clipped.value += 1
+        iq = encode_iq_block(state, audio, mode, offset_hz)
+        return pack_iq_words(iq, swap_iq, invert_q)
 
     deadline = mach_time() if mach_time else time.monotonic()
     while not stop.is_set():
@@ -1149,7 +1183,16 @@ class TransmitAudioRouter:
                 try:
                     self._udp_queue.put_nowait((pcm * 32767).astype("<i2").tobytes())
                 except queue.Full:
-                    pass
+                    # Drop the oldest buffered block so the newest microphone
+                    # audio is never silently lost.
+                    try:
+                        self._udp_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._udp_queue.put_nowait((pcm * 32767).astype("<i2").tobytes())
+                    except queue.Full:
+                        pass
 
         self._input_stream = sd.InputStream(
             device=microphone,
@@ -1490,11 +1533,6 @@ class RadioClient:
 
     def set_stream_format(self, value: int) -> None:
         self.send(encode_frame(Command.USB_FORMAT, bytes((value,))))
-
-    def set_tx_audio_source(self, source: TxAudioSource) -> None:
-        # Undocumented F2 action 29: operation 02 directly assigns the TX
-        # source. Value 04 bypasses the radio modulator and consumes stereo IQ.
-        self.send(encode_frame(Command.EXTENDED_CONTROL, bytes((0x29, 0x02, int(source)))))
 
     @property
     def udp_target(self) -> tuple[str, int] | None:
@@ -2003,7 +2041,6 @@ class MainWindow(QMainWindow):
         self._sdr_tx_offset_hz = 12_000
         self._sdr_tx_swap_iq = False
         self._sdr_tx_invert_q = False
-        self._sdr_tx_source_selected = False
         self._ptt_meter_timer = QTimer(self)
         self._ptt_meter_timer.setInterval(100)
         self._ptt_meter_timer.timeout.connect(self.update_ptt_meter)
@@ -2285,7 +2322,6 @@ class MainWindow(QMainWindow):
                     self.status.setText("Start network receive audio before using network PTT.")
                     return
                 if self._sdr_active:
-                    self.select_sdr_tx_source()
                     self.tx_audio.start_iq_udp(
                         microphone,
                         target,
@@ -2314,7 +2350,6 @@ class MainWindow(QMainWindow):
             except (ConnectionError, OSError, serial.SerialException):
                 pass
             self.tx_audio.stop()
-            self.restore_normal_tx_source()
             self.show_error(f"PTT: {error}")
 
     def stop_ptt(self) -> None:
@@ -2328,7 +2363,6 @@ class MainWindow(QMainWindow):
         if self.client.state.transport == "TCP":
             self._last_ptt_network_status = self.tx_audio.network_status
         self.tx_audio.stop()
-        self.restore_normal_tx_source()
         self._ptt_source = None
         self._ptt_meter_timer.stop()
         self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_status}")
@@ -2400,7 +2434,6 @@ class MainWindow(QMainWindow):
             except (ConnectionError, OSError, serial.SerialException):
                 pass
             self.tx_audio.stop()
-            self.restore_normal_tx_source()
             self._ptt_source = None
             return
         if self._ptt_source:
@@ -2421,7 +2454,6 @@ class MainWindow(QMainWindow):
                 if not self.network_audio.running:
                     return
                 if self._sdr_active:
-                    self.select_sdr_tx_source()
                     self.tx_audio.start_iq_udp(
                         microphone,
                         target,
@@ -2448,32 +2480,12 @@ class MainWindow(QMainWindow):
             except (ConnectionError, OSError, serial.SerialException):
                 pass
             self.tx_audio.stop()
-            self.restore_normal_tx_source()
             self.rigctl_status.setText(f"rigctl PTT: {error}")
-
-    def select_sdr_tx_source(self) -> None:
-        if self._sdr_tx_source_selected:
-            return
-        self.client.set_tx_audio_source(TxAudioSource.DIGITAL_IQ)
-        self._sdr_tx_source_selected = True
-        # Give the radio's audio callback one block to observe the new source.
-        time.sleep(0.05)
-
-    def restore_normal_tx_source(self) -> None:
-        if not self._sdr_tx_source_selected:
-            return
-        try:
-            self.client.set_tx_audio_source(TxAudioSource.DIGITAL)
-        except (ConnectionError, OSError, serial.SerialException):
-            pass
-        self._sdr_tx_source_selected = False
 
     def update_ptt_meter(self) -> None:
         level = min(1.0, getattr(self.tx_audio, "level", 0.0))
         output_level = min(1.0, getattr(self.tx_audio, "output_level", 0.0))
         status = self.tx_audio.network_status if self.client.state.transport == "TCP" else ""
-        if self._sdr_tx_source_selected:
-            status = f"TXSRC DIG I/Q  {status}"
         self.ptt_level.setText(
             f"MIC {round(level * 100):d}%  TX {round(output_level * 100):d}%  {status}"
         )
@@ -2631,7 +2643,7 @@ class MainWindow(QMainWindow):
         self.sdr_offset.setVisible(True)
         self.sdr_tx_calibrate.setVisible(True)
         self.spectrum.set_sdr(True, self.sdr_receiver.offset_hz, self.sdr_receiver.mode)
-        self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. SDR TX source ready on PTT.")
+        self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. Network PTT sends SDR I/Q TX.")
 
     def sdr_switch_timeout(self) -> None:
         if not self._sdr_switch_pending:
@@ -2649,7 +2661,6 @@ class MainWindow(QMainWindow):
             self.stop_ptt()
         elif self._ptt_source == "rigctl":
             self.handle_rigctl_ptt(False)
-        self.restore_normal_tx_source()
         self._sdr_switch_timer.stop()
         self._sdr_switch_pending = False
         self._sdr_active = False
@@ -2691,7 +2702,6 @@ class MainWindow(QMainWindow):
         if self.client.state.connected or self.client.state.listening:
             if self._sdr_active or self._sdr_switch_pending:
                 self.exit_sdr()
-            self.restore_normal_tx_source()
             self._sdr_restore_timer.stop()
             self._sdr_restore_pending = False
             self.client.disconnect()
@@ -2932,7 +2942,6 @@ class MainWindow(QMainWindow):
             self.handle_rigctl_ptt(False)
         if self._sdr_active or self._sdr_switch_pending:
             self.exit_sdr()
-        self.restore_normal_tx_source()
         self._sdr_restore_timer.stop()
         self._sdr_restore_pending = False
         self.audio.stop()
@@ -2946,8 +2955,6 @@ def self_test() -> None:
     assert encode_frame(Command.STATUS).hex() == "a5a5a5a5030bf937"
     assert encode_frame(Command.PTT, b"\x00").hex() == "a5a5a5a504070089cb"
     assert encode_frame(Command.PTT, b"\x01").hex() == "a5a5a5a504070199ea"
-    assert encode_frame(Command.EXTENDED_CONTROL, b"\x29\x02\x04").hex() == "a5a5a5a506f2290204901d"
-    assert encode_frame(Command.EXTENDED_CONTROL, b"\x29\x02\x03").hex() == "a5a5a5a506f2290203e0fa"
     captured_audio = bytes.fromhex("a5a5a5a56721002c00") + bytes(192)
     assert captured_audio.startswith(b"\xa5\xa5\xa5\xa5\x67\x21\x00")
     assert len(captured_audio[9:]) == 192
@@ -2974,6 +2981,108 @@ def self_test() -> None:
     invalid_crc_spectrum = SYNC + spectrum_raw + b"\x00\x00"
     fallback = StreamParser()
     assert isinstance(fallback.feed(invalid_crc_spectrum)[0], SpectrumFrame)
+
+    # --- IQ encoder offline tests (no radio) ---
+    rate = IQ_SAMPLE_RATE
+
+    def encode_stream(audio: np.ndarray, mode: str, offset_hz: int, block: int = 48) -> np.ndarray:
+        state = IqEncoderState()
+        blocks = [encode_iq_block(state, audio[i : i + block], mode, offset_hz) for i in range(0, len(audio), block)]
+        return np.concatenate(blocks)
+
+    duration = 0.6
+    time_axis = np.arange(int(rate * duration)) / rate
+
+    # USB must be a true upper sideband: the wanted sideband dominates the
+    # image by 40 dB and demodulates with positive polarity.
+    tone = 0.3 * np.sin(2 * np.pi * 1000 * time_axis)
+    usb_iq = encode_stream(tone, "USB", 12_000)
+    usb_baseband = np.conj(usb_iq) * np.exp(-1j * 2 * np.pi * 12_000 * np.arange(len(tone)) / rate)
+    usb_spectrum = np.fft.fft(usb_baseband * np.hanning(len(usb_baseband)))
+    frequencies = np.fft.fftfreq(len(usb_baseband), 1 / rate)
+    wanted_bin = int(np.argmin(np.abs(frequencies - 1000)))
+    image_bin = int(np.argmin(np.abs(frequencies + 1000)))
+    wanted_power = np.abs(usb_spectrum[wanted_bin])
+    image_power = np.abs(usb_spectrum[image_bin])
+    assert image_power < wanted_power * 10 ** (-40 / 20), (image_power, wanted_power)
+    reference = tone[: len(usb_baseband) - _HILBERT_DELAY]
+    measured = usb_baseband.real[_HILBERT_DELAY:]
+    correlation = np.corrcoef(measured, reference)[0, 1]
+    assert correlation > 0.9, correlation
+
+    # NFM deviation must reach 2 kHz even for quiet microphones, and the FM
+    # phase must stay continuous across 48-sample packet boundaries.
+    for peak in (0.05, 0.1, 0.3, 0.9):
+        fm_tone = peak * np.sin(2 * np.pi * 1000 * time_axis)
+        fm_iq = encode_stream(fm_tone, "NFM", 0)
+        fm_phase = np.unwrap(np.angle(np.conj(fm_iq)))
+        deviation_hz = np.abs(np.diff(fm_phase)) * rate / (2 * np.pi)
+        assert np.max(deviation_hz) >= 2000, (peak, np.max(deviation_hz))
+        assert np.max(np.abs(np.diff(fm_phase))) < 0.6
+
+    # Full loopback through the actual receive demodulator, simulating the
+    # radio's mirror (it conjugates what we transmit).
+    loopback = 0.3 * np.sin(2 * np.pi * 500 * time_axis)
+    for receive_mode, tx_mode in (("NFM", "NFM"), ("USB", "USB"), ("AM", "AM")):
+        outputs: list[np.ndarray] = []
+        receiver = SDRReceiver(outputs.append)
+        receiver.mode = receive_mode
+        receiver.offset_hz = 12_000
+        receiver.SSB_OUTPUT_GAIN = 3.0
+        receiver.NFM_OUTPUT_GAIN = 3.0
+        receiver.AM_OUTPUT_GAIN = 3.0
+        receiver.start()
+        try:
+            tx_iq = encode_stream(loopback, tx_mode, 12_000)
+            words = pack_iq_words(tx_iq, False, False)
+            complex_words = np.frombuffer(words, dtype="<i2").astype(np.float32).reshape(-1, 2)
+            mirrored = np.conj(complex_words[:, 0] + 1j * complex_words[:, 1])
+            mirrored_words = np.empty(complex_words.shape, dtype="<i2")
+            mirrored_words[:, 0] = np.clip(mirrored.real, -32768, 32767).astype("<i2")
+            mirrored_words[:, 1] = np.clip(mirrored.imag, -32768, 32767).astype("<i2")
+            flat_words = mirrored_words.reshape(-1)
+            block_words = SDRReceiver.BLOCK_FRAMES * 2
+            for start in range(0, len(flat_words), block_words):
+                receiver.feed(flat_words[start : start + block_words])
+            time.sleep(0.15)
+            assert outputs, receive_mode
+            output_audio = np.concatenate(outputs)
+            output_spectrum = np.fft.rfft(output_audio * np.hanning(len(output_audio)))
+            output_frequencies = np.fft.rfftfreq(len(output_audio), 1 / rate)
+            tone_bin = int(np.argmin(np.abs(output_frequencies - 500)))
+            tone_power = np.abs(output_spectrum[tone_bin])
+            other_power = np.abs(output_spectrum).copy()
+            # Ignore the Hanning mainlobe around the tone and any DC settling
+            # below 50 Hz, then compare against the strongest real spur.
+            bin_width = rate / len(output_audio)
+            guard = int(15 / bin_width)
+            other_power[max(0, tone_bin - guard) : tone_bin + guard + 1] = 0
+            other_power[: int(50 / bin_width)] = 0
+            ratio = tone_power / (np.max(other_power) + 1e-9)
+            assert ratio > 10, (receive_mode, ratio)
+        finally:
+            receiver.stop()
+
+    # The encoder bakes the radio mirror in by default. Swapping I/Q (or
+    # inverting Q) individually flips the dominant component to the wrong side
+    # of the carrier, and applying both cancels back to the default.
+    def mirrored_spectrum(swap: bool, invert: bool) -> np.ndarray:
+        packed = pack_iq_words(encode_stream(tone, "USB", 12_000), swap, invert)
+        packed_complex = np.frombuffer(packed, dtype="<i2").astype(np.float32).reshape(-1, 2)
+        baseband = np.conj(packed_complex[:, 0] + 1j * packed_complex[:, 1])
+        baseband = baseband * np.exp(-1j * 2 * np.pi * 12_000 * np.arange(len(tone)) / rate)
+        return np.fft.fft(baseband * np.hanning(len(baseband)))
+
+    swapped_spectrum = mirrored_spectrum(True, False)
+    assert np.abs(swapped_spectrum[image_bin]) > np.abs(swapped_spectrum[wanted_bin]), (
+        np.abs(swapped_spectrum[image_bin]),
+        np.abs(swapped_spectrum[wanted_bin]),
+    )
+    identity_spectrum = mirrored_spectrum(True, True)
+    assert np.abs(identity_spectrum[wanted_bin]) > np.abs(identity_spectrum[image_bin]) * 100, (
+        np.abs(identity_spectrum[image_bin]),
+        np.abs(identity_spectrum[wanted_bin]),
+    )
     print("Q900 protocol self-test passed")
 
 
