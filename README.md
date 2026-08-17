@@ -55,8 +55,21 @@ Recording is off unless `Q900_TX_RECORD` is set.
 
 ### Radio Clock Offset
 
-The network audio row shows the radio's measured media rate once 500 receive
-packets have arrived, for example `radio 999.40 pkt/s (-600 ppm)`.
+The network audio row shows the radio's measured media rate, for example
+`radio 999.40 pkt/s = 47971 Hz (-600 ppm) over 40s`. The implied sample rate is
+shown alongside so a wrong cadence assumption is distinguishable from a genuine
+crystal offset: a figure near 48000 Hz confirms that a 192-byte payload is one
+millisecond of 48 kHz stereo.
+
+The rate is measured over the longest uninterrupted run of arrivals, not over
+the whole session. Averaging across a pause makes the figure climb towards the
+truth indefinitely without settling, and the stream does pause: it stops while
+transmitting and does not begin when the socket opens. A scheduling stall, or a
+backlog draining as a burst, ends the run rather than being averaged into it,
+because one 30 ms stall inside a 20 s window is a 1500 ppm error. `breaks` counts
+pauses and `stalls` counts those discontinuities; `over Ns` is the length of the
+run the figure came from, so a short run means treat it with suspicion. It needs
+a five-second clean run before it reports anything.
 
 This matters because nothing rate-matches the two ends. The radio runs UHSDR on
 an STM32H7 whose codec is clocked by the radio's own crystal, and neither its

@@ -58,6 +58,17 @@ SPECTRUM_BINS = 512
 # callback, so paint cost is transmit audio quality.
 SPECTRUM_MAX_REPAINT_HZ = 15
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
+# Measuring the radio's media clock needs an uninterrupted run of packets.
+# Within a run the rate is packets divided by the elapsed time between its first
+# and last arrival, so arrival jitter only enters through the two endpoints and
+# contributes jitter/window: a few ppm over tens of seconds. Anything that would
+# corrupt that -- a scheduling stall, a pause while transmitting, or a reordered
+# datagram -- ends the run instead of being averaged into it, because a single
+# 30 ms stall inside a 20 s window is a 1500 ppm error, the same order as the
+# crystal offset being measured.
+CLOCK_STALL_NS = 4_000_000
+CLOCK_RUN_GAP_NS = 50_000_000
+CLOCK_MIN_RUN_PACKETS = 5_000
 # The Q900 default IQ translation places the CAT-tuned carrier 12 kHz above
 # the stream reference. Use the same reference for the CAT spectrum cursor.
 FFT_TUNED_OFFSET_HZ = 12_000
@@ -612,9 +623,18 @@ class NetworkAudioMonitor:
         # application nor the radio's UHSDR firmware rate-matches the two ends.
         # The arrival rate of its packets therefore measures that clock, which is
         # the rate transmit audio has to be delivered at.
-        self._first_packet_ns = 0
-        self._last_packet_ns = 0
-        self._clock_packets = 0
+        #
+        # Measure it over the current uninterrupted run, not over the whole
+        # session. The stream stops while transmitting and does not begin the
+        # instant the socket opens, and averaging across a dead interval yields a
+        # figure that climbs towards the true rate forever without reaching it.
+        self._clock_run_start_ns = 0
+        self._clock_run_last_ns = 0
+        self._clock_run_packets = 0
+        self._clock_outliers = 0
+        self._clock_gaps = 0
+        self._clock_best_rate = 0.0
+        self._clock_best_seconds = 0.0
 
     def start(self, output_device: int, port: int = 8000) -> None:
         self.stop()
@@ -715,13 +735,7 @@ class NetworkAudioMonitor:
                     self._last_packet_size = len(packet)
                     self._format = audio_format
                     self._stream_type = packet_type
-                    now_ns = time.monotonic_ns()
-                    if not self._first_packet_ns:
-                        self._first_packet_ns = now_ns
-                        self._clock_packets = 0
-                    else:
-                        self._clock_packets += 1
-                        self._last_packet_ns = now_ns
+                    self._note_arrival(time.monotonic_ns())
                 if first_packet:
                     print(
                         f"Q900 UDP audio from {peer[0]}:{peer[1]}: {len(packet)} bytes, "
@@ -763,9 +777,13 @@ class NetworkAudioMonitor:
             self._packet_count = 0
             self._last_packet_size = 0
             self._format = "waiting"
-            self._first_packet_ns = 0
-            self._last_packet_ns = 0
-            self._clock_packets = 0
+            self._clock_run_start_ns = 0
+            self._clock_run_last_ns = 0
+            self._clock_run_packets = 0
+            self._clock_outliers = 0
+            self._clock_gaps = 0
+            self._clock_best_rate = 0.0
+            self._clock_best_seconds = 0.0
         self._stream_type = 0
         self._underflows = 0
 
@@ -785,6 +803,52 @@ class NetworkAudioMonitor:
     def running(self) -> bool:
         return self._stream is not None
 
+    def _note_arrival(self, now_ns: int) -> None:
+        """Track the radio's media clock. Caller must hold _stats_lock.
+
+        Within an uninterrupted run the rate is packets divided by the elapsed
+        time between the first and last arrival, so arrival jitter enters only
+        through the endpoints. Anything that would corrupt that ends the run.
+        """
+        delta = now_ns - self._clock_run_last_ns if self._clock_run_last_ns else 0
+        if self._clock_run_last_ns and 0 < delta <= CLOCK_STALL_NS:
+            self._clock_run_packets += 1
+            self._clock_run_last_ns = now_ns
+            return
+        if delta > CLOCK_RUN_GAP_NS:
+            self._clock_gaps += 1
+        elif self._clock_run_last_ns:
+            # A stall, or two datagrams read in the same nanosecond because a
+            # socket backlog drained in a burst. Either way the arrival stamps
+            # have stopped being a faithful clock reference, so end the run.
+            # Counting burst packets would add count with no elapsed time and
+            # over-read the rate by around 1000 ppm.
+            self._clock_outliers += 1
+        seconds = (self._clock_run_last_ns - self._clock_run_start_ns) / 1e9
+        if (
+            self._clock_run_packets >= CLOCK_MIN_RUN_PACKETS
+            and seconds > self._clock_best_seconds
+        ):
+            self._clock_best_rate = self._clock_run_packets / seconds
+            self._clock_best_seconds = seconds
+        self._clock_run_start_ns = now_ns
+        self._clock_run_last_ns = now_ns
+        self._clock_run_packets = 0
+
+    def _clock_run(self) -> tuple[float, float, int]:
+        """Return (packets_per_second, run_seconds, packets) for the current run.
+
+        Caller must hold _stats_lock. Returns zeros until the run is long enough
+        for the figure to mean anything.
+        """
+        seconds = (self._clock_run_last_ns - self._clock_run_start_ns) / 1e9
+        if self._clock_run_packets >= CLOCK_MIN_RUN_PACKETS and seconds > 0:
+            if seconds >= self._clock_best_seconds:
+                return self._clock_run_packets / seconds, seconds, self._clock_run_packets
+        if self._clock_best_seconds > 0:
+            return self._clock_best_rate, self._clock_best_seconds, self._clock_run_packets
+        return 0.0, max(0.0, seconds), self._clock_run_packets
+
     @property
     def measured_packet_rate(self) -> float:
         """Packets per second observed from the radio, or 0.0 if not yet known.
@@ -795,10 +859,7 @@ class NetworkAudioMonitor:
         difference accumulates in the radio's ring until it slips.
         """
         with self._stats_lock:
-            if self._clock_packets < 500:
-                return 0.0
-            elapsed = (self._last_packet_ns - self._first_packet_ns) / 1e9
-            return self._clock_packets / elapsed if elapsed > 0 else 0.0
+            return self._clock_run()[0]
 
     @property
     def status(self) -> str:
@@ -806,19 +867,26 @@ class NetworkAudioMonitor:
             if not self._packet_count:
                 return "UDP waiting"
             underflows = f"  drops {self._underflows}" if self._underflows else ""
-            clock = ""
-            if self._clock_packets >= 500:
-                elapsed = (self._last_packet_ns - self._first_packet_ns) / 1e9
-                if elapsed > 0:
-                    rate = self._clock_packets / elapsed
-                    nominal = 1.0 / NETWORK_TX_PERIOD
-                    clock = (
-                        f"  radio {rate:.2f} pkt/s "
-                        f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm)"
-                    )
+            gaps = f"  breaks {self._clock_gaps}" if self._clock_gaps else ""
+            if self._clock_outliers:
+                gaps += f"  stalls {self._clock_outliers}"
+            rate, seconds, run_packets = self._clock_run()
+            if rate:
+                # Report the implied sample rate as well. It validates the
+                # assumption that a 192-byte payload is one millisecond of
+                # 48 kHz stereo: a wildly different figure means the assumed
+                # cadence, not the crystal, is wrong.
+                frames = NETWORK_TX_PACKET_BYTES // 4
+                nominal = 1.0 / NETWORK_TX_PERIOD
+                clock = (
+                    f"  radio {rate:.2f} pkt/s = {rate * frames:.0f} Hz "
+                    f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm) over {seconds:.0f}s"
+                )
+            else:
+                clock = f"  radio clock: {run_packets}/{CLOCK_MIN_RUN_PACKETS} pkts"
             return (
                 f"UDP {self._packet_count} pkts  {self._last_packet_size} B  "
-                f"{self._format}{clock}{underflows}"
+                f"{self._format}{clock}{gaps}{underflows}"
             )
 
 
@@ -3448,6 +3516,67 @@ def self_test() -> None:
             assert ratio > 10, (receive_mode, ratio)
         finally:
             receiver.stop()
+
+    # The radio's media clock is measured from packet arrivals, and that figure
+    # decides whether transmit audio has to be re-paced. Averaging over the whole
+    # session made it climb towards the truth forever without settling, because
+    # the stream pauses while transmitting and does not start with the socket.
+    # Exercise the real accumulator, not a copy of it.
+    class _ClockSignals:
+        class _Slot:
+            def emit(self, *args: object) -> None:
+                pass
+
+        audio_state_changed = _Slot()
+
+    def measure_clock(arrivals_ns: list[int]) -> tuple[float, float]:
+        monitor = NetworkAudioMonitor(_ClockSignals())
+        for stamp in arrivals_ns:
+            monitor._packet_count += 1
+            monitor._note_arrival(stamp)
+        return monitor.measured_packet_rate, monitor._clock_best_seconds
+
+    def arrivals(start_ns: float, seconds: float, rate: float) -> list[int]:
+        return [int(start_ns + i / rate * 1e9) for i in range(int(seconds * rate))]
+
+    for true_rate in (998.10, 1000.00, 1001.30):
+        clean = arrivals(0, 40, true_rate)
+        # A stray packet then a long idle period must not drag the estimate.
+        stray = [0] + arrivals(30e9, 40, true_rate)
+        # A transmit pause splits the run; the surviving run is still exact.
+        paused = arrivals(0, 25, true_rate) + arrivals(45e9, 40, true_rate)
+        # A single stall must end the run rather than bias it: absorbing one
+        # 30 ms stall into a 20 s window would be a 1500 ppm error.
+        stalled = [x + (30_000_000 if x > 10e9 else 0) for x in arrivals(0, 40, true_rate)]
+        for label, series in (("clean", clean), ("stray+idle", stray),
+                              ("paused", paused), ("stalled", stalled)):
+            measured, _ = measure_clock(series)
+            assert measured > 0, (label, true_rate)
+            error_ppm = abs(measured - true_rate) / true_rate * 1e6
+            assert error_ppm < 50, (label, true_rate, measured, error_ppm)
+        # A long run followed by a short one must still report the long run.
+        # Discarding it on every break would lose the only usable measurement.
+        long_then_short = arrivals(0, 40, true_rate) + arrivals(60e9, 3, true_rate)
+        measured, best_seconds = measure_clock(long_then_short)
+        assert best_seconds > 30, best_seconds
+        assert abs(measured - true_rate) / true_rate * 1e6 < 50, (measured, true_rate)
+        # A stalled receive thread draining its backlog delivers a burst of
+        # packets with near-identical arrival stamps. Counting those would add
+        # packet count with no elapsed time and over-read the rate by about
+        # 1000 ppm, so the burst has to end the run instead.
+        held_ns = 25_000_000
+        burst_at = 15e9
+        bursty = sorted(
+            max(stamp, burst_at + held_ns)
+            if burst_at <= stamp < burst_at + held_ns
+            else stamp
+            for stamp in arrivals(0, 40, true_rate)
+        )
+        measured, _ = measure_clock(bursty)
+        assert measured > 0, "clean stretches either side must still measure"
+        assert abs(measured - true_rate) / true_rate * 1e6 < 50, (measured, true_rate)
+    # Too little data must report nothing rather than a wrong number.
+    assert measure_clock(arrivals(0, 1, 1000.0))[0] == 0.0
 
     # The receive demodulator must actually select a sideband. A product
     # detector taking baseband.real passes both sides equally, which makes the
