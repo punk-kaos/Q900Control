@@ -53,6 +53,24 @@ network-side.
 
 Recording is off unless `Q900_TX_RECORD` is set.
 
+### Radio Clock Offset
+
+The network audio row shows the radio's measured media rate once 500 receive
+packets have arrived, for example `radio 999.40 pkt/s (-600 ppm)`.
+
+This matters because nothing rate-matches the two ends. The radio runs UHSDR on
+an STM32H7 whose codec is clocked by the radio's own crystal, and neither its
+firmware nor this application resamples. Transmit audio is paced from the host
+clock at 1000 packets per second. Any difference between the two accumulates in
+the radio's transmit ring until it slips a frame, and each slip is a
+discontinuity that reaches the air as a broadband click. A steady offset of a few
+hundred ppm produces a click every few seconds; larger offsets produce an audible
+tapping.
+
+A reading near `+0 ppm` rules that mechanism out. A reading of hundreds of ppm or
+more means transmit audio has to be paced from the radio's clock rather than the
+host's, or resampled to it.
+
 ## Radio Connection
 
 ### Network

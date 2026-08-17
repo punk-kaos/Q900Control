@@ -608,6 +608,13 @@ class NetworkAudioMonitor:
         self._iq_handler: Callable[[np.ndarray], None] | None = None
         self._stream_type = 0
         self._underflows = 0
+        # The radio's media stream is clocked by its own crystal, and neither this
+        # application nor the radio's UHSDR firmware rate-matches the two ends.
+        # The arrival rate of its packets therefore measures that clock, which is
+        # the rate transmit audio has to be delivered at.
+        self._first_packet_ns = 0
+        self._last_packet_ns = 0
+        self._clock_packets = 0
 
     def start(self, output_device: int, port: int = 8000) -> None:
         self.stop()
@@ -708,6 +715,13 @@ class NetworkAudioMonitor:
                     self._last_packet_size = len(packet)
                     self._format = audio_format
                     self._stream_type = packet_type
+                    now_ns = time.monotonic_ns()
+                    if not self._first_packet_ns:
+                        self._first_packet_ns = now_ns
+                        self._clock_packets = 0
+                    else:
+                        self._clock_packets += 1
+                        self._last_packet_ns = now_ns
                 if first_packet:
                     print(
                         f"Q900 UDP audio from {peer[0]}:{peer[1]}: {len(packet)} bytes, "
@@ -749,7 +763,10 @@ class NetworkAudioMonitor:
             self._packet_count = 0
             self._last_packet_size = 0
             self._format = "waiting"
-            self._stream_type = 0
+            self._first_packet_ns = 0
+            self._last_packet_ns = 0
+            self._clock_packets = 0
+        self._stream_type = 0
         self._underflows = 0
 
     def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
@@ -769,14 +786,39 @@ class NetworkAudioMonitor:
         return self._stream is not None
 
     @property
+    def measured_packet_rate(self) -> float:
+        """Packets per second observed from the radio, or 0.0 if not yet known.
+
+        This is the radio's own media clock. Transmit audio has to be delivered
+        at this rate, not at the host's nominal rate: neither this application
+        nor the radio's UHSDR firmware rate-matches the two ends, so any
+        difference accumulates in the radio's ring until it slips.
+        """
+        with self._stats_lock:
+            if self._clock_packets < 500:
+                return 0.0
+            elapsed = (self._last_packet_ns - self._first_packet_ns) / 1e9
+            return self._clock_packets / elapsed if elapsed > 0 else 0.0
+
+    @property
     def status(self) -> str:
         with self._stats_lock:
             if not self._packet_count:
                 return "UDP waiting"
             underflows = f"  drops {self._underflows}" if self._underflows else ""
+            clock = ""
+            if self._clock_packets >= 500:
+                elapsed = (self._last_packet_ns - self._first_packet_ns) / 1e9
+                if elapsed > 0:
+                    rate = self._clock_packets / elapsed
+                    nominal = 1.0 / NETWORK_TX_PERIOD
+                    clock = (
+                        f"  radio {rate:.2f} pkt/s "
+                        f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm)"
+                    )
             return (
                 f"UDP {self._packet_count} pkts  {self._last_packet_size} B  "
-                f"{self._format}{underflows}"
+                f"{self._format}{clock}{underflows}"
             )
 
 
