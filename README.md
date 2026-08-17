@@ -65,6 +65,11 @@ mapping has not been confirmed: `REF`, `DISP`, `RIT`, and `XIT`.
 
 `LTIME` maps to Q900 CAT `0x32`; its radio-side unit is not yet confirmed.
 
+The spectrum is polled at roughly 8 Hz while receiving and not at all while
+transmitting: the display shows the receive passband, so it is not meaningful on
+air, and the request costs radio DSP time and a host repaint that competes with
+the microphone callback.
+
 ## Audio And PTT
 
 ### SDR Receive
@@ -116,9 +121,17 @@ than by discarding schedule, because discarding makes the long-run send rate
 lower than the capture rate. Buffered capture is capped at 200 ms by trimming
 the oldest whole packets, so transmit latency cannot grow without bound.
 
-The PTT line reports packet count, underruns (`gaps`), packets trimmed at the
-buffer cap (`trim`), failed sends (`err`), worst scheduling delay (`late`), and
-clipped microphone blocks (`clip`).
+The PTT line reports packet count, capture overflows (`ovf`), underruns
+(`gaps`), packets trimmed at the buffer cap (`trim`), failed sends (`err`),
+worst scheduling delay (`late`), and clipped microphone blocks (`clip`).
+
+`ovf` is the one to watch. A PortAudio input overflow means capture samples
+were lost before the sender ever saw them. The byte stream stays contiguous, so
+this is a splice rather than a gap: no other counter can see it, and it reaches
+the air as a broadband click. It is caused by something in the GUI process
+holding the interpreter lock longer than one 20 ms microphone block, so the
+spectrum and waterfall are drawn with vectorised array math, repaints are
+coalesced to 15 Hz, and spectrum polling stops while transmitting.
 
 ### Rigctl Virtual Audio
 

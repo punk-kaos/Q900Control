@@ -52,6 +52,10 @@ from PyQt6.QtWidgets import (
 SYNC = b"\xa5\xa5\xa5\xa5"
 SPECTRUM_PAYLOAD_LENGTH = 516
 SPECTRUM_BINS = 512
+# Spectrum frames arrive at roughly 8 Hz and every arrival used to force a
+# repaint. Coalesce them: the GUI process shares its GIL with the microphone
+# callback, so paint cost is transmit audio quality.
+SPECTRUM_MAX_REPAINT_HZ = 15
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
 # The Q900 default IQ translation places the CAT-tuned carrier 12 kHz above
 # the stream reference. Use the same reference for the CAT spectrum cursor.
@@ -575,6 +579,7 @@ class NetworkAudioMonitor:
         self._stats_lock = threading.Lock()
         self._iq_handler: Callable[[np.ndarray], None] | None = None
         self._stream_type = 0
+        self._underflows = 0
 
     def start(self, output_device: int, port: int = 8000) -> None:
         self.stop()
@@ -583,6 +588,10 @@ class NetworkAudioMonitor:
         max_queued_frames = self.SAMPLE_RATE * 2
 
         def output_callback(outdata, frames, timing, status):  # type: ignore[no-untyped-def]
+            if status.output_underflow:
+                # Playback ran dry: audible as a click, and a symptom of this
+                # process being too busy to service the audio device in time.
+                self._underflows += 1
             outdata.fill(0)
             offset = 0
             with self._queue_lock:
@@ -713,6 +722,7 @@ class NetworkAudioMonitor:
             self._last_packet_size = 0
             self._format = "waiting"
             self._stream_type = 0
+        self._underflows = 0
 
     def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
         """Send from the same UDP/8000 socket used by the Q900 media session."""
@@ -735,7 +745,11 @@ class NetworkAudioMonitor:
         with self._stats_lock:
             if not self._packet_count:
                 return "UDP waiting"
-            return f"UDP {self._packet_count} pkts  {self._last_packet_size} B  {self._format}"
+            underflows = f"  drops {self._underflows}" if self._underflows else ""
+            return (
+                f"UDP {self._packet_count} pkts  {self._last_packet_size} B  "
+                f"{self._format}{underflows}"
+            )
 
 
 # One network TX datagram is the radio's native media quantum: 48 interleaved
@@ -1109,6 +1123,7 @@ class TransmitAudioRouter:
         self._udp_clipped: mp.Value | None = None
         self._udp_trimmed: mp.Value | None = None
         self._udp_send_errors: mp.Value | None = None
+        self._udp_overflows: mp.Value | None = None
         self._udp_ready: mp.Event | None = None
 
     def start_usb(self, microphone: int, q900_output: int) -> None:
@@ -1180,9 +1195,17 @@ class TransmitAudioRouter:
         self._udp_clipped = self._mp.Value("L", 0, lock=False)
         self._udp_trimmed = self._mp.Value("L", 0, lock=False)
         self._udp_send_errors = self._mp.Value("L", 0, lock=False)
+        self._udp_overflows = self._mp.Value("L", 0, lock=False)
         self._udp_ready = self._mp.Event()
 
         def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
+            if self._udp_overflows and status.input_overflow:
+                # Capture samples were lost before they reached us. The byte
+                # stream stays contiguous, so this is a splice rather than a
+                # gap: no downstream counter can see it, and it reaches the air
+                # as a broadband click. Almost always GIL starvation of this
+                # callback by expensive work elsewhere in the GUI process.
+                self._udp_overflows.value += 1
             pcm = np.clip(indata[:, 0], -1, 1)
             with self._level_lock:
                 self._level = float(np.max(np.abs(pcm)))
@@ -1266,8 +1289,13 @@ class TransmitAudioRouter:
         self._udp_trimmed = None
         self._udp_send_errors = None
         self._udp_ready = None
+        # Capture overflow applies to both TX paths: this one has an InputStream
+        # sharing the GUI process GIL exactly as the audio path does.
+        self._udp_overflows = self._mp.Value("L", 0, lock=False)
 
         def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
+            if self._udp_overflows and status.input_overflow:
+                self._udp_overflows.value += 1
             pcm = np.clip(indata[:, 0], -1, 1)
             with self._level_lock:
                 self._level = float(np.max(np.abs(pcm)))
@@ -1372,9 +1400,10 @@ class TransmitAudioRouter:
         clipped = self._udp_clipped.value if self._udp_clipped else 0
         trimmed = self._udp_trimmed.value if self._udp_trimmed else 0
         errors = self._udp_send_errors.value if self._udp_send_errors else 0
+        overflows = self._udp_overflows.value if self._udp_overflows else 0
         return (
-            f"UDP {packets} pkts  gaps {underruns}  trim {trimmed}  err {errors}  "
-            f"late {late_ms:.1f} ms  clip {clipped}"
+            f"UDP {packets} pkts  ovf {overflows}  gaps {underruns}  trim {trimmed}  "
+            f"err {errors}  late {late_ms:.1f} ms  clip {clipped}"
         )
 
 
@@ -1778,7 +1807,16 @@ class RadioClient:
                     if now - last_status >= 0.49:
                         self.send(encode_frame(Command.STATUS))
                         last_status = now
-                    if not spectrum_pending_at or now - spectrum_pending_at >= 0.15:
+                    if self.state.ptt:
+                        # Do not ask the radio to compute and stream a 516-byte
+                        # FFT frame while it is transmitting. The spectrum shows
+                        # the receive passband and is not meaningful on air, and
+                        # the request costs radio DSP time and a host repaint
+                        # that competes with the microphone callback. Clear the
+                        # pending marker so polling resumes on unkey instead of
+                        # waiting out a stale request window.
+                        spectrum_pending_at = 0.0
+                    elif not spectrum_pending_at or now - spectrum_pending_at >= 0.15:
                         if now - last_spectrum >= 0.12:
                             self.send(encode_frame(Command.SPECTRUM))
                             last_spectrum = now
@@ -1916,6 +1954,31 @@ class ControlTile(QPushButton):
         self.value.setText(value)
 
 
+def waterfall_argb(rows: np.ndarray, width: int) -> np.ndarray:
+    """Map stacked 8-bit spectrum rows to one ARGB scanline per row.
+
+    Each row is normalised against its own minimum and maximum, exactly as the
+    original per-pixel mapping did. Vectorising this is not cosmetic: a
+    QImage.setPixel() loop over the same pixels costs 20-70 ms per repaint,
+    which is one to three microphone callback periods, and the GUI process
+    shares its GIL with that callback. Paint cost is transmit audio quality.
+    """
+    index = np.arange(width) * (rows.shape[1] - 1) // max(1, width - 1)
+    full = rows.astype(np.int32)
+    # Normalise against the whole row, not the resampled pixels. These coincide
+    # once the widget is wider than the bin count but diverge when it is not.
+    minimum = full.min(axis=1, keepdims=True)
+    spread = np.maximum(1, full.max(axis=1, keepdims=True) - minimum)
+    # Build the ARGB words in uint32: the opaque alpha byte does not fit int32.
+    intensity = ((full[:, index] - minimum) * 255 // spread).astype(np.uint32)
+    return (
+        np.uint32(0xFF000000)
+        | (intensity << 16)
+        | ((80 + intensity * 175 // 255) << 8)
+        | (40 + (255 - intensity) * 150 // 255)
+    )
+
+
 class SpectrumWaterfall(QWidget):
     """Canvas-like spectrum and waterfall based on the HTML reference behavior."""
 
@@ -1938,6 +2001,14 @@ class SpectrumWaterfall(QWidget):
         self._sdr_active = False
         self._sdr_offset_hz = 0
         self._sdr_mode = "USB"
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setSingleShot(True)
+        self._repaint_timer.timeout.connect(self.update)
+
+    def _schedule_update(self) -> None:
+        """Coalesce repaints so frame arrival rate cannot drive paint rate 1:1."""
+        if not self._repaint_timer.isActive():
+            self._repaint_timer.start(1000 // SPECTRUM_MAX_REPAINT_HZ)
 
     def set_state(self, state: RadioState) -> None:
         tuned_hz = state.vfo_b_hz if state.active_vfo_b else state.vfo_a_hz
@@ -1945,19 +2016,19 @@ class SpectrumWaterfall(QWidget):
         self._display_center_hz = self._tuned_hz
         self._mode = state.vfo_b_mode if state.active_vfo_b else state.vfo_a_mode
         self._span_hz = SPAN_HZ[state.span_index]
-        self.update()
+        self._schedule_update()
 
     def add_bins(self, bins: bytes) -> None:
         self._bins = bins
         self._rows.insert(0, bins)
         self._rows = self._rows[:140]
-        self.update()
+        self._schedule_update()
 
     def set_sdr(self, active: bool, offset_hz: int, mode: str) -> None:
         self._sdr_active = active
         self._sdr_offset_hz = offset_hz
         self._sdr_mode = mode
-        self.update()
+        self._schedule_update()
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)
@@ -2052,6 +2123,9 @@ class SpectrumWaterfall(QWidget):
             y = height - int(value / 255 * (height - 12))
             points.append(QPoint(x, y))
         painter.setPen(QPen(QColor("#76e0ee"), 1.3))
+        # Deliberately a drawLine() loop, not drawPolyline(). The 1.3-width pen
+        # makes Qt stroke a joined 1400-segment path, which measured 22.5 ms
+        # against 0.73 ms for independent cosmetic lines.
         for first, second in zip(points, points[1:]):
             painter.drawLine(first, second)
         painter.setPen(QColor("#9aaab5"))
@@ -2060,27 +2134,32 @@ class SpectrumWaterfall(QWidget):
 
     def _draw_waterfall(self, painter: QPainter, width: int, top: int, height: int) -> None:
         painter.fillRect(0, top, width, height, QColor("#02050c"))
-        if not self._rows:
+        if not self._rows or width < 1:
             painter.setPen(QColor("#63727d"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for spectrum frames")
             return
         row_height = max(1, height // min(len(self._rows), 100))
-        # Build a one-pixel-high scanline and let Qt scale it vertically. The
-        # former nested Python loop wrote every pixel in each row height and
-        # can consume a full core while SDR media is active.
-        image = QImage(width, 1, QImage.Format.Format_RGB32)
-        for row_number, bins in enumerate(self._rows[:height // row_height]):
-            minimum, maximum = min(bins), max(bins)
-            spread = max(1, maximum - minimum)
-            for x in range(width):
-                index = int(x * (len(bins) - 1) / max(1, width - 1))
-                intensity = (bins[index] - minimum) * 255 // spread
-                image.setPixel(
-                    x,
-                    0,
-                    0xFF000000 | (intensity << 16) | ((80 + intensity * 175 // 255) << 8) | (40 + (255 - intensity) * 150 // 255),
-                )
-            painter.drawImage(QRectF(0, top + row_number * row_height, width, row_height), image)
+        rows = [row for row in self._rows[: max(1, height // row_height)] if len(row) >= 2]
+        if not rows:
+            return
+        bin_count = len(rows[0])
+        rows = [row for row in rows if len(row) == bin_count]
+        # Build every scanline at once and blit the waterfall in a single
+        # drawImage. The previous per-pixel QImage.setPixel() loop held the GIL
+        # for 20-70 ms per repaint, which starved the microphone callback in this
+        # same process and put broadband clicks on the transmitted audio.
+        stacked = np.frombuffer(b"".join(rows), dtype=np.uint8).reshape(len(rows), bin_count)
+        scanlines = waterfall_argb(stacked, width)
+        image = QImage(
+            # tobytes() hands Qt an owned copy, so no backing buffer has to
+            # outlive this call.
+            scanlines.tobytes(),
+            width,
+            len(rows),
+            width * 4,
+            QImage.Format.Format_RGB32,
+        )
+        painter.drawImage(QRectF(0, top, width, len(rows) * row_height), image)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.MouseButton.LeftButton:
@@ -3080,6 +3159,44 @@ def self_test() -> None:
         <= NETWORK_TX_HIGH_WATER_PACKETS
     )
     assert NETWORK_TX_PRIME_PACKETS <= NETWORK_TX_PREROLL_PACKETS
+
+    # The vectorized waterfall must reproduce the previous per-pixel mapping
+    # exactly. That loop was replaced because it held the GIL for 20-70 ms per
+    # repaint and starved the microphone callback in the same process.
+    def waterfall_argb_reference(bins: bytes, width: int) -> list[int]:
+        minimum, maximum = min(bins), max(bins)
+        spread = max(1, maximum - minimum)
+        out = []
+        for x in range(width):
+            index = int(x * (len(bins) - 1) / max(1, width - 1))
+            intensity = (bins[index] - minimum) * 255 // spread
+            out.append(
+                0xFF000000
+                | (intensity << 16)
+                | ((80 + intensity * 175 // 255) << 8)
+                | (40 + (255 - intensity) * 150 // 255)
+            )
+        return out
+
+    patterns = [
+        bytes(range(256)) * 2,
+        bytes((0, 255) * 256),
+        bytes((7,)) * 512,
+        bytes((i * i // 512) % 256 for i in range(512)),
+    ]
+    for pattern in patterns:
+        for test_width in (1, 2, 3, 511, 512, 513, 900, 1900):
+            expected = waterfall_argb_reference(pattern, test_width)
+            produced = waterfall_argb(
+                np.frombuffer(pattern, dtype=np.uint8).reshape(1, -1), test_width
+            )
+            assert list(produced[0]) == expected, (test_width, len(pattern))
+    # Multiple rows are normalised independently, exactly as the row loop was.
+    multi = np.frombuffer(patterns[0] + patterns[3], dtype=np.uint8).reshape(2, 512)
+    produced = waterfall_argb(multi, 640)
+    assert list(produced[0]) == waterfall_argb_reference(patterns[0], 640)
+    assert list(produced[1]) == waterfall_argb_reference(patterns[3], 640)
+    assert produced.dtype == np.uint32
     iq_tx = np.empty(48 * 2, dtype="<i2")
     iq_tx[0::2] = 100
     iq_tx[1::2] = -100
