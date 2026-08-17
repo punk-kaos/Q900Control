@@ -409,6 +409,9 @@ class SDRReceiver:
         self.mode = "USB"
         # Q900 network IQ places the CAT-tuned carrier near +12 kHz.
         self.offset_hz = 12_000
+        # These mirror the whole 48 kHz stream about its own DC, not about the
+        # tuned carrier, so they detune rather than swap sidebands. Use the
+        # offset control to retune and the mode selector to pick a sideband.
         self.swap_iq = False
         self.invert_q = False
 
@@ -474,6 +477,9 @@ class SDRReceiver:
         am_taps = self._lowpass_taps(4_500, 65)
         ssb_previous_input = 0.0
         ssb_previous_output = 0.0
+        ssb_history = np.zeros(_HILBERT_LEN - 1, dtype=np.complex128)
+        ssb_taps = np.ones(9, dtype=np.float32) / 9
+        ssb_smooth_history = np.zeros(len(ssb_taps) - 1, dtype=np.float64)
         output_pending: deque[np.ndarray] = deque()
         while not self._stop.is_set():
             try:
@@ -525,12 +531,33 @@ class SDRReceiver:
                 audio = envelope - np.mean(envelope)
                 gain = self.AM_OUTPUT_GAIN
             else:
-                # USB and LSB share the same suppressed-carrier frequency.
-                # Sideband content is carried in the complex samples around
-                # it, so both must translate the selected carrier to zero.
+                # USB and LSB share the same suppressed-carrier frequency, so
+                # both translate the selected carrier to zero. They differ only
+                # in which side of zero carries the wanted audio. Taking
+                # baseband.real is a product detector: it folds both sides
+                # together, so it has no opposite-sideband rejection and the
+                # mode selector has no audible effect.
+                #
+                # Use a phasing detector instead. With H the Hilbert transform
+                # (H(w) = -j*sgn(w), realised by _HILBERT_TAPS), I - H{Q} keeps
+                # only positive baseband frequencies and I + H{Q} keeps only
+                # negative ones.
                 shift = np.exp(-1j * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
                 baseband = signal * shift
-                audio = np.convolve(baseband.real, np.ones(9, dtype=np.float32) / 9, mode="same")
+                combined = np.concatenate((ssb_history, baseband))
+                ssb_history = combined[-(_HILBERT_LEN - 1):]
+                quadrature = np.convolve(combined.imag, _HILBERT_TAPS, mode="valid")
+                in_phase = combined.real[_HILBERT_DELAY : _HILBERT_DELAY + count]
+                if self.mode == "LSB":
+                    audio = in_phase + quadrature
+                else:
+                    audio = in_phase - quadrature
+                # Smooth with carried state. A mode="same" convolution per block
+                # zero-pads both edges, which puts a discontinuity at every
+                # block boundary and buzzes at the block rate.
+                smoothing_input = np.concatenate((ssb_smooth_history, audio))
+                ssb_smooth_history = smoothing_input[-(len(ssb_taps) - 1):]
+                audio = np.convolve(smoothing_input, ssb_taps, mode="valid")
                 # Remove residual carrier/DC without suppressing voice tones.
                 highpassed = np.empty_like(audio)
                 for sample_index, sample in enumerate(audio):
@@ -957,13 +984,22 @@ def encode_iq_block(state: IqEncoderState, audio: np.ndarray, mode: str, offset_
     if mode in ("USB", "LSB"):
         state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
         ssb_audio = np.clip(audio - state.ssb_dc, -0.45, 0.45)
-        # The 63-tap Hilbert needs 31 future samples, so the streaming state
-        # keeps the previous 62 samples and the whole output lags 31 behind.
+        # The 127-tap Hilbert needs 63 future samples, so the streaming state
+        # keeps the previous 126 samples and the whole output lags 63 behind.
         combined = np.concatenate((state.hilbert_state, ssb_audio))
         quadrature = np.convolve(combined, _HILBERT_TAPS, mode="valid")
         in_phase = combined[_HILBERT_DELAY : _HILBERT_DELAY + count]
         state.hilbert_state = combined[-(_HILBERT_LEN - 1):]
-        baseband = in_phase + 1j * (quadrature if mode == "LSB" else -quadrature)
+        # _HILBERT_TAPS realise H(w) = -j*sgn(w), so in_phase + 1j*quadrature is
+        # the analytic signal: positive baseband frequencies only, which becomes
+        # the upper sideband once the carrier and the radio's mirror are applied.
+        # Do not flip this sign to correct an inverted sideband heard on air. It
+        # mirrors USB and LSB together, so the mode labels swap and nothing is
+        # actually corrected, and it leaves AM and NFM untouched because they
+        # never reach this branch. A genuine whole-stream handedness error is a
+        # property of the radio's mirror, so it belongs with the carrier offset
+        # and the pack_iq_words() toggles, which act on every mode alike.
+        baseband = in_phase + 1j * (quadrature if mode == "USB" else -quadrature)
     elif mode == "AM":
         state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
         baseband = 0.55 + np.clip(audio - state.ssb_dc, -0.45, 0.45).astype(np.complex64)
@@ -3243,6 +3279,25 @@ def self_test() -> None:
     correlation = np.corrcoef(measured, reference)[0, 1]
     assert correlation > 0.9, correlation
 
+    # LSB must be a true lower sideband. Without this, the USB assertion above
+    # can be satisfied by inverting the Hilbert sign, which mirrors both modes
+    # at once so USB transmits LSB and vice versa. Testing only one sideband
+    # cannot distinguish a correct encoder from a fully swapped one.
+    lsb_iq = encode_stream(tone, "LSB", 12_000)
+    lsb_baseband = np.conj(lsb_iq) * np.exp(-1j * 2 * np.pi * 12_000 * np.arange(len(tone)) / rate)
+    lsb_spectrum = np.fft.fft(lsb_baseband * np.hanning(len(lsb_baseband)))
+    # The wanted and image bins are the mirror of the USB case.
+    lsb_wanted_power = np.abs(lsb_spectrum[image_bin])
+    lsb_image_power = np.abs(lsb_spectrum[wanted_bin])
+    assert lsb_image_power < lsb_wanted_power * 10 ** (-40 / 20), (
+        lsb_image_power,
+        lsb_wanted_power,
+    )
+    # Both sidebands carry the audio in the real part with the same polarity, so
+    # this also pins in_phase against an accidental overall sign inversion.
+    lsb_correlation = np.corrcoef(lsb_baseband.real[_HILBERT_DELAY:], reference)[0, 1]
+    assert lsb_correlation > 0.9, lsb_correlation
+
     # NFM deviation must reach 2 kHz even for quiet microphones, and the FM
     # phase must stay continuous across 48-sample packet boundaries.
     for peak in (0.05, 0.1, 0.3, 0.9):
@@ -3296,9 +3351,63 @@ def self_test() -> None:
         finally:
             receiver.stop()
 
-    # The encoder bakes the radio mirror in by default. Swapping I/Q (or
-    # inverting Q) individually flips the dominant component to the wrong side
-    # of the carrier, and applying both cancels back to the default.
+    # The receive demodulator must actually select a sideband. A product
+    # detector taking baseband.real passes both sides equally, which makes the
+    # RX mode selector inert and hides transmit-side sideband errors from anyone
+    # listening on this app. Feed a single complex exponential placed strictly
+    # above or below the suppressed carrier and require real rejection.
+    def demodulate_offset_tone(receive_mode: str, tone_offset_hz: int) -> np.ndarray:
+        samples = int(rate * 0.5)
+        axis = np.arange(samples) / rate
+        wave = 0.4 * np.exp(1j * 2 * np.pi * (12_000 + tone_offset_hz) * axis)
+        words = np.empty(samples * 2, dtype="<i2")
+        words[0::2] = np.clip(wave.real * 32767, -32768, 32767).astype("<i2")
+        words[1::2] = np.clip(wave.imag * 32767, -32768, 32767).astype("<i2")
+        collected: list[np.ndarray] = []
+        receiver = SDRReceiver(collected.append)
+        receiver.mode = receive_mode
+        receiver.offset_hz = 12_000
+        receiver.SSB_OUTPUT_GAIN = 1.0
+        receiver.start()
+        try:
+            block_words = SDRReceiver.BLOCK_FRAMES * 2
+            for start in range(0, len(words), block_words):
+                receiver.feed(words[start : start + block_words])
+            time.sleep(0.25)
+        finally:
+            receiver.stop()
+        return np.concatenate(collected) if collected else np.zeros(1, dtype=np.float32)
+
+    def tone_power_at(audio: np.ndarray, hz: float) -> float:
+        spectrum = np.abs(np.fft.rfft(audio * np.hanning(len(audio))))
+        bins = np.fft.rfftfreq(len(audio), 1 / rate)
+        return float(spectrum[int(np.argmin(np.abs(bins - hz)))])
+
+    for receive_mode in ("USB", "LSB"):
+        above = demodulate_offset_tone(receive_mode, 1_000)
+        below = demodulate_offset_tone(receive_mode, -1_000)
+        upper = tone_power_at(above, 1_000)
+        lower = tone_power_at(below, 1_000)
+        wanted_audio = above if receive_mode == "USB" else below
+        wanted, image = (upper, lower) if receive_mode == "USB" else (lower, upper)
+        assert wanted > 0, receive_mode
+        assert image < wanted * 10 ** (-30 / 20), (receive_mode, image, wanted)
+        # Every filter in this path must carry state across blocks. A per-block
+        # mode="same" convolution zero-pads both edges, which puts a
+        # discontinuity at each boundary and raises a comb at the block rate
+        # (48000/960 = 50 Hz). That measured -53 dB before the carried state was
+        # added and -138 dB after.
+        block_rate = rate / SDRReceiver.BLOCK_FRAMES
+        worst_spur = max(
+            tone_power_at(wanted_audio, block_rate * harmonic) for harmonic in range(1, 7)
+        )
+        assert worst_spur < wanted * 10 ** (-80 / 20), (receive_mode, worst_spur, wanted)
+
+    # The encoder bakes the radio mirror in by default. `Swap I/Q` sends
+    # j*conj(z) and `Invert Q` sends conj(z), so each mirrors the whole 48 kHz
+    # stream about its own DC rather than about the tuned carrier. At the default
+    # +12 kHz offset that moves the signal 24 kHz, aliasing to +23 kHz, instead
+    # of exchanging sidebands. Applying both cancels back to the default.
     def mirrored_spectrum(swap: bool, invert: bool) -> np.ndarray:
         packed = pack_iq_words(encode_stream(tone, "USB", 12_000), swap, invert)
         packed_complex = np.frombuffer(packed, dtype="<i2").astype(np.float32).reshape(-1, 2)
@@ -3306,11 +3415,15 @@ def self_test() -> None:
         baseband = baseband * np.exp(-1j * 2 * np.pi * 12_000 * np.arange(len(tone)) / rate)
         return np.fft.fft(baseband * np.hanning(len(baseband)))
 
-    swapped_spectrum = mirrored_spectrum(True, False)
-    assert np.abs(swapped_spectrum[image_bin]) > np.abs(swapped_spectrum[wanted_bin]), (
-        np.abs(swapped_spectrum[image_bin]),
-        np.abs(swapped_spectrum[wanted_bin]),
-    )
+    default_wanted = np.abs(mirrored_spectrum(False, False)[wanted_bin])
+    for swap, invert in ((True, False), (False, True)):
+        moved = mirrored_spectrum(swap, invert)
+        peak_hz = frequencies[int(np.argmax(np.abs(moved)))]
+        assert abs(peak_hz - 23_000) < 100, (swap, invert, peak_hz)
+        # Assert the tone has left the carrier region entirely. Comparing the
+        # two sideband bins against each other would pass on leakage alone.
+        assert np.abs(moved[wanted_bin]) < default_wanted * 1e-4, (swap, invert)
+        assert np.abs(moved[image_bin]) < default_wanted * 1e-4, (swap, invert)
     identity_spectrum = mirrored_spectrum(True, True)
     assert np.abs(identity_spectrum[wanted_bin]) > np.abs(identity_spectrum[image_bin]) * 100, (
         np.abs(identity_spectrum[image_bin]),

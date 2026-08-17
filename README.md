@@ -79,10 +79,24 @@ It is independent of the Q900 CAT operating-mode selector. When enabled, the
 app requests the alternate stream and only activates SDR after it observes a
 Q900 UDP packet with type `0x68`.
 
-The SDR mode selector currently provides host-side `USB` and `LSB`
+The SDR mode selector currently provides host-side `USB`, `LSB`, `AM` and `NFM`
 demodulation. I/Q packets are decoded as 48 kHz interleaved signed PCM16LE
 complex frames and processed on a worker thread before being sent through the
 normal selected speaker or rigctl virtual-microphone output.
+
+`USB` and `LSB` use a phasing detector built on the same Hilbert transformer as
+the transmit encoder: with `H` the Hilbert transform, `I - H{Q}` keeps only
+positive baseband frequencies and `I + H{Q}` keeps only negative ones, measured
+at better than 60 dB opposite-sideband rejection. The two modes are therefore
+genuinely different. A product detector that simply takes the real part of the
+baseband would fold both sidebands together, give no rejection at all, and make
+the mode selector inert.
+
+The receive offset control retunes within the 48 kHz stream. The `swap_iq` and
+`invert_q` fields on the receiver mirror the whole stream about its own DC rather
+than about the tuned carrier, so they detune instead of swapping sidebands and
+are deliberately not exposed; use the offset control to retune and the mode
+selector to choose a sideband.
 
 SDR mode also supports experimental network I/Q transmit: 48 kHz interleaved
 complex S16LE on UDP/8000. The Q900's network upconverter consumes these as raw
