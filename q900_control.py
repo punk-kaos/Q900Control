@@ -749,7 +749,12 @@ def udp_audio_sender(
     late_ms: mp.Value,
 ) -> None:
     """Pace TX audio outside the GUI process and its contended Python GIL."""
-    packet_bytes = 96 * 2 * 2
+    # The radio's native media quantum is 96 int16 words: 48 interleaved stereo
+    # frames, 192 bytes, 1 ms at 48 kHz. That is the payload size the radio
+    # itself sends on RX and the size the working I/Q sender uses. A 384-byte
+    # 2 ms datagram carries the correct 192 kB/s aggregate but the firmware
+    # consumes only the first millisecond of it, discarding every second frame.
+    packet_bytes = 48 * 2 * 2
     preroll_bytes = 9_600 * 2 * 2
     pending = bytearray()
     while len(pending) < preroll_bytes and not stop.is_set():
@@ -760,7 +765,7 @@ def udp_audio_sender(
     while not keyed.wait(0.05) and not stop.is_set():
         pass
 
-    period = 0.002
+    period = 0.001
 
     def next_payload() -> bytes:
         while len(pending) < packet_bytes:
@@ -782,7 +787,7 @@ def udp_audio_sender(
     # Put 20 ms into the radio's TX ring before paced delivery. The host wake
     # delay is below one packet now, but the firmware/network path still has
     # several milliseconds of variance that a two-packet cushion cannot hide.
-    for _ in range(10):
+    for _ in range(20):
         try:
             udp_socket.sendto(next_payload(), target)
         except OSError:
@@ -878,7 +883,7 @@ def encode_iq_block(state: IqEncoderState, audio: np.ndarray, mode: str, offset_
         quadrature = np.convolve(combined, _HILBERT_TAPS, mode="valid")
         in_phase = combined[_HILBERT_DELAY : _HILBERT_DELAY + count]
         state.hilbert_state = combined[-(_HILBERT_LEN - 1):]
-        baseband = in_phase + 1j * (quadrature if mode == "USB" else -quadrature)
+        baseband = in_phase + 1j * (quadrature if mode == "LSB" else -quadrature)
     elif mode == "AM":
         state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
         baseband = 0.55 + np.clip(audio - state.ssb_dc, -0.45, 0.45).astype(np.complex64)
@@ -1013,7 +1018,6 @@ class TransmitAudioRouter:
     SAMPLE_RATE = 48_000
     BLOCK_SIZE = 960
     NETWORK_SAMPLE_RATE = 48_000
-    NETWORK_PACKET_SAMPLES = 96
     NETWORK_PREROLL_SAMPLES = 9_600
 
     def __init__(self, signals: RadioSignals) -> None:
@@ -2960,9 +2964,14 @@ def self_test() -> None:
     assert len(captured_audio[9:]) == 192
     raw_tx = np.zeros(96, dtype="<i2").tobytes()
     assert len(raw_tx) == 192
-    mono_tx = np.arange(96, dtype="<i2")
+    # A network TX datagram is one 1 ms media frame: 48 interleaved stereo
+    # frames, 96 int16 words, 192 bytes -- the same quantum the radio sends on
+    # RX. Tie the assertion to the captured RX payload so the two directions
+    # cannot silently drift apart again.
+    mono_tx = np.arange(48, dtype="<i2")
     stereo_tx = np.repeat(mono_tx, 2)
-    assert len(stereo_tx.tobytes()) == 384
+    assert len(stereo_tx) == 96
+    assert len(stereo_tx.tobytes()) == 192 == len(captured_audio[9:])
     assert np.array_equal(stereo_tx[0::2], stereo_tx[1::2])
     iq_tx = np.empty(48 * 2, dtype="<i2")
     iq_tx[0::2] = 100

@@ -97,14 +97,17 @@ Use `Hold To Talk` with the selected physical microphone.
 
 - USB transport sends microphone audio to the selected Q900 USB TX-output
   device.
-- Network transport sends raw Q900 UDP audio to the radio on UDP/8000.
+- Network transport sends raw Q900 UDP audio to the radio on UDP/8000, where
+  the radio performs the modulation.
 - SDR network transport sends 192-byte I/Q packets every 1 ms into the
   radio's digital-I/Q TX path.
 
 Network TX uses 48 kHz, stereo, signed 16-bit little-endian PCM. A mono
-microphone source is duplicated into interleaved left/right samples. The
-sender runs in a separate process and uses macOS absolute Mach timing for the
-Q900's 2 ms media cadence.
+microphone source is duplicated into interleaved left/right samples. Each
+datagram is one native media frame: 48 stereo frames, 96 signed 16-bit words,
+192 bytes, sent every 1 ms. That is the same quantum the radio uses for its own
+RX audio payload. The sender runs in a separate process and uses macOS absolute
+Mach timing to hold the 1 ms cadence.
 
 The PTT line reports packet count, underruns (`gaps`), worst scheduling delay
 (`late`), and clipped microphone blocks (`clip`).
@@ -169,5 +172,10 @@ A5 A5 A5 A5 | length | command | payload | CRC-16/CCITT-FALSE (big-endian)
 ```
 
 Network RX/TX audio uses UDP port `8000`. The radio-to-PC packets are Q900
-framed; PC-to-radio payloads are raw stereo PCM16LE without an application
-header.
+framed: a nine-byte header whose fifth byte is the stream type (`0x67` audio,
+`0x68` I/Q), followed by a 192-byte payload. PC-to-radio payloads are raw
+stereo PCM16LE without an application header, but use the same 192-byte
+payload size and 1 ms cadence. Sending a larger datagram at a
+proportionally slower rate delivers the correct aggregate byte rate and is
+still wrong: the firmware consumes only the first media frame of each
+datagram and discards the remainder.
