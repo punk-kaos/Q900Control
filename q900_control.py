@@ -66,9 +66,21 @@ SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
 # datagram -- ends the run instead of being averaged into it, because a single
 # 30 ms stall inside a 20 s window is a 1500 ppm error, the same order as the
 # crystal offset being measured.
+# A read later than this is reported as a stall. It does not end the run: a late
+# read moves an endpoint without changing the packet count, so count-over-span
+# remains unbiased, whereas restarting on every late read never accumulates a
+# usable window at all.
 CLOCK_STALL_NS = 4_000_000
+# Longer than this is a real pause in the stream rather than a late read, and the
+# radio genuinely stops producing audio during one.
 CLOCK_RUN_GAP_NS = 50_000_000
 CLOCK_MIN_RUN_PACKETS = 5_000
+# Set Q900_RX_RECORD to a path prefix to log the arrival pattern of the radio's
+# media stream: one 12-byte record per packet holding an 8-byte little-endian
+# monotonic nanosecond stamp, a 2-byte payload length and a 2-byte stream type.
+# Analyse with `--analyze-rx <prefix>`. This distinguishes a radio that sends in
+# bursts from a receive thread that is being starved, which need opposite fixes.
+RX_RECORD_PREFIX = os.environ.get("Q900_RX_RECORD") or None
 # The Q900 default IQ translation places the CAT-tuned carrier 12 kHz above
 # the stream reference. Use the same reference for the CAT spectrum cursor.
 FFT_TUNED_OFFSET_HZ = 12_000
@@ -635,6 +647,10 @@ class NetworkAudioMonitor:
         self._clock_gaps = 0
         self._clock_best_rate = 0.0
         self._clock_best_seconds = 0.0
+        self._clock_align_first_ns = 0
+        self._clock_align_first_index = 0
+        self._clock_align_last_ns = 0
+        self._clock_align_last_index = 0
 
     def start(self, output_device: int, port: int = 8000) -> None:
         self.stop()
@@ -686,6 +702,19 @@ class NetworkAudioMonitor:
 
         def receive_loop() -> None:
             set_interactive_qos()
+            arrival_log = None
+            if RX_RECORD_PREFIX:
+                try:
+                    arrival_log = open(f"{RX_RECORD_PREFIX}.rx.time", "wb")
+                except OSError:
+                    arrival_log = None
+            try:
+                receive_packets(arrival_log)
+            finally:
+                if arrival_log is not None:
+                    arrival_log.close()
+
+        def receive_packets(arrival_log) -> None:  # type: ignore[no-untyped-def]
             while not self._stop.is_set() and self._socket:
                 try:
                     packet, peer = self._socket.recvfrom(65_535)
@@ -735,7 +764,14 @@ class NetworkAudioMonitor:
                     self._last_packet_size = len(packet)
                     self._format = audio_format
                     self._stream_type = packet_type
-                    self._note_arrival(time.monotonic_ns())
+                    arrived_ns = time.monotonic_ns()
+                    self._note_arrival(arrived_ns)
+                    if arrival_log is not None:
+                        arrival_log.write(
+                            arrived_ns.to_bytes(8, "little")
+                            + min(len(packet), 0xFFFF).to_bytes(2, "little")
+                            + packet_type.to_bytes(2, "little")
+                        )
                 if first_packet:
                     print(
                         f"Q900 UDP audio from {peer[0]}:{peer[1]}: {len(packet)} bytes, "
@@ -784,6 +820,10 @@ class NetworkAudioMonitor:
             self._clock_gaps = 0
             self._clock_best_rate = 0.0
             self._clock_best_seconds = 0.0
+            self._clock_align_first_ns = 0
+            self._clock_align_first_index = 0
+            self._clock_align_last_ns = 0
+            self._clock_align_last_index = 0
         self._stream_type = 0
         self._underflows = 0
 
@@ -806,34 +846,48 @@ class NetworkAudioMonitor:
     def _note_arrival(self, now_ns: int) -> None:
         """Track the radio's media clock. Caller must hold _stats_lock.
 
-        Within an uninterrupted run the rate is packets divided by the elapsed
-        time between the first and last arrival, so arrival jitter enters only
-        through the endpoints. Anything that would corrupt that ends the run.
+        The rate is packets over the span between the first and last arrival of
+        the current run. A delayed read shifts an endpoint but does not change
+        the packet total, so that ratio stays unbiased as the window grows even
+        when reads are frequently late; breaking the run on every late read
+        instead throws away the measurement and never converges. Only a real
+        pause in the stream starts a new run, because during a pause the radio
+        genuinely stops producing audio.
         """
-        delta = now_ns - self._clock_run_last_ns if self._clock_run_last_ns else 0
-        if self._clock_run_last_ns and 0 < delta <= CLOCK_STALL_NS:
-            self._clock_run_packets += 1
+        if not self._clock_run_last_ns:
+            self._clock_run_start_ns = now_ns
             self._clock_run_last_ns = now_ns
             return
+        delta = now_ns - self._clock_run_last_ns
         if delta > CLOCK_RUN_GAP_NS:
             self._clock_gaps += 1
-        elif self._clock_run_last_ns:
-            # A stall, or two datagrams read in the same nanosecond because a
-            # socket backlog drained in a burst. Either way the arrival stamps
-            # have stopped being a faithful clock reference, so end the run.
-            # Counting burst packets would add count with no elapsed time and
-            # over-read the rate by around 1000 ppm.
+            rate, seconds, packets = self._clock_run()
+            if packets >= CLOCK_MIN_RUN_PACKETS and seconds > self._clock_best_seconds:
+                self._clock_best_rate = rate
+                self._clock_best_seconds = seconds
+            self._clock_run_start_ns = now_ns
+            self._clock_run_last_ns = now_ns
+            self._clock_run_packets = 0
+            self._clock_align_first_ns = 0
+            self._clock_align_first_index = 0
+            self._clock_align_last_ns = 0
+            self._clock_align_last_index = 0
+            return
+        self._clock_run_packets += 1
+        if delta > CLOCK_STALL_NS:
+            # A late read, or the boundary between groups if the radio sends its
+            # media in bursts. Record it as an alignment point: measuring between
+            # two boundaries makes the span cover a whole number of groups, where
+            # endpoints falling mid-group would understate it by up to one group
+            # and bias the rate by group duration over window.
             self._clock_outliers += 1
-        seconds = (self._clock_run_last_ns - self._clock_run_start_ns) / 1e9
-        if (
-            self._clock_run_packets >= CLOCK_MIN_RUN_PACKETS
-            and seconds > self._clock_best_seconds
-        ):
-            self._clock_best_rate = self._clock_run_packets / seconds
-            self._clock_best_seconds = seconds
-        self._clock_run_start_ns = now_ns
-        self._clock_run_last_ns = now_ns
-        self._clock_run_packets = 0
+            if not self._clock_align_first_ns:
+                self._clock_align_first_ns = now_ns
+                self._clock_align_first_index = self._clock_run_packets
+            self._clock_align_last_ns = now_ns
+            self._clock_align_last_index = self._clock_run_packets
+        if now_ns > self._clock_run_last_ns:
+            self._clock_run_last_ns = now_ns
 
     def _clock_run(self) -> tuple[float, float, int]:
         """Return (packets_per_second, run_seconds, packets) for the current run.
@@ -841,10 +895,17 @@ class NetworkAudioMonitor:
         Caller must hold _stats_lock. Returns zeros until the run is long enough
         for the figure to mean anything.
         """
-        seconds = (self._clock_run_last_ns - self._clock_run_start_ns) / 1e9
-        if self._clock_run_packets >= CLOCK_MIN_RUN_PACKETS and seconds > 0:
+        packets = self._clock_align_last_index - self._clock_align_first_index
+        span_ns = self._clock_align_last_ns - self._clock_align_first_ns
+        if packets < CLOCK_MIN_RUN_PACKETS or span_ns <= 0:
+            # No usable pair of boundaries, so the stream is smoothly paced and
+            # the first and last arrival are themselves aligned.
+            packets = self._clock_run_packets
+            span_ns = self._clock_run_last_ns - self._clock_run_start_ns
+        seconds = span_ns / 1e9
+        if packets >= CLOCK_MIN_RUN_PACKETS and seconds > 0:
             if seconds >= self._clock_best_seconds:
-                return self._clock_run_packets / seconds, seconds, self._clock_run_packets
+                return packets / seconds, seconds, self._clock_run_packets
         if self._clock_best_seconds > 0:
             return self._clock_best_rate, self._clock_best_seconds, self._clock_run_packets
         return 0.0, max(0.0, seconds), self._clock_run_packets
@@ -3545,11 +3606,57 @@ def self_test() -> None:
         stray = [0] + arrivals(30e9, 40, true_rate)
         # A transmit pause splits the run; the surviving run is still exact.
         paused = arrivals(0, 25, true_rate) + arrivals(45e9, 40, true_rate)
-        # A single stall must end the run rather than bias it: absorbing one
-        # 30 ms stall into a 20 s window would be a 1500 ppm error.
-        stalled = [x + (30_000_000 if x > 10e9 else 0) for x in arrivals(0, 40, true_rate)]
+        # A stalled reader does not shift later arrivals: the backlog drains and
+        # the stream catches up, so the span is unchanged and only the interior
+        # pacing is disturbed. Model it that way, not as a step in the timeline.
+        def stall_reads(series: list[int], at_ns: list[float], held_ns: int) -> list[int]:
+            delayed = list(series)
+            for start in at_ns:
+                delayed = [
+                    max(stamp, int(start + held_ns))
+                    if start <= stamp < start + held_ns
+                    else stamp
+                    for stamp in delayed
+                ]
+            return sorted(delayed)
+
+        stalled = stall_reads(arrivals(0, 40, true_rate), [10e9], 30_000_000)
+        # The observed failure mode: reads stall many times a second. Breaking
+        # the run on each one never accumulates a usable window, so the estimate
+        # must survive this.
+        many = stall_reads(
+            arrivals(0, 40, true_rate),
+            [float(x) * 1e9 for x in range(1, 40)],
+            25_000_000,
+        )
+        # If the radio sends its media in groups rather than evenly, both
+        # endpoints must land on group boundaries. Endpoints falling mid-group
+        # understate the span by up to one group, biasing the rate by the group
+        # duration over the window: 32 ms in 40 s is 800 ppm.
+        def grouped(seconds: float, rate: float, size: int) -> list[int]:
+            period_ns = 1e9 / rate
+            out: list[int] = []
+            for index in range(int(seconds * rate) // size):
+                base = index * size * period_ns
+                out.extend(int(base + offset * 20_000) for offset in range(size))
+            return out
+
         for label, series in (("clean", clean), ("stray+idle", stray),
-                              ("paused", paused), ("stalled", stalled)):
+                              ("paused", paused), ("stalled", stalled),
+                              ("many stalls", many),
+                              ("groups of 8", grouped(40, true_rate, 8)),
+                              ("groups of 32", grouped(40, true_rate, 32)),
+                              # Alignment points must not survive a pause. A
+                              # boundary from before it paired with one after
+                              # would span the pause with a packet count that
+                              # excludes it, understating the rate several fold.
+                              ("stalls either side of a pause",
+                               stall_reads(arrivals(0, 10, true_rate),
+                                           [float(x) * 1e9 for x in range(1, 10)],
+                                           25_000_000)
+                               + stall_reads(arrivals(60e9, 40, true_rate),
+                                             [60e9 + float(x) * 1e9 for x in range(1, 40)],
+                                             25_000_000))):
             measured, _ = measure_clock(series)
             assert measured > 0, (label, true_rate)
             error_ppm = abs(measured - true_rate) / true_rate * 1e6
@@ -3807,9 +3914,133 @@ def analyze_tx_recording(prefix: str) -> None:
         print("  Use the alignment and spacing figures above to localise them.")
 
 
+def analyze_rx_recording(prefix: str) -> None:
+    """Report the arrival pattern of the radio's media stream.
+
+    The question this answers is whether large inter-arrival gaps come from the
+    radio sending in bursts or from this host failing to read the socket in time.
+    They need opposite fixes, and the timestamps alone distinguish them: a host
+    stall leaves a backlog that drains as a run of near-zero intervals straight
+    after the gap, whereas a radio burst puts the near-zero intervals before it.
+    """
+    try:
+        with open(f"{prefix}.rx.time", "rb") as handle:
+            raw = handle.read()
+    except OSError as error:
+        print(f"cannot read {prefix}.rx.time: {error}")
+        return
+    records = len(raw) // 12
+    if records < 3:
+        print(f"only {records} packets recorded; nothing to analyse")
+        return
+    block = np.frombuffer(
+        raw[: records * 12],
+        dtype=np.dtype([("ns", "<u8"), ("size", "<u2"), ("type", "<u2")]),
+    )
+    stamps = block["ns"].astype(np.int64)
+    sizes, types = block["size"], block["type"]
+    span = (stamps[-1] - stamps[0]) / 1e9
+    print(f"received {records:,} packets over {span:.2f} s")
+    print(f"  overall rate      : {(records - 1) / span:.2f} pkt/s")
+    frames = NETWORK_TX_PACKET_BYTES // 4
+    print(f"  implied sample rate: {(records - 1) / span * frames:,.0f} Hz "
+          f"(payload {int(np.median(sizes))} B, "
+          f"types {', '.join(hex(int(t)) for t in np.unique(types))})")
+
+    delta = np.diff(stamps) / 1e6          # milliseconds
+    print("\n-- inter-arrival distribution (ms) --")
+    for lo, hi, label in ((0, 0.05, "< 0.05  (same instant: burst or backlog)"),
+                          (0.05, 0.5, "0.05-0.5"),
+                          (0.5, 1.5, "0.5-1.5  (paced ~1 ms)"),
+                          (1.5, 4, "1.5-4"),
+                          (4, 20, "4-20"),
+                          (20, 50, "20-50"),
+                          (50, 1e12, "> 50    (stream pause)")):
+        count = int(np.count_nonzero((delta >= lo) & (delta < hi)))
+        print(f"  {label:42s} {count:8,d}  ({count / len(delta) * 100:5.2f}%)")
+    print(f"  median {np.median(delta):.3f} ms   p99 {np.percentile(delta, 99):.3f} ms   "
+          f"max {delta.max():.1f} ms")
+
+    nominal_ms = NETWORK_TX_PERIOD * 1000.0
+    paced = int(np.count_nonzero((delta >= 0.5 * nominal_ms) & (delta <= 1.5 * nominal_ms)))
+    grouped = int(np.count_nonzero(delta < 0.05))
+    paced_fraction = paced / len(delta)
+    big = np.flatnonzero(delta > 4.0)
+
+    print("\n-- who is responsible for the gaps --")
+    print(f"  intervals near the {nominal_ms:.0f} ms cadence : {paced_fraction * 100:5.1f}%")
+    print(f"  intervals back-to-back (< 0.05 ms)  : {grouped / len(delta) * 100:5.1f}%")
+    if len(big):
+        print(f"  gaps over 4 ms                      : {len(big):,} "
+              f"({len(big) / span:.1f}/s)")
+        group = np.diff(np.concatenate(([-1], big)))
+        print(f"  packets between gaps                : median {np.median(group):.0f}")
+
+    # A radio that sends in groups produces almost no normally-paced intervals:
+    # everything is either back-to-back within a group or the gap between groups.
+    # A starved reader interrupts an otherwise paced stream, so most intervals
+    # remain at the cadence and only the stalls stand out.
+    if not len(big):
+        diagnosis = "smooth"
+    elif paced_fraction < 0.2 and grouped > paced:
+        diagnosis = "radio-groups"
+    else:
+        diagnosis = "host-starved"
+
+    print("\n-- clock estimate --")
+    nominal = 1.0 / NETWORK_TX_PERIOD
+    def report(rate: float, seconds: float, label: str) -> None:
+        print(f"  {label}: {rate:.2f} pkt/s = {rate * frames:,.0f} Hz "
+              f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm) over {seconds:.2f} s")
+
+    if diagnosis == "radio-groups":
+        # Grouping is the radio's normal behaviour, so the average over the whole
+        # recording is the meaningful figure; per-group runs are far too short.
+        report((records - 1) / span, span, "whole recording")
+    else:
+        breaks = np.flatnonzero((delta > 4.0) | (delta <= 0.0))
+        edges = np.concatenate(([0], breaks + 1, [len(stamps)]))
+        best = (0, 0.0, 0.0)
+        for run_start, run_end in zip(edges[:-1], edges[1:]):
+            if run_end - run_start < 2:
+                continue
+            seconds = (stamps[run_end - 1] - stamps[run_start]) / 1e9
+            if seconds > best[1]:
+                best = (run_end - run_start, seconds,
+                        (run_end - run_start - 1) / seconds if seconds else 0.0)
+        packets, seconds, rate = best
+        if packets >= 2 and seconds > 0:
+            report(rate, seconds, "longest clean run")
+            if seconds < 5:
+                print("  run far too short to trust: the offset being sought is a "
+                      "few hundred ppm")
+        else:
+            print("  no usable clean run")
+        report((records - 1) / span, span, "whole recording  ")
+
+    print("\n-- verdict --")
+    if diagnosis == "smooth":
+        print("  Smoothly paced. The rate above is the radio's media clock.")
+    elif diagnosis == "radio-groups":
+        print("  The radio sends its media in groups, which is its own pacing and")
+        print("  not a fault. The whole-recording rate is the clock figure, and the")
+        print("  live estimator must tolerate grouping instead of breaking on it.")
+    else:
+        print("  An otherwise paced stream is being interrupted, so this host is")
+        print("  not reading the socket in time. That invalidates the arrival")
+        print("  timestamps as a clock reference until the receive path is fixed.")
+
+
 def main() -> None:
     if "--self-test" in sys.argv:
         self_test()
+        return
+    if "--analyze-rx" in sys.argv:
+        index = sys.argv.index("--analyze-rx")
+        if index + 1 >= len(sys.argv):
+            print("usage: q900_control.py --analyze-rx <prefix>")
+            return
+        analyze_rx_recording(sys.argv[index + 1])
         return
     if "--analyze-tx" in sys.argv:
         index = sys.argv.index("--analyze-tx")

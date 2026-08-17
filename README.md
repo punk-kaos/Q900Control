@@ -61,15 +61,40 @@ shown alongside so a wrong cadence assumption is distinguishable from a genuine
 crystal offset: a figure near 48000 Hz confirms that a 192-byte payload is one
 millisecond of 48 kHz stereo.
 
-The rate is measured over the longest uninterrupted run of arrivals, not over
-the whole session. Averaging across a pause makes the figure climb towards the
-truth indefinitely without settling, and the stream does pause: it stops while
-transmitting and does not begin when the socket opens. A scheduling stall, or a
-backlog draining as a burst, ends the run rather than being averaged into it,
-because one 30 ms stall inside a 20 s window is a 1500 ppm error. `breaks` counts
-pauses and `stalls` counts those discontinuities; `over Ns` is the length of the
-run the figure came from, so a short run means treat it with suspicion. It needs
-a five-second clean run before it reports anything.
+The rate is measured over the current run of arrivals, not over the whole
+session. Averaging across a pause makes the figure climb towards the truth
+indefinitely without settling, and the stream does pause: it stops while
+transmitting and does not begin when the socket opens.
+
+A late read is counted rather than discarded. It shifts an endpoint but does not
+change the packet total, so packets over span stays unbiased as the window grows,
+whereas restarting on every late read never accumulates a usable window. Only a
+pause longer than 50 ms starts a new run, because the radio genuinely stops
+producing audio during one.
+
+If the radio sends its media in groups rather than evenly, both endpoints are
+aligned to group boundaries. An endpoint falling mid-group understates the span
+by up to one group, which for a 32 ms group in a 40 s window is an 800 ppm error.
+
+`breaks` counts pauses, `stalls` counts late reads or group boundaries, and
+`over Ns` is the window the figure came from: precision improves with window
+length, so treat a short window with suspicion. Nothing is reported until five
+thousand packets have accumulated.
+
+### Arrival Pattern
+
+If the radio clock figure looks unstable, record the arrival pattern:
+
+```bash
+Q900_RX_RECORD=/tmp/q900 python3 q900_control.py
+python3 q900_control.py --analyze-rx /tmp/q900
+```
+
+This reports the inter-arrival distribution and distinguishes a radio that sends
+in groups from a host that is not reading the socket in time. The two need
+opposite fixes, and the timestamps tell them apart: a starved reader leaves an
+otherwise evenly paced stream interrupted by stalls, whereas a grouping radio
+produces almost no evenly paced intervals at all.
 
 This matters because nothing rate-matches the two ends. The radio runs UHSDR on
 an STM32H7 whose codec is clocked by the radio's own crystal, and neither its
