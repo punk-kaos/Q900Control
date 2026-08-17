@@ -2326,6 +2326,28 @@ def waterfall_argb(rows: np.ndarray, width: int) -> np.ndarray:
     )
 
 
+def should_autostart_audio(
+    connected: bool,
+    transport: str,
+    audio_wanted: bool,
+    usb_running: bool,
+    network_running: bool,
+) -> bool:
+    """Whether an incoming status frame should start receive audio.
+
+    Status frames arrive about twice a second, so this has to return False once
+    the operator has stopped audio. Restarting on every frame made stopping it
+    impossible. The radio's audio routing is a front-panel menu with no CAT
+    equivalent, so releasing the media port is the only way to hand receive audio
+    to Bluetooth or to another application on this machine.
+    """
+    if not connected or not audio_wanted:
+        return False
+    if transport == "USB":
+        return not usb_running
+    return not network_running
+
+
 class SpectrumWaterfall(QWidget):
     """Canvas-like spectrum and waterfall based on the HTML reference behavior."""
 
@@ -2558,6 +2580,12 @@ class MainWindow(QMainWindow):
         self.rigctl = RigctlServer(self.client, self.signals)
         self._ptt_source: str | None = None
         self._virtual_receive_active = False
+        # Whether the operator wants receive audio at all. Connecting starts it
+        # automatically, but "Stop Audio" has to stick: status frames arrive twice
+        # a second and each one used to restart the stream, so stopping it was
+        # impossible. The radio's own audio routing is a front-panel menu, so
+        # releasing the media port is the only way to hand the audio elsewhere.
+        self._audio_wanted = True
         self._last_ptt_network_status = ""
         self._sdr_active = False
         self._sdr_switch_pending = False
@@ -2914,6 +2942,11 @@ class MainWindow(QMainWindow):
     def start_virtual_receive_audio(self) -> None:
         if not self.client.state.connected or self._virtual_receive_active:
             return
+        if not self._audio_wanted:
+            self.rigctl_status.setText(
+                "rigctl: client connected, receive audio is stopped"
+            )
+            return
         output = UsbAudioMonitor.named_device("Virtual Desktop Mic", "output")
         if output is None:
             self.rigctl_status.setText("rigctl: client connected, Virtual Desktop Mic unavailable")
@@ -2944,7 +2977,7 @@ class MainWindow(QMainWindow):
         self.network_audio.stop()
         self._network_audio_timer.stop()
         self._virtual_receive_active = False
-        if self.client.state.connected:
+        if self.client.state.connected and self._audio_wanted:
             QTimer.singleShot(0, self.start_audio_default)
 
     def handle_rigctl_ptt(self, active: bool) -> None:
@@ -3017,11 +3050,21 @@ class MainWindow(QMainWindow):
 
     def toggle_audio(self) -> None:
         if self.audio.running or self.network_audio.running:
+            self._audio_wanted = False
             self.audio.stop()
             self.network_audio.stop()
+            self._network_audio_timer.stop()
+            self.network_audio_status.setText("")
             self.audio_button.setText("Start Audio")
-            self.status.setText("Receive audio monitor stopped.")
+            if self.client.state.transport == "TCP":
+                self.status.setText(
+                    "Receive audio stopped and UDP/8000 released. Network PTT and "
+                    "SDR need it restarted."
+                )
+            else:
+                self.status.setText("Receive audio monitor stopped.")
             return
+        self._audio_wanted = True
         if self.client.state.transport == "TCP":
             output_device = self.audio_output.currentData()
             if output_device is None:
@@ -3047,7 +3090,7 @@ class MainWindow(QMainWindow):
 
     def start_audio_default(self) -> None:
         """Start USB or network receive monitoring after a radio connects."""
-        if self.audio_output.currentData() is None:
+        if not self._audio_wanted or self.audio_output.currentData() is None:
             return
         try:
             if self.client.state.transport == "TCP":
@@ -3084,6 +3127,8 @@ class MainWindow(QMainWindow):
             self.status.setText("Release PTT before entering SDR mode.")
             return
         if not self.network_audio.running:
+            # Requesting SDR is a request for the media stream.
+            self._audio_wanted = True
             self.start_audio_default()
         if not self.network_audio.running:
             self.status.setText("Start network receive audio before entering SDR mode.")
@@ -3246,6 +3291,7 @@ class MainWindow(QMainWindow):
             if output_device is None:
                 self.status.setText("Select a local speaker output before starting the TCP listener.")
                 return
+            self._audio_wanted = True
             try:
                 # The radio may begin sending UDP as soon as its TCP session
                 # completes. Bind the media port before accepting that session.
@@ -3444,9 +3490,13 @@ class MainWindow(QMainWindow):
         self.tiles["PEAK"].set_value(str(state.peak_threshold))
         self.tiles["LTIME"].set_value(str(state.cw_txrx_delay))
         self.spectrum.set_state(state)
-        if state.connected and state.transport == "USB" and not self.audio.running:
-            QTimer.singleShot(0, self.start_audio_default)
-        if state.connected and state.transport == "TCP" and not self.network_audio.running:
+        if should_autostart_audio(
+            state.connected,
+            state.transport,
+            self._audio_wanted,
+            self.audio.running,
+            self.network_audio.running,
+        ):
             QTimer.singleShot(0, self.start_audio_default)
         # Keep UDP/8000 bound while the TCP listener waits for a radio. Some
         # firmware starts media before the first status frame reaches the UI.
@@ -3680,6 +3730,28 @@ def self_test() -> None:
             assert ratio > 10, (receive_mode, ratio)
         finally:
             receiver.stop()
+
+    # Stopping receive audio has to stick. Status frames arrive about twice a
+    # second and each one asks whether audio should be started, so a rule that
+    # ignores the operator's choice makes the stop button do nothing.
+    assert should_autostart_audio(True, "TCP", True, False, False)
+    assert should_autostart_audio(True, "USB", True, False, False)
+    # Already running: nothing to do, per transport.
+    assert not should_autostart_audio(True, "TCP", True, False, True)
+    assert not should_autostart_audio(True, "USB", True, True, False)
+    # The transports are independent: a running USB monitor must not satisfy the
+    # network check, or network audio would never start.
+    assert should_autostart_audio(True, "TCP", True, True, False)
+    assert should_autostart_audio(True, "USB", True, False, True)
+    # Stopped by the operator: never restart, whatever else is true.
+    for transport in ("TCP", "USB"):
+        for usb_running in (False, True):
+            for network_running in (False, True):
+                assert not should_autostart_audio(
+                    True, transport, False, usb_running, network_running
+                ), (transport, usb_running, network_running)
+    # Not connected: nothing to start.
+    assert not should_autostart_audio(False, "TCP", True, False, False)
 
     # Rate conversion. The host produces audio on its own clock and the radio
     # consumes on its crystal; pacing can match only one of them, so the other

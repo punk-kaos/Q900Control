@@ -28,6 +28,26 @@ Run the built-in protocol checks:
 python3 q900_control.py --self-test
 ```
 
+## Receive Audio And Bluetooth
+
+`Start Audio` / `Stop Audio` controls whether this application consumes the
+radio's media stream. Connecting starts it automatically, but stopping it is
+final: it is not restarted until you ask for it, or until the transport is
+reconnected.
+
+Stopping network audio closes UDP/8000. Network PTT, SDR receive and the radio
+clock measurement all need that socket, so they are unavailable until audio is
+started again; the status line says so when you stop it.
+
+The radio's own audio routing is a front-panel menu (`AUDIO_SOURCE` under
+`SYS_SET`, alongside `BT_SET`) and no CAT command for it exists in the supported
+set, so this application cannot switch the radio to Bluetooth for you. Releasing
+UDP/8000 is what it can do: it stops consuming the network stream and frees the
+port for another application. Note that the radio's `BT-MUSIC` entry is described
+on the radio as "Open your phone music", which suggests Bluetooth there is for
+playing a phone's audio through the radio rather than sending receive audio to a
+headset.
+
 ## Diagnosing Transmit Audio
 
 To find out whether a defect heard on the air originates in this application,
