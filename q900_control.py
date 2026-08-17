@@ -738,6 +738,25 @@ class NetworkAudioMonitor:
             return f"UDP {self._packet_count} pkts  {self._last_packet_size} B  {self._format}"
 
 
+# One network TX datagram is the radio's native media quantum: 48 interleaved
+# stereo frames, 96 signed 16-bit words, 192 bytes, 1 ms at 48 kHz. That is the
+# payload size the radio itself sends on RX and the size the working I/Q sender
+# uses. A 384-byte 2 ms datagram carries the correct 192 kB/s aggregate and is
+# still wrong: the firmware consumes only the first media frame of a datagram.
+# Every other quantity on this path is expressed in whole packets so the parent
+# and the sender process cannot disagree about the unit again.
+NETWORK_TX_PERIOD = 0.001
+NETWORK_TX_PACKET_BYTES = 48 * 2 * 2
+NETWORK_TX_PREROLL_PACKETS = 40      # buffered before the transmitter is keyed
+NETWORK_TX_PRIME_PACKETS = 20        # unpaced burst into the radio's TX ring
+NETWORK_TX_LOW_WATER_PACKETS = 20    # cushion held inside the sender process
+NETWORK_TX_HIGH_WATER_PACKETS = 200  # hard cap on buffered capture
+NETWORK_TX_MAX_CATCHUP_PACKETS = 8
+# Upper bound on the pre-key wait for the sender process to report ready. It
+# covers interpreter spawn and module import, not audio latency.
+NETWORK_TX_READY_TIMEOUT = 3.0
+
+
 def udp_audio_sender(
     audio_queue: mp.Queue,
     udp_socket: socket.socket,
@@ -747,28 +766,53 @@ def udp_audio_sender(
     packets: mp.Value,
     underruns: mp.Value,
     late_ms: mp.Value,
+    trimmed: mp.Value,
+    send_errors: mp.Value,
+    ready: mp.Event,
 ) -> None:
     """Pace TX audio outside the GUI process and its contended Python GIL."""
-    # The radio's native media quantum is 96 int16 words: 48 interleaved stereo
-    # frames, 192 bytes, 1 ms at 48 kHz. That is the payload size the radio
-    # itself sends on RX and the size the working I/Q sender uses. A 384-byte
-    # 2 ms datagram carries the correct 192 kB/s aggregate but the firmware
-    # consumes only the first millisecond of it, discarding every second frame.
-    packet_bytes = 48 * 2 * 2
-    preroll_bytes = 9_600 * 2 * 2
+    packet_bytes = NETWORK_TX_PACKET_BYTES
+    period = NETWORK_TX_PERIOD
+    preroll_bytes = NETWORK_TX_PREROLL_PACKETS * packet_bytes
+    low_water = NETWORK_TX_LOW_WATER_PACKETS * packet_bytes
+    high_water = NETWORK_TX_HIGH_WATER_PACKETS * packet_bytes
     pending = bytearray()
     while len(pending) < preroll_bytes and not stop.is_set():
         try:
             pending.extend(audio_queue.get(timeout=0.05))
         except queue.Empty:
             continue
+    # Spawning this process costs a fresh interpreter and a full module import,
+    # which is far longer than the preroll. Report readiness explicitly so the
+    # caller keys the transmitter only once audio can actually leave the host;
+    # a fixed pre-key sleep would either waste latency or open a dead-air gap.
+    ready.set()
     while not keyed.wait(0.05) and not stop.is_set():
         pass
 
-    period = 0.001
+    def send(payload: bytes) -> None:
+        try:
+            udp_socket.sendto(payload, target)
+        except OSError:
+            send_errors.value += 1
+            return
+        packets.value += 1
 
-    def next_payload() -> bytes:
-        while len(pending) < packet_bytes:
+    def refill() -> None:
+        """Keep a cushion of captured audio inside this process.
+
+        Refilling only once `pending` has run dry migrates the entire buffer
+        across the feeder pipe and leaves the pacer with zero slack: it then has
+        to complete a cross-process read inside a single packet period, once per
+        microphone block, or emit silence. Drain opportunistically instead so
+        the blocking read stays off the steady-state path.
+        """
+        while len(pending) < low_water:
+            try:
+                pending.extend(audio_queue.get_nowait())
+            except queue.Empty:
+                break
+        if len(pending) < packet_bytes:
             try:
                 # Capture arrives in 20 ms blocks through a feeder pipe. At
                 # block boundaries get_nowait() can race that feeder and turn
@@ -776,7 +820,17 @@ def udp_audio_sender(
                 # one native packet before substituting silence.
                 pending.extend(audio_queue.get(timeout=period))
             except queue.Empty:
-                break
+                pass
+
+    def next_payload() -> bytes:
+        refill()
+        if len(pending) > high_water:
+            # Trim the oldest whole packets rather than letting latency grow
+            # without bound. A 1 ms trim is inaudible; letting the feeder queue
+            # saturate instead discards whole 20 ms microphone blocks.
+            excess = (len(pending) - high_water) // packet_bytes
+            del pending[: excess * packet_bytes]
+            trimmed.value += excess
         if len(pending) < packet_bytes:
             underruns.value += 1
             return bytes(packet_bytes)
@@ -784,15 +838,14 @@ def udp_audio_sender(
         del pending[:packet_bytes]
         return payload
 
-    # Put 20 ms into the radio's TX ring before paced delivery. The host wake
-    # delay is below one packet now, but the firmware/network path still has
-    # several milliseconds of variance that a two-packet cushion cannot hide.
-    for _ in range(20):
-        try:
-            udp_socket.sendto(next_payload(), target)
-        except OSError:
-            pass
-        packets.value += 1
+    # Prime the radio's TX ring before paced delivery begins, so the first
+    # scheduling jitter has something to eat into rather than starving it.
+    for _ in range(NETWORK_TX_PRIME_PACKETS):
+        if stop.is_set():
+            # Teardown releases `keyed` so this process can exit. Do not emit a
+            # burst of packets into a transmitter that is already unkeyed.
+            return
+        send(next_payload())
 
     mach_time = mach_wait = None
     ticks_per_second = 0.0
@@ -812,31 +865,44 @@ def udp_audio_sender(
             ticks_per_second = 1_000_000_000 * info.denom / info.numer
         except (AttributeError, OSError):
             mach_time = mach_wait = None
+    period_ticks = int(period * ticks_per_second)
     deadline = mach_time() if mach_time else time.monotonic()
     while not stop.is_set():
-        try:
-            udp_socket.sendto(next_payload(), target)
-        except OSError:
-            pass
-        packets.value += 1
+        send(next_payload())
         if mach_time and mach_wait:
-            deadline += int(period * ticks_per_second)
+            deadline += period_ticks
             mach_wait(deadline)
             lateness = (mach_time() - deadline) / ticks_per_second
             late_ms.value = max(late_ms.value, lateness * 1000)
             if lateness > period:
-                # Do not catch up by sending several packets back-to-back.
-                # A stale Mach deadline drains the capture buffer and makes
-                # one delayed wake appear as a run of audio underruns.
-                deadline = mach_time()
+                # Catch up on the missed schedule, bounded, instead of
+                # discarding it. Discarding makes the long-run send rate lower
+                # than the capture rate, so the buffer grows until the parent
+                # starts dropping whole 20 ms microphone blocks. This is only
+                # safe because refill() keeps a cushion in this process; with a
+                # dry buffer a stale deadline would turn one delayed wake into
+                # a run of audio underruns.
+                behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
+                for _ in range(behind):
+                    send(next_payload())
+                deadline += behind * period_ticks
+                if (mach_time() - deadline) / ticks_per_second > period:
+                    # Further behind than the catch-up bound allows. Resync
+                    # rather than spiral into unbounded schedule debt.
+                    deadline = mach_time()
         else:
             deadline += period
-            remaining = deadline - time.monotonic()
-            if remaining < 0:
-                late_ms.value = max(late_ms.value, -remaining * 1000)
-                deadline = time.monotonic()
+            lateness = time.monotonic() - deadline
+            if lateness > 0:
+                late_ms.value = max(late_ms.value, lateness * 1000)
+                behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
+                for _ in range(behind):
+                    send(next_payload())
+                deadline += behind * period
+                if time.monotonic() - deadline > period:
+                    deadline = time.monotonic()
             else:
-                time.sleep(remaining)
+                time.sleep(-lateness)
 
 
 IQ_SAMPLE_RATE = 48_000
@@ -1041,6 +1107,9 @@ class TransmitAudioRouter:
         self._udp_underruns: mp.Value | None = None
         self._udp_late_ms: mp.Value | None = None
         self._udp_clipped: mp.Value | None = None
+        self._udp_trimmed: mp.Value | None = None
+        self._udp_send_errors: mp.Value | None = None
+        self._udp_ready: mp.Event | None = None
 
     def start_usb(self, microphone: int, q900_output: int) -> None:
         self.stop()
@@ -1109,6 +1178,9 @@ class TransmitAudioRouter:
         self._udp_underruns = self._mp.Value("L", 0, lock=False)
         self._udp_late_ms = self._mp.Value("d", 0.0, lock=False)
         self._udp_clipped = self._mp.Value("L", 0, lock=False)
+        self._udp_trimmed = self._mp.Value("L", 0, lock=False)
+        self._udp_send_errors = self._mp.Value("L", 0, lock=False)
+        self._udp_ready = self._mp.Event()
 
         def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
             pcm = np.clip(indata[:, 0], -1, 1)
@@ -1125,7 +1197,16 @@ class TransmitAudioRouter:
                 try:
                     self._udp_queue.put_nowait(payload)
                 except queue.Full:
-                    pass
+                    # Drop the oldest buffered block so the newest microphone
+                    # audio is never silently lost.
+                    try:
+                        self._udp_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._udp_queue.put_nowait(payload)
+                    except queue.Full:
+                        pass
 
         self._input_stream = sd.InputStream(
             device=microphone,
@@ -1147,16 +1228,19 @@ class TransmitAudioRouter:
                 self._udp_packets,
                 self._udp_underruns,
                 self._udp_late_ms,
+                self._udp_trimmed,
+                self._udp_send_errors,
+                self._udp_ready,
             ),
             name="q900-udp-tx",
             daemon=True,
         )
         self._udp_sender.start()
         self._input_stream.start()
-        time.sleep(self.NETWORK_PREROLL_SAMPLES / self.NETWORK_SAMPLE_RATE)
-        self.signals.audio_state_changed.emit(
-            f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} (48 kHz stereo S16LE)"
-        )
+        state = f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} (48 kHz stereo S16LE)"
+        if not self._udp_ready.wait(timeout=NETWORK_TX_READY_TIMEOUT):
+            state += " -- sender did not report ready, transmit may start late"
+        self.signals.audio_state_changed.emit(state)
 
     def start_iq_udp(
         self,
@@ -1177,6 +1261,11 @@ class TransmitAudioRouter:
         self._udp_underruns = self._mp.Value("L", 0, lock=False)
         self._udp_late_ms = self._mp.Value("d", 0.0, lock=False)
         self._udp_clipped = self._mp.Value("L", 0, lock=False)
+        # The I/Q sender does not report trims or send errors. Clear them so the
+        # PTT line cannot show stale values left by a previous audio keying.
+        self._udp_trimmed = None
+        self._udp_send_errors = None
+        self._udp_ready = None
 
         def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
             pcm = np.clip(indata[:, 0], -1, 1)
@@ -1243,6 +1332,7 @@ class TransmitAudioRouter:
         self._udp_queue = None
         self._udp_stop = None
         self._udp_keyed = None
+        self._udp_ready = None
         for stream in (self._input_stream, self._output_stream):
             if stream:
                 stream.stop()
@@ -1280,7 +1370,12 @@ class TransmitAudioRouter:
         underruns = self._udp_underruns.value if self._udp_underruns else 0
         late_ms = self._udp_late_ms.value if self._udp_late_ms else 0.0
         clipped = self._udp_clipped.value if self._udp_clipped else 0
-        return f"UDP {packets} pkts  gaps {underruns}  late {late_ms:.1f} ms  clip {clipped}"
+        trimmed = self._udp_trimmed.value if self._udp_trimmed else 0
+        errors = self._udp_send_errors.value if self._udp_send_errors else 0
+        return (
+            f"UDP {packets} pkts  gaps {underruns}  trim {trimmed}  err {errors}  "
+            f"late {late_ms:.1f} ms  clip {clipped}"
+        )
 
 
 class RigctlServer:
@@ -2973,6 +3068,18 @@ def self_test() -> None:
     assert len(stereo_tx) == 96
     assert len(stereo_tx.tobytes()) == 192 == len(captured_audio[9:])
     assert np.array_equal(stereo_tx[0::2], stereo_tx[1::2])
+    # Pin the TX geometry to the captured RX payload and to the 48 kHz stereo
+    # byte rate. Either identity would have caught the 384-byte/2 ms datagram.
+    assert NETWORK_TX_PACKET_BYTES == 192 == len(captured_audio[9:])
+    assert NETWORK_TX_PACKET_BYTES / NETWORK_TX_PERIOD == 48_000 * 2 * 2
+    # The sender must start with more than it holds back, and must never be
+    # asked to hold back more than the hard cap allows.
+    assert (
+        NETWORK_TX_LOW_WATER_PACKETS
+        < NETWORK_TX_PREROLL_PACKETS
+        <= NETWORK_TX_HIGH_WATER_PACKETS
+    )
+    assert NETWORK_TX_PRIME_PACKETS <= NETWORK_TX_PREROLL_PACKETS
     iq_tx = np.empty(48 * 2, dtype="<i2")
     iq_tx[0::2] = 100
     iq_tx[1::2] = -100

@@ -109,8 +109,16 @@ datagram is one native media frame: 48 stereo frames, 96 signed 16-bit words,
 RX audio payload. The sender runs in a separate process and uses macOS absolute
 Mach timing to hold the 1 ms cadence.
 
-The PTT line reports packet count, underruns (`gaps`), worst scheduling delay
-(`late`), and clipped microphone blocks (`clip`).
+The sender buffers 40 ms before the transmitter is keyed and then holds a 20 ms
+cushion inside its own process, topping it up from the capture feeder without
+blocking. A late scheduler wake is made up with a bounded catch-up burst rather
+than by discarding schedule, because discarding makes the long-run send rate
+lower than the capture rate. Buffered capture is capped at 200 ms by trimming
+the oldest whole packets, so transmit latency cannot grow without bound.
+
+The PTT line reports packet count, underruns (`gaps`), packets trimmed at the
+buffer cap (`trim`), failed sends (`err`), worst scheduling delay (`late`), and
+clipped microphone blocks (`clip`).
 
 ### Rigctl Virtual Audio
 
