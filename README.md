@@ -209,6 +209,28 @@ datagram is one native media frame: 48 stereo frames, 96 signed 16-bit words,
 RX audio payload. The sender runs in a separate process and uses macOS absolute
 Mach timing to hold the 1 ms cadence.
 
+Transmit audio is emitted at the radio's own measured clock, and the host stream
+is rate-converted to it. Three clocks are involved: the host produces audio on
+its audio clock, this application paces the send, and the radio consumes on its
+crystal. Pacing can match only one of the other two. Sending at the host rate
+leaves the radio's ring gaining a millisecond of audio every few seconds, which
+it resolves by discarding a frame; sending at the radio rate leaves the host
+buffer growing until it is trimmed instead. Either way a whole millisecond of
+audio disappears periodically and reaches the air as a broadband click, audible
+as a tap and visible as a line across a receiving waterfall. Converting the rate
+spreads the difference across every sample.
+
+Conversion uses linear interpolation with a fractional phase carried between
+packets, so the output is continuous in both amplitude and phase. Worst-case
+spurious content measures better than 50 dB below the wanted signal at the
+offsets involved, against a discarded millisecond which is broadband. A ratio of
+exactly one is bit-transparent, so a correctly clocked link is unaffected.
+
+The ratio starts from the measured radio clock and is then trimmed by a servo on
+buffer depth, which absorbs the host audio clock's own error without needing to
+know it. Residual drift at the radio is bounded by the accuracy of the clock
+measurement alone.
+
 The sender buffers 80 ms before the transmitter is keyed, spends 20 ms of that
 priming the radio's TX ring, and holds the remaining 60 ms as a cushion inside
 its own process, topping it up from the capture feeder without blocking. The

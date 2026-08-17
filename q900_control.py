@@ -971,6 +971,13 @@ NETWORK_TX_PRIME_PACKETS = 20        # unpaced burst into the radio's TX ring
 NETWORK_TX_LOW_WATER_PACKETS = 60    # cushion held inside the sender process
 NETWORK_TX_HIGH_WATER_PACKETS = 200  # hard cap on buffered capture
 NETWORK_TX_MAX_CATCHUP_PACKETS = 8
+# Rate-conversion servo. The ratio starts from the radio's measured clock, so the
+# servo only has to absorb the host audio clock's own error, and both gains are
+# deliberately gentle: the buffer holds tens of milliseconds, so there is no need
+# to correct quickly and every reason not to modulate the audio while doing it.
+RESAMPLE_KP = 0.002
+RESAMPLE_KI = 1.0e-7
+RESAMPLE_TRIM_LIMIT = 0.005
 # Upper bound on the pre-key wait for the sender process to report ready. It
 # covers interpreter spawn and module import, not audio latency.
 NETWORK_TX_READY_TIMEOUT = 3.0
@@ -981,6 +988,74 @@ NETWORK_TX_READY_TIMEOUT = 3.0
 # host-side defect from a radio-side or network-side one: if the recording is
 # clean, nothing above the socket is responsible.
 TX_RECORD_PREFIX = os.environ.get("Q900_TX_RECORD") or None
+
+
+def tx_pacing(radio_rate: float) -> tuple[float, float]:
+    """Return (send period, conversion ratio) for a measured radio packet rate.
+
+    Emitting at the radio's clock and converting the host stream to it is the
+    only arrangement that leaves neither end's buffer drifting. A rate of zero
+    means the clock has not been measured yet, so fall back to nominal and
+    convert nothing.
+    """
+    if radio_rate <= 0.0:
+        return NETWORK_TX_PERIOD, 1.0
+    return 1.0 / radio_rate, (1.0 / NETWORK_TX_PERIOD) / radio_rate
+
+
+def resample_ratio(
+    depth_frames: int, target_frames: int, trim: float, base_ratio: float
+) -> tuple[float, float]:
+    """Return (ratio, new trim) holding the buffer at `target_frames`.
+
+    The base ratio comes from the radio's measured clock, so this only has to
+    absorb the host audio clock's own error. A deeper buffer than wanted must
+    consume faster, hence a larger ratio.
+    """
+    error = (depth_frames - target_frames) / target_frames if target_frames else 0.0
+    trim = min(
+        max(trim + RESAMPLE_KI * error, -RESAMPLE_TRIM_LIMIT), RESAMPLE_TRIM_LIMIT
+    )
+    return base_ratio * (1.0 + RESAMPLE_KP * error + trim), trim
+
+
+def resample_stereo(
+    pending: bytearray, frames_out: int, ratio: float, phase: float
+) -> tuple[bytes, float] | None:
+    """Emit `frames_out` interleaved stereo S16LE frames from `pending`.
+
+    Consumes `ratio` input frames per output frame using linear interpolation,
+    deletes what it consumed, and returns the payload with the new fractional
+    phase. Returns None if `pending` does not yet hold enough input.
+
+    This exists because three clocks are involved and only two can be matched by
+    pacing. The host produces audio on its own audio clock, the radio consumes on
+    its crystal, and the two differ by hundreds of ppm. Sending at the host rate
+    makes the radio's ring overflow; sending at the radio rate makes the host
+    buffer overflow. Either way a whole millisecond of audio is eventually
+    discarded, which reaches the air as a broadband click. Converting the rate
+    spreads that difference across every sample instead.
+    """
+    if frames_out < 1 or ratio <= 0.0:
+        return None
+    last_position = phase + ratio * (frames_out - 1)
+    # One frame beyond the final interpolation point, plus one so the next call
+    # still has a frame either side of its own starting phase.
+    required = int(last_position) + 3
+    if len(pending) < required * 4:
+        return None
+    data = np.frombuffer(bytes(pending[: required * 4]), dtype="<i2").reshape(-1, 2)
+    position = phase + ratio * np.arange(frames_out)
+    index = position.astype(np.int64)
+    weight = (position - index).astype(np.float32)[:, None]
+    lower = data[index].astype(np.float32)
+    upper = data[index + 1].astype(np.float32)
+    frames = np.rint(lower + (upper - lower) * weight)
+    payload = np.clip(frames, -32768, 32767).astype("<i2").tobytes()
+    advance = phase + ratio * frames_out
+    consumed = int(advance)
+    del pending[: consumed * 4]
+    return payload, advance - consumed
 
 
 def udp_audio_sender(
@@ -995,10 +1070,19 @@ def udp_audio_sender(
     trimmed: mp.Value,
     send_errors: mp.Value,
     ready: mp.Event,
+    radio_rate: float = 0.0,
 ) -> None:
     """Pace TX audio outside the GUI process and its contended Python GIL."""
     packet_bytes = NETWORK_TX_PACKET_BYTES
-    period = NETWORK_TX_PERIOD
+    frames_per_packet = packet_bytes // 4
+    # Emit at the radio's own clock when it is known, and convert the host stream
+    # to it. Sending at the host rate instead leaves the radio's ring gaining or
+    # losing a millisecond of audio every few seconds, which it resolves by
+    # discarding a frame: a broadband click at exactly that period.
+    period, base_ratio = tx_pacing(radio_rate)
+    target_frames = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
+    resample_phase = 0.0
+    ratio_trim = 0.0
     preroll_bytes = NETWORK_TX_PREROLL_PACKETS * packet_bytes
     low_water = NETWORK_TX_LOW_WATER_PACKETS * packet_bytes
     high_water = NETWORK_TX_HIGH_WATER_PACKETS * packet_bytes
@@ -1064,19 +1148,25 @@ def udp_audio_sender(
                 pass
 
     def next_payload() -> bytes:
+        nonlocal resample_phase, ratio_trim
         refill()
         if len(pending) > high_water:
             # Trim the oldest whole packets rather than letting latency grow
-            # without bound. A 1 ms trim is inaudible; letting the feeder queue
-            # saturate instead discards whole 20 ms microphone blocks.
+            # without bound. With rate conversion working this should never fire;
+            # it remains the backstop for a feeder that has run away.
             excess = (len(pending) - high_water) // packet_bytes
             del pending[: excess * packet_bytes]
             trimmed.value += excess
-        if len(pending) < packet_bytes:
+        # Hold the buffer at its target depth by trimming the conversion ratio.
+        # This absorbs the host audio clock's error without needing to know it.
+        ratio, ratio_trim = resample_ratio(
+            len(pending) // 4, target_frames, ratio_trim, base_ratio
+        )
+        converted = resample_stereo(pending, frames_per_packet, ratio, resample_phase)
+        if converted is None:
             underruns.value += 1
             return bytes(packet_bytes)
-        payload = bytes(pending[:packet_bytes])
-        del pending[:packet_bytes]
+        payload, resample_phase = converted
         return payload
 
     # Prime the radio's TX ring before paced delivery begins, so the first
@@ -1498,13 +1588,26 @@ class TransmitAudioRouter:
                 self._udp_trimmed,
                 self._udp_send_errors,
                 self._udp_ready,
+                # The radio's measured clock, so the sender can emit at it and
+                # convert the host stream rather than letting the difference
+                # accumulate in the radio's ring.
+                network_audio.measured_packet_rate,
             ),
             name="q900-udp-tx",
             daemon=True,
         )
         self._udp_sender.start()
         self._input_stream.start()
-        state = f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} (48 kHz stereo S16LE)"
+        radio_rate = network_audio.measured_packet_rate
+        clock = (
+            f", radio clock {radio_rate:.2f} pkt/s"
+            if radio_rate
+            else ", radio clock not yet measured"
+        )
+        state = (
+            f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} "
+            f"(48 kHz stereo S16LE{clock})"
+        )
         if not self._udp_ready.wait(timeout=NETWORK_TX_READY_TIMEOUT):
             state += " -- sender did not report ready, transmit may start late"
         self.signals.audio_state_changed.emit(state)
@@ -3578,6 +3681,179 @@ def self_test() -> None:
         finally:
             receiver.stop()
 
+    # Rate conversion. The host produces audio on its own clock and the radio
+    # consumes on its crystal; pacing can match only one of them, so the other
+    # end eventually discards a whole millisecond of audio and clicks. Converting
+    # spreads the difference across every sample instead.
+    #
+    # Every loop below keeps the working buffer small and tops it up, exactly as
+    # the sender does. Handing resample_stereo a multi-megabyte buffer instead
+    # makes its del pending[:n] quadratic.
+    frames_per_packet = NETWORK_TX_PACKET_BYTES // 4
+
+    def tone_frames(count: int, start_index: int, hz: float = 1500.0) -> bytes:
+        index = start_index + np.arange(count)
+        mono = np.clip(
+            np.rint(9000 * np.sin(2 * np.pi * hz * index / 48_000)), -32768, 32767
+        ).astype("<i2")
+        return np.repeat(mono, 2).tobytes()
+
+    def convert(ratio: float, packets: int, keep: int = 200) -> tuple[bytes, int, int]:
+        """Return (output, frames consumed, frames produced) for a steady ratio."""
+        buffer = bytearray()
+        supplied = 0
+        output = bytearray()
+        phase = 0.0
+        produced = 0
+        for _ in range(packets):
+            while len(buffer) // 4 < keep:
+                buffer += tone_frames(frames_per_packet, supplied)
+                supplied += frames_per_packet
+            before = len(buffer) // 4
+            step = resample_stereo(buffer, frames_per_packet, ratio, phase)
+            assert step is not None
+            payload, phase = step
+            output += payload
+            produced += len(payload) // 4
+            _ = before
+        return bytes(output), supplied - len(buffer) // 4, produced
+
+    # A ratio of exactly one must be bit-identical, so enabling conversion cannot
+    # perturb a correctly clocked link.
+    identity, consumed, produced = convert(1.0, 60)
+    assert consumed == produced, (consumed, produced)
+    assert identity == tone_frames(produced, 0), "ratio 1.0 must be transparent"
+
+    for ratio in (1.0005, 0.9995, 1.002, 0.998):
+        _, consumed, produced = convert(ratio, 600)
+        assert abs((consumed / produced) / ratio - 1.0) < 5e-4, (ratio, consumed, produced)
+
+    # Left and right must stay identical: the radio expects duplicated mono and
+    # interpolation must not decorrelate the pair.
+    converted, _, _ = convert(1.0005, 200)
+    words = np.frombuffer(converted, dtype="<i2")
+    assert np.array_equal(words[0::2], words[1::2])
+
+    # Converted audio must stay spectrally clean. A discarded millisecond is a
+    # broadband click; interpolation must not trade it for comparable rubbish.
+    for ratio in (1.0005, 1.005):
+        converted, _, _ = convert(ratio, 1_200)
+        signal = np.frombuffer(converted, dtype="<i2")[0::2].astype(np.float64)
+        signal -= signal.mean()
+        spectrum = np.abs(np.fft.rfft(signal * np.hanning(len(signal))))
+        peak = int(np.argmax(spectrum))
+        residue = spectrum.copy()
+        residue[max(0, peak - 12) : peak + 13] = 0
+        residue[:8] = 0
+        assert np.max(residue) < spectrum[peak] * 10 ** (-45 / 20), (
+            ratio, 20 * np.log10(np.max(residue) / spectrum[peak]),
+        )
+
+    # Channel order must survive interpolation. A duplicated-mono test signal
+    # cannot detect a left/right swap, so use distinct channels here.
+    distinct = bytearray()
+    for frame in range(400):
+        distinct += int(frame % 1000).to_bytes(2, "little", signed=True)
+        distinct += int(-(frame % 1000)).to_bytes(2, "little", signed=True)
+    step = resample_stereo(distinct, frames_per_packet, 1.0, 0.0)
+    assert step is not None
+    swapped = np.frombuffer(step[0], dtype="<i2")
+    assert swapped[0] == 0 and swapped[1] == 0
+    assert swapped[2] == 1 and swapped[3] == -1, swapped[:4]
+
+    # Pacing must follow the radio, and fall back cleanly when it is unknown.
+    assert tx_pacing(0.0) == (NETWORK_TX_PERIOD, 1.0)
+    for radio_rate in (999.3, 1_000.0, 1_000.7):
+        period, base_ratio = tx_pacing(radio_rate)
+        assert abs(1.0 / period - radio_rate) < 1e-9, radio_rate
+        # One second of host audio must convert to exactly one second of radio
+        # packets, which is what stops either buffer from drifting.
+        assert abs(base_ratio * radio_rate - 1.0 / NETWORK_TX_PERIOD) < 1e-6, radio_rate
+
+    # The servo must push back in the right direction and with a bounded trim.
+    target = NETWORK_LOW_WATER_FRAMES = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
+    deep, _ = resample_ratio(target * 2, target, 0.0, 1.0)
+    shallow, _ = resample_ratio(target // 2, target, 0.0, 1.0)
+    steady, steady_trim = resample_ratio(target, target, 0.0, 1.0)
+    assert deep > steady > shallow, (deep, steady, shallow)
+    assert abs(steady - 1.0) < 1e-12 and steady_trim == 0.0
+    runaway = 0.0
+    for _ in range(10_000_000 // 1_000):
+        _, runaway = resample_ratio(target * 10, target, runaway, 1.0)
+    assert runaway <= RESAMPLE_TRIM_LIMIT + 1e-12, runaway
+
+    # With the base ratio deliberately wrong, only the servo can stop the buffer
+    # from running away. Model consumption arithmetically so this stays quick.
+    for host_hz, radio_rate in ((48_024.0, 999.5), (47_976.0, 1_000.6)):
+        emit_period = 1.0 / radio_rate
+        depth = float(target)
+        trim = 0.0
+        deepest, shallowest = depth, depth
+        for _ in range(int(180.0 / emit_period)):
+            ratio, trim = resample_ratio(int(depth), target, trim, 1.0)
+            depth += host_hz * emit_period - ratio * frames_per_packet
+            deepest, shallowest = max(deepest, depth), min(shallowest, depth)
+        assert shallowest > frames_per_packet, (host_hz, radio_rate, shallowest)
+        assert deepest < NETWORK_TX_HIGH_WATER_PACKETS * frames_per_packet, (
+            host_hz, radio_rate, deepest,
+        )
+        # And it must actually settle near the target rather than merely staying
+        # inside the limits.
+        assert abs(depth - target) < target * 0.5, (host_hz, radio_rate, depth, target)
+
+    # Depth-to-ratio is a double integrator, so the loop needs damping as well as
+    # integral action. Start the buffer at twice its target: with the
+    # proportional term the overshoot is bounded, without it the buffer rings all
+    # the way down through empty and underruns.
+    depth, trim = float(target * 2), 0.0
+    shallowest = depth
+    for _ in range(300_000):
+        ratio, trim = resample_ratio(int(depth), target, trim, 1.0)
+        depth += 48_000.0 * NETWORK_TX_PERIOD - ratio * frames_per_packet
+        shallowest = min(shallowest, depth)
+    assert shallowest > frames_per_packet * 20, shallowest
+    assert abs(depth - target) < target * 0.5, depth
+
+    # The servo must hold the buffer between the cushion and the trim cap for any
+    # plausible pair of clocks, without underrunning or trimming.
+    target_frames = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
+    for host_hz, radio_rate in ((48_000.0, 1_000.0), (48_000.0, 999.3), (48_024.0, 999.5)):
+        emit_period = 1.0 / radio_rate
+        ratio_base = (1.0 / NETWORK_TX_PERIOD) / radio_rate
+        buffer = bytearray(tone_frames(NETWORK_TX_PREROLL_PACKETS * frames_per_packet, 0))
+        supplied = NETWORK_TX_PREROLL_PACKETS * frames_per_packet
+        phase, trim, starved = 0.0, 0.0, 0
+        deepest, shallowest = 0, 10 ** 9
+        for packet_index in range(int(20.0 / emit_period)):
+            wanted = int(packet_index * emit_period * host_hz)
+            behind = wanted + NETWORK_TX_PREROLL_PACKETS * frames_per_packet - supplied
+            if behind >= 960:
+                add = (behind // 960) * 960
+                buffer += tone_frames(add, supplied)
+                supplied += add
+            depth = len(buffer) // 4
+            deepest, shallowest = max(deepest, depth), min(shallowest, depth)
+            error = (depth - target_frames) / target_frames
+            trim = min(
+                max(trim + RESAMPLE_KI * error, -RESAMPLE_TRIM_LIMIT),
+                RESAMPLE_TRIM_LIMIT,
+            )
+            step = resample_stereo(
+                buffer,
+                frames_per_packet,
+                ratio_base * (1.0 + RESAMPLE_KP * error + trim),
+                phase,
+            )
+            if step is None:
+                starved += 1
+                continue
+            _, phase = step
+        assert starved == 0, (host_hz, radio_rate, starved)
+        assert shallowest > frames_per_packet * 4, (host_hz, radio_rate, shallowest)
+        assert deepest < NETWORK_TX_HIGH_WATER_PACKETS * frames_per_packet, (
+            host_hz, radio_rate, deepest,
+        )
+
     # The radio's media clock is measured from packet arrivals, and that figure
     # decides whether transmit audio has to be re-paced. Averaging over the whole
     # session made it climb towards the truth forever without settling, because
@@ -3895,8 +4171,22 @@ def analyze_tx_recording(prefix: str) -> None:
             print(f"  first 10 stall times (s): "
                   f"{', '.join(f'{value / 1e9:.4f}' for value in at[:10])}")
         elapsed = (int(stamps[-1]) - int(stamps[0])) / 1e9
-        print(f"  achieved rate: {(len(stamps) - 1) / elapsed:.1f} packets/s "
+        print(f"  achieved rate: {(len(stamps) - 1) / elapsed:.2f} packets/s "
               f"(nominal {1 / NETWORK_TX_PERIOD:.0f})")
+        # The run opens with an unpaced burst that primes the radio's ring. It is
+        # a one-off, so including it overstates the steady-state rate: over a
+        # short recording those 20 packets alone look like several hundred ppm.
+        primed = int(np.argmax(gaps > 0.2)) if np.any(gaps > 0.2) else 0
+        if primed:
+            steady = stamps[primed:]
+            if len(steady) > 2:
+                span = (int(steady[-1]) - int(steady[0])) / 1e9
+                rate = (len(steady) - 1) / span
+                print(f"  after the {primed}-packet priming burst: {rate:.2f} packets/s "
+                      f"over {span:.2f} s")
+                print(f"    median paced interval "
+                      f"{np.median(gaps[gaps > 0.2]):.4f} ms "
+                      f"-> {1000 / np.median(gaps[gaps > 0.2]):.2f} packets/s")
 
     print("\n-- verdict --")
     clean = (
