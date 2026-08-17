@@ -28,6 +28,31 @@ Run the built-in protocol checks:
 python3 q900_control.py --self-test
 ```
 
+## Diagnosing Transmit Audio
+
+To find out whether a defect heard on the air originates in this application,
+record exactly what leaves the socket and analyse it:
+
+```bash
+Q900_TX_RECORD=/tmp/q900 python3 q900_control.py
+# transmit, then close the app
+python3 q900_control.py --analyze-tx /tmp/q900
+```
+
+The sender writes every transmitted payload to `/tmp/q900.tx.raw` (48 kHz stereo
+S16LE, playable directly) and one nanosecond send timestamp per packet to
+`/tmp/q900.tx.time`. The analyser reports framing, inserted silence, sample-step
+discontinuities, phase discontinuities, and send pacing, with the repetition rate
+and buffer-boundary alignment of any events it finds.
+
+The phase test is the sensitive one for FT8 and other tone-based modes: a lost or
+repeated sample breaks phase without necessarily producing a large sample step,
+and reaches the air as a broadband click. If the analyser reports a clean stream,
+nothing above the socket is responsible and the cause is radio-side or
+network-side.
+
+Recording is off unless `Q900_TX_RECORD` is set.
+
 ## Radio Connection
 
 ### Network

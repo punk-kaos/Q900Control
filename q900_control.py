@@ -12,6 +12,7 @@ import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
 import multiprocessing as mp
+import os
 import queue
 import signal
 import socket
@@ -802,6 +803,13 @@ NETWORK_TX_MAX_CATCHUP_PACKETS = 8
 # Upper bound on the pre-key wait for the sender process to report ready. It
 # covers interpreter spawn and module import, not audio latency.
 NETWORK_TX_READY_TIMEOUT = 3.0
+# Set Q900_TX_RECORD to a path prefix to capture exactly what leaves the host.
+# The sender writes every transmitted payload to <prefix>.tx.raw (48 kHz stereo
+# S16LE) and one 8-byte little-endian nanosecond send timestamp per packet to
+# <prefix>.tx.time. Analyse with `--analyze-tx <prefix>`. This distinguishes a
+# host-side defect from a radio-side or network-side one: if the recording is
+# clean, nothing above the socket is responsible.
+TX_RECORD_PREFIX = os.environ.get("Q900_TX_RECORD") or None
 
 
 def udp_audio_sender(
@@ -837,6 +845,16 @@ def udp_audio_sender(
     while not keyed.wait(0.05) and not stop.is_set():
         pass
 
+    record_stream = record_times = None
+    if TX_RECORD_PREFIX:
+        try:
+            record_stream = open(f"{TX_RECORD_PREFIX}.tx.raw", "wb")
+            record_times = open(f"{TX_RECORD_PREFIX}.tx.time", "wb")
+        except OSError:
+            if record_stream is not None:
+                record_stream.close()
+            record_stream = record_times = None
+
     def send(payload: bytes) -> None:
         try:
             udp_socket.sendto(payload, target)
@@ -844,6 +862,11 @@ def udp_audio_sender(
             send_errors.value += 1
             return
         packets.value += 1
+        if record_stream is not None:
+            # Record after a successful send so the file is exactly the stream
+            # the radio received, in order, with nothing the socket rejected.
+            record_stream.write(payload)
+            record_times.write(time.monotonic_ns().to_bytes(8, "little"))
 
     def refill() -> None:
         """Keep a cushion of captured audio inside this process.
@@ -887,69 +910,77 @@ def udp_audio_sender(
 
     # Prime the radio's TX ring before paced delivery begins, so the first
     # scheduling jitter has something to eat into rather than starving it.
-    for _ in range(NETWORK_TX_PRIME_PACKETS):
-        if stop.is_set():
-            # Teardown releases `keyed` so this process can exit. Do not emit a
-            # burst of packets into a transmitter that is already unkeyed.
-            return
-        send(next_payload())
+    def transmit() -> None:
+        for _ in range(NETWORK_TX_PRIME_PACKETS):
+            if stop.is_set():
+                # Teardown releases `keyed` so this process can exit. Do not
+                # emit a burst into a transmitter that is already unkeyed.
+                return
+            send(next_payload())
 
-    mach_time = mach_wait = None
-    ticks_per_second = 0.0
-    if sys.platform == "darwin":
-        class TimebaseInfo(ctypes.Structure):
-            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+        mach_time = mach_wait = None
+        ticks_per_second = 0.0
+        if sys.platform == "darwin":
+            class TimebaseInfo(ctypes.Structure):
+                _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
-        try:
-            system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-            info = TimebaseInfo()
-            system.mach_timebase_info(ctypes.byref(info))
-            system.mach_absolute_time.restype = ctypes.c_uint64
-            system.mach_wait_until.argtypes = (ctypes.c_uint64,)
-            system.pthread_set_qos_class_self_np(0x21, 0)
-            mach_time = system.mach_absolute_time
-            mach_wait = system.mach_wait_until
-            ticks_per_second = 1_000_000_000 * info.denom / info.numer
-        except (AttributeError, OSError):
-            mach_time = mach_wait = None
-    period_ticks = int(period * ticks_per_second)
-    deadline = mach_time() if mach_time else time.monotonic()
-    while not stop.is_set():
-        send(next_payload())
-        if mach_time and mach_wait:
-            deadline += period_ticks
-            mach_wait(deadline)
-            lateness = (mach_time() - deadline) / ticks_per_second
-            late_ms.value = max(late_ms.value, lateness * 1000)
-            if lateness > period:
-                # Catch up on the missed schedule, bounded, instead of
-                # discarding it. Discarding makes the long-run send rate lower
-                # than the capture rate, so the buffer grows until the parent
-                # starts dropping whole 20 ms microphone blocks. This is only
-                # safe because refill() keeps a cushion in this process; with a
-                # dry buffer a stale deadline would turn one delayed wake into
-                # a run of audio underruns.
-                behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
-                for _ in range(behind):
-                    send(next_payload())
-                deadline += behind * period_ticks
-                if (mach_time() - deadline) / ticks_per_second > period:
-                    # Further behind than the catch-up bound allows. Resync
-                    # rather than spiral into unbounded schedule debt.
-                    deadline = mach_time()
-        else:
-            deadline += period
-            lateness = time.monotonic() - deadline
-            if lateness > 0:
+            try:
+                system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                info = TimebaseInfo()
+                system.mach_timebase_info(ctypes.byref(info))
+                system.mach_absolute_time.restype = ctypes.c_uint64
+                system.mach_wait_until.argtypes = (ctypes.c_uint64,)
+                system.pthread_set_qos_class_self_np(0x21, 0)
+                mach_time = system.mach_absolute_time
+                mach_wait = system.mach_wait_until
+                ticks_per_second = 1_000_000_000 * info.denom / info.numer
+            except (AttributeError, OSError):
+                mach_time = mach_wait = None
+        period_ticks = int(period * ticks_per_second)
+        deadline = mach_time() if mach_time else time.monotonic()
+        while not stop.is_set():
+            send(next_payload())
+            if mach_time and mach_wait:
+                deadline += period_ticks
+                mach_wait(deadline)
+                lateness = (mach_time() - deadline) / ticks_per_second
                 late_ms.value = max(late_ms.value, lateness * 1000)
-                behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
-                for _ in range(behind):
-                    send(next_payload())
-                deadline += behind * period
-                if time.monotonic() - deadline > period:
-                    deadline = time.monotonic()
+                if lateness > period:
+                    # Catch up on the missed schedule, bounded, instead of
+                    # discarding it. Discarding makes the long-run send rate
+                    # lower than the capture rate, so the buffer grows until the
+                    # parent starts dropping whole 20 ms microphone blocks. This
+                    # is only safe because refill() keeps a cushion in this
+                    # process; with a dry buffer a stale deadline would turn one
+                    # delayed wake into a run of audio underruns.
+                    behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
+                    for _ in range(behind):
+                        send(next_payload())
+                    deadline += behind * period_ticks
+                    if (mach_time() - deadline) / ticks_per_second > period:
+                        # Further behind than the catch-up bound allows. Resync
+                        # rather than spiral into unbounded schedule debt.
+                        deadline = mach_time()
             else:
-                time.sleep(-lateness)
+                deadline += period
+                lateness = time.monotonic() - deadline
+                if lateness > 0:
+                    late_ms.value = max(late_ms.value, lateness * 1000)
+                    behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
+                    for _ in range(behind):
+                        send(next_payload())
+                    deadline += behind * period
+                    if time.monotonic() - deadline > period:
+                        deadline = time.monotonic()
+                else:
+                    time.sleep(-lateness)
+
+    try:
+        transmit()
+    finally:
+        if record_stream is not None:
+            record_stream.close()
+            record_times.close()
 
 
 IQ_SAMPLE_RATE = 48_000
@@ -3457,9 +3488,164 @@ def self_test() -> None:
     print("Q900 protocol self-test passed")
 
 
+def analyze_tx_recording(prefix: str) -> None:
+    """Report defects in a Q900_TX_RECORD capture of the transmitted stream.
+
+    The recording is exactly what left the socket, so it separates a host-side
+    defect from a radio-side or network-side one. If this reports a clean stream,
+    nothing above the socket is responsible for what is heard on the air.
+    """
+    rate = 48_000
+    def cluster(indices: np.ndarray, gap: int = 64) -> np.ndarray:
+        """Collapse runs of adjacent detections into one event each.
+
+        A single splice trips several neighbouring samples, so the raw counts
+        would report a rate that is a multiple of the real one. The repetition
+        rate is the most useful clue available, so it has to be right.
+        """
+        if not len(indices):
+            return indices
+        breaks = np.flatnonzero(np.diff(indices) > gap)
+        return indices[np.concatenate(([0], breaks + 1))]
+
+    def report_events(indices: np.ndarray, label: str) -> None:
+        events = cluster(indices)
+        print(f"  {label}: {len(events):,} event(s) "
+              f"(from {len(indices):,} flagged samples)")
+        if not len(events):
+            return
+        seconds = events / rate
+        print(f"  first 10 times (s): "
+              f"{', '.join(f'{value:.4f}' for value in seconds[:10])}")
+        if len(events) > 1:
+            spacing = np.diff(seconds)
+            print(f"  spacing: median {np.median(spacing) * 1000:.2f} ms "
+                  f"-> {1 / np.median(spacing):.2f} Hz   "
+                  f"min {spacing.min() * 1000:.2f} ms  max {spacing.max() * 1000:.2f} ms")
+        for name, size in (("packet", NETWORK_TX_PACKET_BYTES // 4),
+                           ("mic block", TransmitAudioRouter.BLOCK_SIZE)):
+            offsets = events % size
+            print(f"  aligned to {name} boundary ({size} frames): "
+                  f"{int(np.count_nonzero(offsets == 0)):,} exactly, "
+                  f"{len(np.unique(offsets))} distinct offset(s)")
+
+    try:
+        with open(f"{prefix}.tx.raw", "rb") as handle:
+            raw = handle.read()
+    except OSError as error:
+        print(f"cannot read {prefix}.tx.raw: {error}")
+        return
+    try:
+        with open(f"{prefix}.tx.time", "rb") as handle:
+            stamps = np.frombuffer(handle.read(), dtype="<u8")
+    except OSError:
+        stamps = np.zeros(0, dtype="<u8")
+
+    words = np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<i2")
+    left, right = words[0::2].astype(np.int32), words[1::2].astype(np.int32)
+    frames = len(left)
+    packets = len(raw) // NETWORK_TX_PACKET_BYTES
+    print(f"transmitted stream : {len(raw):,} B  {packets:,} packets  "
+          f"{frames / rate:.2f} s at {rate} Hz")
+
+    print("\n-- framing --")
+    print(f"  size is a whole number of packets : {len(raw) % NETWORK_TX_PACKET_BYTES == 0}")
+    mismatched = int(np.count_nonzero(left != right))
+    print(f"  L != R frames (mono is duplicated): {mismatched:,}")
+
+    print("\n-- inserted silence (underrun substitution) --")
+    silent = np.all(
+        words[: packets * (NETWORK_TX_PACKET_BYTES // 2)].reshape(packets, -1) == 0, axis=1
+    )
+    runs = int(np.count_nonzero(np.diff(silent.astype(np.int8)) == 1)) + int(silent[:1].sum())
+    print(f"  fully silent packets : {int(silent.sum()):,} of {packets:,}  in {runs} run(s)")
+
+    print("\n-- sample continuity (a splice is a broadband click) --")
+    # A discontinuity shows as a first difference far outside the local
+    # distribution. Compare against a robust scale so a loud passage does not
+    # mask a click and a quiet one does not manufacture them.
+    diff = np.diff(left)
+    scale = float(np.median(np.abs(diff))) or 1.0
+    threshold = max(8.0 * scale, 64.0)
+    events = np.flatnonzero(np.abs(diff) > threshold)
+    print(f"  median |step| {scale:.1f}   threshold {threshold:.1f}")
+    report_events(events, "sample-step outliers")
+
+    print("\n-- phase continuity (catches splices the step test misses) --")
+    # FT8 is a single tone at any instant, so a lost or repeated sample shows as
+    # a phase discontinuity even when the sample-to-sample step stays small.
+    # This is the sensitive test for tonal transmissions.
+    phase_events: np.ndarray = np.zeros(0, dtype=np.int64)
+    signal = left.astype(np.float64)
+    signal -= signal.mean()
+    if frames > 4096 and np.any(signal):
+        spectrum = np.abs(np.fft.rfft(signal * np.hanning(frames))) ** 2
+        dominant = int(np.argmax(spectrum))
+        tonality = float(spectrum[dominant] / (spectrum.sum() + 1e-30))
+        print(f"  dominant {dominant * rate / frames:8.1f} Hz   tonality {tonality:.4f}")
+        if tonality > 0.005:
+            transform = np.fft.fft(signal)
+            transform[frames // 2 + 1:] = 0
+            transform[1:(frames + 1) // 2] *= 2
+            analytic = np.fft.ifft(transform)
+            step = np.angle(analytic[1:] * np.conj(analytic[:-1]))
+            centre = float(np.median(step))
+            deviation = np.abs(step - centre)
+            robust = float(np.median(deviation)) or 1e-9
+            phase_events = np.flatnonzero(deviation > max(25.0 * robust, 0.30))
+            # The FFT-based analytic signal rings at both ends of the record.
+            # Those edges are an artefact of the measurement, not the stream.
+            edge = 256
+            phase_events = phase_events[
+                (phase_events >= edge) & (phase_events < len(step) - edge)
+            ]
+            report_events(phase_events, "phase-step outliers")
+        else:
+            print("  not tonal enough for this test; rely on the step test above")
+    else:
+        print("  recording too short or silent")
+
+    if len(stamps) > 1:
+        print("\n-- send pacing --")
+        gaps = np.diff(stamps.astype(np.int64)) / 1e6
+        print(f"  inter-packet: median {np.median(gaps):.3f} ms  "
+              f"p99 {np.percentile(gaps, 99):.3f} ms  max {gaps.max():.3f} ms")
+        stalls = np.flatnonzero(gaps > 5.0)
+        print(f"  stalls over 5 ms: {len(stalls):,}")
+        if len(stalls):
+            at = stamps[stalls] - stamps[0]
+            print(f"  first 10 stall times (s): "
+                  f"{', '.join(f'{value / 1e9:.4f}' for value in at[:10])}")
+        elapsed = (int(stamps[-1]) - int(stamps[0])) / 1e9
+        print(f"  achieved rate: {(len(stamps) - 1) / elapsed:.1f} packets/s "
+              f"(nominal {1 / NETWORK_TX_PERIOD:.0f})")
+
+    print("\n-- verdict --")
+    clean = (
+        not mismatched
+        and not int(silent.sum())
+        and len(events) == 0
+        and len(phase_events) == 0
+    )
+    if clean:
+        print("  The stream that left this host is clean: contiguous samples, no")
+        print("  inserted silence, correct framing. A defect heard on the air is")
+        print("  therefore radio-side or network-side, not in this application.")
+    else:
+        print("  Defects are present in the stream before it leaves the host.")
+        print("  Use the alignment and spacing figures above to localise them.")
+
+
 def main() -> None:
     if "--self-test" in sys.argv:
         self_test()
+        return
+    if "--analyze-tx" in sys.argv:
+        index = sys.argv.index("--analyze-tx")
+        if index + 1 >= len(sys.argv):
+            print("usage: q900_control.py --analyze-tx <prefix>")
+            return
+        analyze_tx_recording(sys.argv[index + 1])
         return
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
