@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/Users/kaos/radio/q900/q900_control.py", line 2233, in <module>
+    main()
+    ~~~~^^
+  File "/Users/kaos/radio/q900/q900_control.py", line 2222, in main
+    window = MainWindow()
+  File "/Users/kaos/radio/q900/q900_control.py", line 1556, in __init__
+    self.rigctl.start()
+    ~~~~~~~~~~~~~~~~~^^
+  File "/Users/kaos/radio/q900/q900_control.py", line 855, in start
+    listener.bind(("127.0.0.1", port))
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+OSError: [Errno 48] Address already in use
