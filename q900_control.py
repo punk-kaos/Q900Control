@@ -788,9 +788,15 @@ class NetworkAudioMonitor:
 # and the sender process cannot disagree about the unit again.
 NETWORK_TX_PERIOD = 0.001
 NETWORK_TX_PACKET_BYTES = 48 * 2 * 2
-NETWORK_TX_PREROLL_PACKETS = 40      # buffered before the transmitter is keyed
+# The priming burst is drawn from the preroll, so the steady-state buffer is
+# PREROLL - PRIME, not PREROLL. At 40/20 that left 20 packets, exactly one
+# microphone callback, so the buffer emptied on every mic period and a block
+# arriving 10 ms late produced audible gaps. Keep at least two callbacks of
+# slack, and set the low-water mark to the whole cushion so it is held inside
+# the sender process rather than across the capture feeder pipe.
+NETWORK_TX_PREROLL_PACKETS = 80      # buffered before the transmitter is keyed
 NETWORK_TX_PRIME_PACKETS = 20        # unpaced burst into the radio's TX ring
-NETWORK_TX_LOW_WATER_PACKETS = 20    # cushion held inside the sender process
+NETWORK_TX_LOW_WATER_PACKETS = 60    # cushion held inside the sender process
 NETWORK_TX_HIGH_WATER_PACKETS = 200  # hard cap on buffered capture
 NETWORK_TX_MAX_CATCHUP_PACKETS = 8
 # Upper bound on the pre-key wait for the sender process to report ready. It
@@ -3195,6 +3201,25 @@ def self_test() -> None:
         <= NETWORK_TX_HIGH_WATER_PACKETS
     )
     assert NETWORK_TX_PRIME_PACKETS <= NETWORK_TX_PREROLL_PACKETS
+    # The priming burst is drawn from the preroll, so the steady-state cushion is
+    # the difference, not the preroll itself. It must cover more than a single
+    # microphone callback or the buffer bottoms out every mic period and any
+    # late block becomes an audible gap.
+    mic_block_packets = (
+        TransmitAudioRouter.BLOCK_SIZE * 2 * 2 // NETWORK_TX_PACKET_BYTES
+    )
+    steady_state_packets = NETWORK_TX_PREROLL_PACKETS - NETWORK_TX_PRIME_PACKETS
+    assert steady_state_packets >= 2 * mic_block_packets, (
+        steady_state_packets,
+        mic_block_packets,
+    )
+    # Hold that cushion in the sender process. If the low-water mark is below it
+    # the surplus migrates into the feeder queue, back across the pipe that the
+    # in-process cushion exists to insulate against.
+    assert NETWORK_TX_LOW_WATER_PACKETS >= steady_state_packets, (
+        NETWORK_TX_LOW_WATER_PACKETS,
+        steady_state_packets,
+    )
 
     # The vectorized waterfall must reproduce the previous per-pixel mapping
     # exactly. That loop was replaced because it held the GIL for 20-70 ms per

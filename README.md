@@ -128,12 +128,16 @@ datagram is one native media frame: 48 stereo frames, 96 signed 16-bit words,
 RX audio payload. The sender runs in a separate process and uses macOS absolute
 Mach timing to hold the 1 ms cadence.
 
-The sender buffers 40 ms before the transmitter is keyed and then holds a 20 ms
-cushion inside its own process, topping it up from the capture feeder without
-blocking. A late scheduler wake is made up with a bounded catch-up burst rather
-than by discarding schedule, because discarding makes the long-run send rate
-lower than the capture rate. Buffered capture is capped at 200 ms by trimming
-the oldest whole packets, so transmit latency cannot grow without bound.
+The sender buffers 80 ms before the transmitter is keyed, spends 20 ms of that
+priming the radio's TX ring, and holds the remaining 60 ms as a cushion inside
+its own process, topping it up from the capture feeder without blocking. The
+cushion has to cover more than one 20 ms microphone callback: at a smaller
+setting the buffer bottomed out on every mic period, and a callback arriving a
+few milliseconds late became an audible gap. A late scheduler wake is made up
+with a bounded catch-up burst rather than by discarding schedule, because
+discarding makes the long-run send rate lower than the capture rate. Buffered
+capture is capped at 200 ms by trimming the oldest whole packets, so transmit
+latency cannot grow without bound.
 
 The PTT line reports packet count, capture overflows (`ovf`), underruns
 (`gaps`), packets trimmed at the buffer cap (`trim`), failed sends (`err`),
