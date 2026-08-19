@@ -1037,6 +1037,77 @@ NETWORK_TX_PRIME_PACKETS = round(
 RESAMPLE_KP = 0.002
 RESAMPLE_KI = 1.0e-7
 RESAMPLE_TRIM_LIMIT = 0.005
+# Two-pole smoothing of the depth error, in packets, so roughly two seconds.
+#
+# Without it the proportional path put 229 ppm rms of ratio wobble into the 2 to
+# 200 Hz band, which frequency-modulates the audio: measured as a sideband family
+# a few Hz either side of a transmitted tone at -28 dB, and heard as roughness.
+# The cause is that capture arrives in 20 ms blocks, so the buffer depth is a
+# sawtooth of one whole block, and KP converted that granularity directly into
+# rate. The loop itself has a natural frequency near 0.006 Hz, so a two second
+# filter is two orders of magnitude faster than anything the servo needs to do
+# and costs it nothing. Slow drift below 2 Hz is left alone: it is the servo
+# working, and at these amplitudes it is inaudible pitch wander rather than
+# roughness.
+RESAMPLE_SMOOTH_PACKETS = 2000
+# Rate conversion filter. Linear interpolation was measured putting a spurious
+# sideband comb on transmitted audio at -43 dB, spaced at the rate its fractional
+# phase wraps -- 23.66 Hz for the 493 ppm offset seen on this radio. That is
+# plainly audible as roughness, it is present on a steady tone, and it is the one
+# thing the USB transmit path does not do, which is why USB sounded clean while
+# the network path did not.
+#
+# The cause is that a two-tap interpolator's response depends on the fractional
+# phase: at phase 0 it is a passthrough, at phase 0.5 it is a mild lowpass. With
+# the phase walking continuously that difference becomes amplitude and spectral
+# modulation at the wrap rate. A windowed-sinc bank has essentially the same
+# response at every phase, so there is nothing left to modulate.
+RESAMPLE_TAPS = 24
+RESAMPLE_PHASES = 512
+# Cutoff at Nyquist rather than below it. That makes the zero-phase row an exact
+# delta, because sinc() lands on a zero at every other integer tap, so a ratio of
+# exactly one stays bit-identical and enabling conversion cannot touch a correctly
+# clocked link. Backing the cutoff off to 0.88 measured no better on spurs and
+# cost that property, since the row became a mild lowpass instead.
+RESAMPLE_CUTOFF = 1.0
+RESAMPLE_KAISER_BETA = 9.0
+
+
+def _resample_bank(
+    taps: int = RESAMPLE_TAPS,
+    phases: int = RESAMPLE_PHASES,
+    cutoff: float = RESAMPLE_CUTOFF,
+    beta: float = RESAMPLE_KAISER_BETA,
+) -> np.ndarray:
+    """Fractional-delay FIR bank, shape (phases, taps).
+
+    Row p is the filter for an output instant p/phases of a sample after the
+    integer input index. Each row is normalised to unity DC gain so no phase can
+    have a different gain from any other: that equality is the whole point, since
+    a gain that varies with phase is exactly what modulates the audio.
+    """
+    half = taps // 2
+    # Distance from every tap to the output instant, per phase.
+    offset = np.arange(taps)[None, :] - (half - 1)
+    frac = np.arange(phases)[:, None] / phases
+    distance = offset - frac
+    kernel = np.sinc(cutoff * distance) * cutoff
+    # Kaiser window as a function of that distance rather than of the tap index,
+    # so the window stays centred on the output instant as the phase moves.
+    shape = np.clip(distance / half, -1.0, 1.0)
+    kernel = kernel * (
+        np.i0(beta * np.sqrt(np.maximum(0.0, 1.0 - shape * shape))) / np.i0(beta)
+    )
+    kernel /= kernel.sum(axis=1, keepdims=True)
+    return kernel.astype(np.float32)
+
+
+_RESAMPLE_BANK = _resample_bank()
+# Input frames the filter reaches back before the output instant. The caller's
+# buffer keeps this many already-consumed frames in front of the next output
+# position, which happens naturally because only the integer advance is deleted.
+_RESAMPLE_HISTORY = RESAMPLE_TAPS // 2
+
 # Upper bound on the pre-key wait for the sender process to report ready. It
 # covers interpreter spawn and module import, not audio latency.
 NETWORK_TX_READY_TIMEOUT = 3.0
@@ -1107,19 +1178,32 @@ def tx_pacing(radio_rate: float) -> tuple[float, float]:
 
 
 def resample_ratio(
-    depth_frames: int, target_frames: int, trim: float, base_ratio: float
-) -> tuple[float, float]:
-    """Return (ratio, new trim) holding the buffer at `target_frames`.
+    depth_frames: int,
+    target_frames: int,
+    trim: float,
+    base_ratio: float,
+    smooth: tuple[float, float] = (0.0, 0.0),
+) -> tuple[float, float, tuple[float, float]]:
+    """Return (ratio, new trim, new smoothing state) holding the buffer at target.
 
     The base ratio comes from the radio's measured clock, so this only has to
     absorb the host audio clock's own error. A deeper buffer than wanted must
     consume faster, hence a larger ratio.
+
+    The error is smoothed before it reaches either gain. Capture arrives in 20 ms
+    blocks, so the raw depth is a sawtooth a whole block deep, and feeding that
+    to a proportional term modulates the conversion ratio at the block rate --
+    which is frequency modulation of the transmitted audio, not rate control.
+    See RESAMPLE_SMOOTH_PACKETS.
     """
     error = (depth_frames - target_frames) / target_frames if target_frames else 0.0
+    alpha = 1.0 / RESAMPLE_SMOOTH_PACKETS
+    first = smooth[0] + alpha * (error - smooth[0])
+    second = smooth[1] + alpha * (first - smooth[1])
     trim = min(
-        max(trim + RESAMPLE_KI * error, -RESAMPLE_TRIM_LIMIT), RESAMPLE_TRIM_LIMIT
+        max(trim + RESAMPLE_KI * second, -RESAMPLE_TRIM_LIMIT), RESAMPLE_TRIM_LIMIT
     )
-    return base_ratio * (1.0 + RESAMPLE_KP * error + trim), trim
+    return base_ratio * (1.0 + RESAMPLE_KP * second + trim), trim, (first, second)
 
 
 def resample_stereo(
@@ -1138,23 +1222,32 @@ def resample_stereo(
     buffer overflow. Either way a whole millisecond of audio is eventually
     discarded, which reaches the air as a broadband click. Converting the rate
     spreads that difference across every sample instead.
+
+    The conversion is a polyphase windowed-sinc bank, not linear interpolation:
+    see RESAMPLE_TAPS. Both channels are filtered independently so this stays
+    correct for the I/Q path, where the two words are not copies of each other.
+
+    The first _RESAMPLE_HISTORY frames of a fresh buffer serve only as filter
+    history and are never output, which costs a quarter of a millisecond once.
     """
     if frames_out < 1 or ratio <= 0.0:
         return None
-    last_position = phase + ratio * (frames_out - 1)
-    # One frame beyond the final interpolation point, plus one so the next call
-    # still has a frame either side of its own starting phase.
-    required = int(last_position) + 3
+    history = _RESAMPLE_HISTORY
+    reach = RESAMPLE_TAPS - history
+    last_position = history + phase + ratio * (frames_out - 1)
+    required = int(last_position) + reach + 1
     if len(pending) < required * 4:
         return None
     data = np.frombuffer(bytes(pending[: required * 4]), dtype="<i2").reshape(-1, 2)
-    position = phase + ratio * np.arange(frames_out)
+    position = history + phase + ratio * np.arange(frames_out)
     index = position.astype(np.int64)
-    weight = (position - index).astype(np.float32)[:, None]
-    lower = data[index].astype(np.float32)
-    upper = data[index + 1].astype(np.float32)
-    frames = np.rint(lower + (upper - lower) * weight)
-    payload = np.clip(frames, -32768, 32767).astype("<i2").tobytes()
+    row = np.minimum(
+        ((position - index) * RESAMPLE_PHASES).astype(np.int64), RESAMPLE_PHASES - 1
+    )
+    kernel = _RESAMPLE_BANK[row]
+    window = data[index[:, None] + (np.arange(RESAMPLE_TAPS) - (history - 1))[None, :]]
+    frames = np.einsum("ft,ftc->fc", kernel, window.astype(np.float32))
+    payload = np.clip(np.rint(frames), -32768, 32767).astype("<i2").tobytes()
     advance = phase + ratio * frames_out
     consumed = int(advance)
     del pending[: consumed * 4]
@@ -1238,9 +1331,18 @@ def udp_audio_sender(
     # losing a millisecond of audio every few seconds, which it resolves by
     # discarding a frame: a broadband click at exactly that period.
     period, base_ratio = tx_pacing(radio_rate)
-    target_frames = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
+    # refill() tops the buffer up whenever it falls below the low-water mark, so
+    # the depth it actually holds is that mark plus up to one microphone block.
+    # Aim at the middle of that band. Aiming at the mark itself, as this did,
+    # means the measured error can never go negative, so the integrator winds up
+    # against its limit and the servo runs permanently biased.
+    target_frames = (
+        NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
+        + TransmitAudioRouter.BLOCK_SIZE // 2
+    )
     resample_phase = 0.0
     ratio_trim = 0.0
+    ratio_smooth = (0.0, 0.0)
     preroll_bytes = NETWORK_TX_PREROLL_PACKETS * packet_bytes
     low_water = NETWORK_TX_LOW_WATER_PACKETS * packet_bytes
     high_water = NETWORK_TX_HIGH_WATER_PACKETS * packet_bytes
@@ -1357,7 +1459,7 @@ def udp_audio_sender(
                 pass
 
     def next_payload() -> bytes:
-        nonlocal resample_phase, ratio_trim
+        nonlocal resample_phase, ratio_trim, ratio_smooth
         refill()
         if len(pending) > high_water:
             # Trim the oldest whole packets rather than letting latency grow
@@ -1368,8 +1470,8 @@ def udp_audio_sender(
             trimmed.value += excess
         # Hold the buffer at its target depth by trimming the conversion ratio.
         # This absorbs the host audio clock's error without needing to know it.
-        ratio, ratio_trim = resample_ratio(
-            len(pending) // 4, target_frames, ratio_trim, base_ratio
+        ratio, ratio_trim, ratio_smooth = resample_ratio(
+            len(pending) // 4, target_frames, ratio_trim, base_ratio, ratio_smooth
         )
         converted = resample_stereo(pending, frames_per_packet, ratio, resample_phase)
         if converted is None:
@@ -4261,10 +4363,14 @@ def self_test() -> None:
         return bytes(output), supplied - len(buffer) // 4, produced
 
     # A ratio of exactly one must be bit-identical, so enabling conversion cannot
-    # perturb a correctly clocked link.
+    # perturb a correctly clocked link. The output starts _RESAMPLE_HISTORY frames
+    # into the input, because the filter reaches back that far and those frames
+    # serve only as history: a quarter of a millisecond, once, at startup.
     identity, consumed, produced = convert(1.0, 60)
     assert consumed == produced, (consumed, produced)
-    assert identity == tone_frames(produced, 0), "ratio 1.0 must be transparent"
+    assert identity == tone_frames(produced, _RESAMPLE_HISTORY), (
+        "ratio 1.0 must be transparent"
+    )
 
     for ratio in (1.0005, 0.9995, 1.002, 0.998):
         _, consumed, produced = convert(ratio, 600)
@@ -4292,7 +4398,9 @@ def self_test() -> None:
         )
 
     # Channel order must survive interpolation. A duplicated-mono test signal
-    # cannot detect a left/right swap, so use distinct channels here.
+    # cannot detect a left/right swap, so use distinct channels here. The output
+    # begins _RESAMPLE_HISTORY frames in, because the filter needs that much
+    # history, so compare against the input from there.
     distinct = bytearray()
     for frame in range(400):
         distinct += int(frame % 1000).to_bytes(2, "little", signed=True)
@@ -4300,8 +4408,9 @@ def self_test() -> None:
     step = resample_stereo(distinct, frames_per_packet, 1.0, 0.0)
     assert step is not None
     swapped = np.frombuffer(step[0], dtype="<i2")
-    assert swapped[0] == 0 and swapped[1] == 0
-    assert swapped[2] == 1 and swapped[3] == -1, swapped[:4]
+    first = _RESAMPLE_HISTORY
+    assert swapped[0] == first and swapped[1] == -first, swapped[:4]
+    assert swapped[2] == first + 1 and swapped[3] == -(first + 1), swapped[:4]
 
     # Pacing must follow the radio, and fall back cleanly when it is unknown.
     assert tx_pacing(0.0) == (NETWORK_TX_PERIOD, 1.0)
@@ -4313,15 +4422,31 @@ def self_test() -> None:
         assert abs(base_ratio * radio_rate - 1.0 / NETWORK_TX_PERIOD) < 1e-6, radio_rate
 
     # The servo must push back in the right direction and with a bounded trim.
-    target = NETWORK_LOW_WATER_FRAMES = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
-    deep, _ = resample_ratio(target * 2, target, 0.0, 1.0)
-    shallow, _ = resample_ratio(target // 2, target, 0.0, 1.0)
-    steady, steady_trim = resample_ratio(target, target, 0.0, 1.0)
+    # Its error is now smoothed, so a single call barely moves: drive it for a
+    # while and compare where it settles.
+    target = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
+
+    def drive(depth: int, packets: int, base: float = 1.0) -> tuple[float, float]:
+        """Hold `depth` constant for `packets` and return (ratio, trim)."""
+        trim, smooth = 0.0, (0.0, 0.0)
+        ratio = base
+        for _ in range(packets):
+            ratio, trim, smooth = resample_ratio(depth, target, trim, base, smooth)
+        return ratio, trim
+
+    deep, _ = drive(target * 2, 20_000)
+    shallow, _ = drive(target // 2, 20_000)
+    steady, steady_trim = drive(target, 20_000)
     assert deep > steady > shallow, (deep, steady, shallow)
     assert abs(steady - 1.0) < 1e-12 and steady_trim == 0.0
-    runaway = 0.0
-    for _ in range(10_000_000 // 1_000):
-        _, runaway = resample_ratio(target * 10, target, runaway, 1.0)
+    # A single call must be a small correction, not a lurch: that is the property
+    # that stops buffer granularity from frequency-modulating the audio.
+    once, _, _ = resample_ratio(target * 2, target, 0.0, 1.0)
+    assert abs(once - 1.0) < 1e-5, once
+    # The trim must stay bounded however long the error persists.
+    runaway, smooth = 0.0, (0.0, 0.0)
+    for _ in range(200_000):
+        _, runaway, smooth = resample_ratio(target * 10, target, runaway, 1.0, smooth)
     assert runaway <= RESAMPLE_TRIM_LIMIT + 1e-12, runaway
 
     # With the base ratio deliberately wrong, only the servo can stop the buffer
@@ -4329,10 +4454,10 @@ def self_test() -> None:
     for host_hz, radio_rate in ((48_024.0, 999.5), (47_976.0, 1_000.6)):
         emit_period = 1.0 / radio_rate
         depth = float(target)
-        trim = 0.0
+        trim, smooth = 0.0, (0.0, 0.0)
         deepest, shallowest = depth, depth
-        for _ in range(int(180.0 / emit_period)):
-            ratio, trim = resample_ratio(int(depth), target, trim, 1.0)
+        for _ in range(int(600.0 / emit_period)):
+            ratio, trim, smooth = resample_ratio(int(depth), target, trim, 1.0, smooth)
             depth += host_hz * emit_period - ratio * frames_per_packet
             deepest, shallowest = max(deepest, depth), min(shallowest, depth)
         assert shallowest > frames_per_packet, (host_hz, radio_rate, shallowest)
@@ -4344,57 +4469,41 @@ def self_test() -> None:
         assert abs(depth - target) < target * 0.5, (host_hz, radio_rate, depth, target)
 
     # Depth-to-ratio is a double integrator, so the loop needs damping as well as
-    # integral action. Start the buffer at twice its target: with the
-    # proportional term the overshoot is bounded, without it the buffer rings all
-    # the way down through empty and underruns.
-    depth, trim = float(target * 2), 0.0
+    # integral action. Start the buffer at twice its target and check it does not
+    # ring down through empty.
+    depth, trim, smooth = float(target * 2), 0.0, (0.0, 0.0)
     shallowest = depth
-    for _ in range(300_000):
-        ratio, trim = resample_ratio(int(depth), target, trim, 1.0)
+    for _ in range(900_000):
+        ratio, trim, smooth = resample_ratio(int(depth), target, trim, 1.0, smooth)
         depth += 48_000.0 * NETWORK_TX_PERIOD - ratio * frames_per_packet
         shallowest = min(shallowest, depth)
     assert shallowest > frames_per_packet * 20, shallowest
     assert abs(depth - target) < target * 0.5, depth
 
-    # The servo must hold the buffer between the cushion and the trim cap for any
-    # plausible pair of clocks, without underrunning or trimming.
-    target_frames = NETWORK_TX_LOW_WATER_PACKETS * frames_per_packet
-    for host_hz, radio_rate in ((48_000.0, 1_000.0), (48_000.0, 999.3), (48_024.0, 999.5)):
-        emit_period = 1.0 / radio_rate
-        ratio_base = (1.0 / NETWORK_TX_PERIOD) / radio_rate
-        buffer = bytearray(tone_frames(NETWORK_TX_PREROLL_PACKETS * frames_per_packet, 0))
-        supplied = NETWORK_TX_PREROLL_PACKETS * frames_per_packet
-        phase, trim, starved = 0.0, 0.0, 0
-        deepest, shallowest = 0, 10 ** 9
-        for packet_index in range(int(20.0 / emit_period)):
-            wanted = int(packet_index * emit_period * host_hz)
-            behind = wanted + NETWORK_TX_PREROLL_PACKETS * frames_per_packet - supplied
-            if behind >= 960:
-                add = (behind // 960) * 960
-                buffer += tone_frames(add, supplied)
-                supplied += add
-            depth = len(buffer) // 4
-            deepest, shallowest = max(deepest, depth), min(shallowest, depth)
-            error = (depth - target_frames) / target_frames
-            trim = min(
-                max(trim + RESAMPLE_KI * error, -RESAMPLE_TRIM_LIMIT),
-                RESAMPLE_TRIM_LIMIT,
-            )
-            step = resample_stereo(
-                buffer,
-                frames_per_packet,
-                ratio_base * (1.0 + RESAMPLE_KP * error + trim),
-                phase,
-            )
-            if step is None:
-                starved += 1
-                continue
-            _, phase = step
-        assert starved == 0, (host_hz, radio_rate, starved)
-        assert shallowest > frames_per_packet * 4, (host_hz, radio_rate, shallowest)
-        assert deepest < NETWORK_TX_HIGH_WATER_PACKETS * frames_per_packet, (
-            host_hz, radio_rate, deepest,
-        )
+    # The whole point of the smoothing: capture arrives in 20 ms blocks, so the
+    # depth is a sawtooth one block deep. That granularity must not reach the
+    # conversion ratio, because a ratio that moves at the block rate frequency-
+    # modulates the transmitted audio. Measured at -28 dB on a real transmission
+    # before this filter existed.
+    ratios = []
+    depth = float(target + TransmitAudioRouter.BLOCK_SIZE // 2)
+    trim, smooth = 0.0, (0.0, 0.0)
+    for packet in range(60_000):
+        if packet % 20 == 0:
+            depth += TransmitAudioRouter.BLOCK_SIZE
+        ratio, trim, smooth = resample_ratio(int(depth), target, trim, 1.0, smooth)
+        depth -= ratio * frames_per_packet
+        ratios.append(ratio)
+    settled = np.array(ratios[20_000:])
+    wobble = settled / settled.mean() - 1.0
+    # Isolate the block rate and above, where the audible sidebands were.
+    spectrum = np.abs(np.fft.rfft(wobble * np.hanning(len(wobble))))
+    spectrum *= 2.0 / np.sum(np.hanning(len(wobble)))
+    bins = np.fft.rfftfreq(len(wobble), NETWORK_TX_PERIOD)
+    audible = spectrum[(bins >= 2.0) & (bins <= 200.0)]
+    assert np.sqrt(np.sum(audible ** 2) / 2) < 5e-6, float(
+        np.sqrt(np.sum(audible ** 2) / 2) * 1e6
+    )
 
     # The radio's media clock is measured from packet arrivals, and that figure
     # decides whether transmit audio has to be re-paced. Averaging over the whole
@@ -4734,6 +4843,26 @@ def analyze_tx_recording(prefix: str) -> None:
     else:
         span = slice(0, 0)
     sustained = signal[span]
+    # Then restrict to the steady part of it. A Tune transmission ramps its tone up
+    # and down on purpose to avoid key clicks, and a ramp inside the analysis
+    # window is a genuine amplitude modulation: it puts sidebands within a few Hz
+    # of the carrier and dominates any envelope figure, which is how a tone that is
+    # flat to half a per cent reads as a hundred per cent modulated. Keep the
+    # longest run that stays near the median level, then stand clear of its edges
+    # so the analytic transform's own ringing is excluded too.
+    if len(sustained) > 8192:
+        envelope = np.abs(_analytic(sustained))
+        level = float(np.median(envelope))
+        if level > 0.0:
+            inside = np.flatnonzero(envelope > 0.7 * level)
+            if len(inside):
+                cuts = np.flatnonzero(np.diff(inside) > 1)
+                longest_run = max(np.split(inside, cuts + 1), key=len)
+                margin = 512
+                start = int(longest_run[0]) + margin
+                stop = int(longest_run[-1]) + 1 - margin
+                if stop - start > 8192:
+                    sustained = sustained[start:stop]
     if len(sustained) > 8192 and np.any(sustained):
         spectrum = np.abs(np.fft.rfft(sustained * np.hanning(len(sustained)))) ** 2
         dominant = int(np.argmax(spectrum))
@@ -4778,12 +4907,37 @@ def analyze_tx_recording(prefix: str) -> None:
             print(f"  SNR              {snr:+9.1f} dB  (everything else vs fundamental)")
             for n, fn, level in lines[:5]:
                 print(f"    harmonic {n} at {fn:8.1f} Hz  {level:+7.1f} dB")
-            # Envelope stability. A ring correction, an ALC, or a resampler with a
-            # walking phase all modulate amplitude; a clean tone does not.
+            # Nearby spurs, not harmonics, are what a rate converter leaves behind.
+            # A two-tap interpolator's response depends on its fractional phase, so
+            # with the phase walking it modulates the audio and puts a comb around
+            # the tone spaced at the wrap rate: |ratio - 1| * 48000 Hz. Reporting
+            # the spacing identifies the mechanism, because that figure is the
+            # conversion ratio expressed in ppm.
+            skirt = 8.0
+            near = (np.abs(freqs - f0) > skirt) & (np.abs(freqs - f0) < 500.0)
+            if np.any(near):
+                worst = float(np.max(mag[near]))
+                at = float(freqs[near][int(np.argmax(mag[near]))])
+                level = 20 * np.log10(worst / (np.max(mag) + 1e-30) + 1e-30)
+                spacing = at - f0
+                print(f"  worst spur       {level:+9.1f} dB  at {at:.2f} Hz "
+                      f"({spacing:+.2f} Hz from the tone)")
+                if abs(spacing) > 0.5:
+                    print(f"    a comb at this spacing is rate-conversion residue: "
+                          f"{abs(spacing) / rate * 1e6:.0f} ppm")
+            else:
+                level = -999.0
+            # Envelope stability. Measure over the interior with percentiles: the
+            # onset of the tone is a legitimate step, and letting it into a
+            # peak-to-peak figure reports a flat tone as 109 per cent modulated.
             analytic_mag = np.abs(_analytic(block))
-            core = analytic_mag[256:-256] if len(analytic_mag) > 1024 else analytic_mag
-            envelope_ripple = float(np.ptp(core) / (np.mean(core) + 1e-30))
-            print(f"  envelope ripple  {envelope_ripple * 100:8.2f} %  peak-to-peak")
+            core = analytic_mag[1024:-1024] if len(analytic_mag) > 4096 else analytic_mag
+            envelope_ripple = float(
+                (np.percentile(core, 99.9) - np.percentile(core, 0.1))
+                / (np.mean(core) + 1e-30)
+            )
+            print(f"  envelope ripple  {envelope_ripple * 100:8.3f} %  "
+                  f"(0.1..99.9 percentile of the interior)")
             # Lost or repeated samples. For a steady tone the unwrapped phase is a
             # straight line; a sample gained or lost displaces it by one sample's
             # worth of advance. Fitting the line and measuring the residual counts
@@ -4801,7 +4955,9 @@ def analyze_tx_recording(prefix: str) -> None:
             print(f"  phase-implied f0 {implied:9.3f} Hz  "
                   f"({(implied / max(f0, 1e-9) - 1) * 1e6:+.0f} ppm vs FFT peak)")
             print(f"  net sample slip  {samples_slipped:8.2f} samples across the record")
-            tone_clean = thd < -55.0 and snr > 45.0 and envelope_ripple < 0.05
+            tone_clean = (
+                thd < -55.0 and snr > 45.0 and envelope_ripple < 0.01 and level < -75.0
+            )
             print(f"  tone verdict     {'clean' if tone_clean else 'DEGRADED'}")
 
     if len(stamps) > 1:

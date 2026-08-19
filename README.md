@@ -390,6 +390,73 @@ used is the application's own record of it: if the radio's compressor has been
 changed from the front panel, set it from the host as well or the level will be
 wrong by the ratio of the two gains.
 
+### Transmit Rate Conversion
+
+The host produces audio on its own clock and the radio consumes on its crystal,
+so one end has to be converted to the other. Both the conversion filter and the
+loop that steers it were putting measurable spurs on transmitted audio, and both
+were invisible on the USB transmit path because that path does not convert at
+all -- which is why USB sounded clean while the network path did not.
+
+The conversion is a polyphase windowed-sinc bank, 24 taps and 512 phases, cut off
+at Nyquist so the zero-phase row is an exact delta and a correctly clocked link
+stays bit-identical. It replaced linear interpolation, whose response depends on
+the fractional phase: a passthrough at phase 0 and a mild lowpass at phase 0.5.
+With the phase walking continuously that difference became spectral modulation at
+the wrap rate, `|ratio - 1| * 48000` Hz, measured on a transmitted tone as a
+sideband comb 23.66 Hz either side of the carrier. Replacing the filter moved the
+worst nearby spur from -61 dB to -91 dB.
+
+The servo that trims the ratio smooths its error with two poles at about two
+seconds. Capture arrives in 20 ms blocks, so the buffer depth is a sawtooth one
+whole block deep, and a proportional term applied to that converted buffer
+granularity directly into rate -- frequency modulation of the audio rather than
+rate control. It measured 229 ppm rms of ratio movement in the 2 to 200 Hz band,
+worth a -47 dB sideband family a few Hz either side of a tone; smoothing brings
+that to 0.01 ppm. The loop's own natural frequency is near 0.006 Hz, so a two
+second filter is orders of magnitude faster than anything it needs to do. Slow
+drift below 2 Hz is deliberately left alone: that is the servo working, and at
+these amplitudes it is inaudible pitch wander rather than roughness.
+
+The servo also aims at the middle of the band the refill loop actually holds,
+rather than at the low-water mark itself. Aiming at the mark meant the measured
+depth could never fall below the target, so the error never changed sign and the
+integrator wound up against its limit.
+
+### Diagnosing Transmit Audio
+
+`--analyze-tx` reads a `Q900_TX_RECORD` capture, which is byte-for-byte what left
+the socket, and so separates a host defect from a radio or network one. Drive it
+with a steady tone -- WSJT-X `Tune` will do -- because a single sine makes every
+defect measurable in a way speech cannot:
+
+```bash
+Q900_TX_RECORD=/tmp/q900 python3 q900_control.py
+python3 q900_control.py --analyze-tx /tmp/q900
+```
+
+Each defect this path can produce has its own signature, so the numbers identify
+which one rather than merely reporting that something is wrong:
+
+| defect | THD | SNR | envelope ripple |
+| --- | --- | --- | --- |
+| clean | -76 dB | +85 dB | 0.04 % |
+| a frame dropped per datagram (ring above 4608 words) | -34 dB | +25 dB | 16 % |
+| a frame duplicated per datagram (ring below 1536 words) | -34 dB | +25 dB | 16 % |
+| audio being transmitted as I/Q | -87 dB | 0 dB | 157 % |
+| driven into the radio's ALC | -15 dB | +42 dB | 30 % |
+| host underrun silence | -76 dB | +65 dB | 0.4 % |
+
+Rate-conversion residue does not show up in any of those columns, because it is
+neither harmonic nor amplitude modulation. It appears as a spur close to the
+carrier, so the report names the worst one within 500 Hz and converts its offset
+to ppm: a comb at that spacing is the conversion ratio made audible.
+
+Measure only the steady part of a tone. A Tune transmission ramps up and down on
+purpose, and a ramp inside the analysis window is a real amplitude modulation
+that will report a tone flat to half a per cent as a hundred per cent modulated.
+
+
 ### Transmit Ring
 
 The radio's transmit ring holds 6144 words, 64 ms at 48 kHz stereo. Its rate
