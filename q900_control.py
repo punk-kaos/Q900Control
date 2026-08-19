@@ -1805,6 +1805,7 @@ class TransmitAudioRouter:
         self._udp_trimmed: mp.Value | None = None
         self._udp_send_errors: mp.Value | None = None
         self._udp_overflows: mp.Value | None = None
+        self._udp_dropped: mp.Value | None = None
         self._udp_ready: mp.Event | None = None
         self._udp_ceiling = 0
         self._udp_compressor = 0
@@ -1893,6 +1894,7 @@ class TransmitAudioRouter:
         self._udp_trimmed = self._mp.Value("L", 0, lock=False)
         self._udp_send_errors = self._mp.Value("L", 0, lock=False)
         self._udp_overflows = self._mp.Value("L", 0, lock=False)
+        self._udp_dropped = self._mp.Value("L", 0, lock=False)
         self._udp_ready = self._mp.Event()
 
         def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
@@ -1926,7 +1928,12 @@ class TransmitAudioRouter:
                     self._udp_queue.put_nowait(payload)
                 except queue.Full:
                     # Drop the oldest buffered block so the newest microphone
-                    # audio is never silently lost.
+                    # audio is never silently lost. Count it: this discards a
+                    # whole 20 ms of audio, which reaches the air as a splice,
+                    # and it used to be the one event on this path that no
+                    # counter could see.
+                    if self._udp_dropped:
+                        self._udp_dropped.value += 1
                     try:
                         self._udp_queue.get_nowait()
                     except queue.Empty:
@@ -2120,9 +2127,10 @@ class TransmitAudioRouter:
         trimmed = self._udp_trimmed.value if self._udp_trimmed else 0
         errors = self._udp_send_errors.value if self._udp_send_errors else 0
         overflows = self._udp_overflows.value if self._udp_overflows else 0
+        dropped = self._udp_dropped.value if self._udp_dropped else 0
         return (
-            f"UDP {packets} pkts  ovf {overflows}  gaps {underruns}  trim {trimmed}  "
-            f"err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
+            f"UDP {packets} pkts  ovf {overflows}  drop {dropped}  gaps {underruns}  "
+            f"trim {trimmed}  err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
             f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
         )
 
