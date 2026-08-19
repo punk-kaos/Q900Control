@@ -1402,6 +1402,20 @@ def udp_audio_sender(
             record_stream = record_times = None
 
     last_send = [0]
+    skipped = [0]
+
+    def send_scheduled() -> bool:
+        """Emit one scheduled packet, or skip it if there is no audio for it.
+
+        Skipping spends the radio's ring slack instead of transmitting a hole.
+        The caller turns a skip into debt so the depth is restored afterwards.
+        """
+        payload = next_payload()
+        if payload is None:
+            skipped[0] += 1
+            return False
+        send(payload)
+        return True
 
     def send(payload: bytes) -> None:
         # Enforce a floor on the spacing between datagrams here rather than at
@@ -1458,7 +1472,7 @@ def udp_audio_sender(
             except queue.Empty:
                 pass
 
-    def next_payload() -> bytes:
+    def next_payload() -> bytes | None:
         nonlocal resample_phase, ratio_trim, ratio_smooth
         refill()
         if len(pending) > high_water:
@@ -1476,7 +1490,17 @@ def udp_audio_sender(
         converted = resample_stereo(pending, frames_per_packet, ratio, resample_phase)
         if converted is None:
             underruns.value += 1
-            return bytes(packet_bytes)
+            # Send nothing rather than substituting silence. The radio's ring
+            # holds about 32 ms precisely so a brief feeder hiccup costs nothing,
+            # and skipping a packet spends that slack: measured on the air, a
+            # transmitted silence packet is a hole in the audio, whereas the same
+            # gap covered by the ring is inaudible. Debt repayment above then
+            # restores the depth once capture catches up.
+            #
+            # Runs of these were the "faint pulsing": 8 dropouts of 2 to 12 ms in
+            # 30 s, one every 3.5 s, at -38 dB, present on the network path and
+            # absent from the radio's own USB path.
+            return None
         payload, resample_phase = converted
         return payload
 
@@ -1516,12 +1540,14 @@ def udp_audio_sender(
                 # Teardown releases `keyed` so this process can exit. Do not
                 # emit a burst into a transmitter that is already unkeyed.
                 return
-            send(next_payload())
+            send_scheduled()
 
         deadline = mach_time() if mach_time else time.monotonic()
         debt_packets = 0
         while not stop.is_set():
-            send(next_payload())
+            if not send_scheduled():
+                # No audio for this slot. The ring covers it; owe it back.
+                debt_packets = min(debt_packets + 1, NETWORK_TX_MAX_DEBT_PACKETS)
             if debt_packets:
                 # Repay abandoned schedule debt one packet per period. Dropping
                 # it instead makes the long-run send rate lower than the radio's
@@ -1530,8 +1556,8 @@ def udp_audio_sender(
                 # walks down past 1536 words and the firmware then duplicates a
                 # frame on every single datagram. Repaying gradually keeps the
                 # ring inside the corrector's dead zone without bursting.
-                send(next_payload())
-                debt_packets -= 1
+                if send_scheduled():
+                    debt_packets -= 1
             if mach_time and mach_wait:
                 deadline += period_ticks
                 mach_wait(deadline)
@@ -1548,7 +1574,7 @@ def udp_audio_sender(
                     behind = int(lateness / period)
                     burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
                     for _ in range(burst):
-                        send(next_payload())
+                        send_scheduled()
                     deadline += burst * period_ticks
                     if (mach_time() - deadline) / ticks_per_second > period:
                         # Further behind than the catch-up bound allows. Resync
@@ -1571,7 +1597,7 @@ def udp_audio_sender(
                     behind = int(lateness / period)
                     burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
                     for _ in range(burst):
-                        send(next_payload())
+                        send_scheduled()
                     deadline += burst * period
                     if time.monotonic() - deadline > period:
                         now = time.monotonic()
@@ -2129,7 +2155,7 @@ class TransmitAudioRouter:
         overflows = self._udp_overflows.value if self._udp_overflows else 0
         dropped = self._udp_dropped.value if self._udp_dropped else 0
         return (
-            f"UDP {packets} pkts  ovf {overflows}  drop {dropped}  gaps {underruns}  "
+            f"UDP {packets} pkts  ovf {overflows}  drop {dropped}  skip {underruns}  "
             f"trim {trimmed}  err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
             f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
         )

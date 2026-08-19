@@ -423,6 +423,27 @@ rather than at the low-water mark itself. Aiming at the mark meant the measured
 depth could never fall below the target, so the error never changed sign and the
 integrator wound up against its limit.
 
+### Transmit Underruns
+
+When the sender has no audio for a scheduled slot it emits nothing, rather than
+substituting a packet of digital silence. The radio's ring holds about 32 ms
+precisely so a brief feeder hiccup costs nothing, and a skipped slot spends that
+slack; the debt mechanism then restores the depth once capture catches up.
+
+This was measured, not reasoned about. Recording the receiving radio
+electrically and comparing the network path against the radio's own USB path
+showed eight dropouts in 30 s on the network path only, 2 to 12 ms long, one
+every 3.5 s, at -38 dB -- digital silence on the air, and audible as a faint
+pulsing. The mean level never moved, which is what distinguished it from AM,
+receiver AGC or anything acoustic. Modelling the radio's ring from real send
+timestamps, a 12 ms feeder stall now produces no holes at all.
+
+A stall longer than the ring is deep cannot be covered from this side. Skipping
+still degrades better than silence: the depth falls into the firmware's
+duplication region, where it repeats one frame per datagram, which is mild
+roughness rather than a hole. Skipped slots are counted as `skip` in the audio
+status line, and a whole discarded microphone block as `drop`.
+
 ### Diagnosing Transmit Audio
 
 `--analyze-tx` reads a `Q900_TX_RECORD` capture, which is byte-for-byte what left
