@@ -1111,13 +1111,24 @@ _RESAMPLE_HISTORY = RESAMPLE_TAPS // 2
 # Upper bound on the pre-key wait for the sender process to report ready. It
 # covers interpreter spawn and module import, not audio latency.
 NETWORK_TX_READY_TIMEOUT = 3.0
-# Set Q900_TX_RECORD to a path prefix to capture exactly what leaves the host.
+
 # The sender writes every transmitted payload to <prefix>.tx.raw (48 kHz stereo
 # S16LE) and one 8-byte little-endian nanosecond send timestamp per packet to
 # <prefix>.tx.time. Analyse with `--analyze-tx <prefix>`. This distinguishes a
 # host-side defect from a radio-side or network-side one: if the recording is
 # clean, nothing above the socket is responsible.
 TX_RECORD_PREFIX = os.environ.get("Q900_TX_RECORD") or None
+
+# Set Q900_TX_TONE to a frequency in Hz to transmit a synthesised sine instead of
+# the microphone. Everything downstream is identical -- the same DC blocker,
+# quantiser, resampler, pacing and socket -- so anything the recording shows that
+# is not in a mathematically exact tone belongs to this application or the radio.
+#
+# This exists because a tone driven in through a virtual audio device cannot be
+# trusted as a reference: the source application, the virtual device and CoreAudio
+# may each resample it, and all of that is upstream of anything here. Measuring a
+# transmit path needs a source that is known to be clean.
+TX_TONE_HZ = float(os.environ.get("Q900_TX_TONE") or 0.0)
 
 # Transmit gain staging. The radio does not scale network audio to suit itself:
 # for stream format 1 the conversion at 0x080397BC multiplies by exactly 2**-16,
@@ -1309,6 +1320,12 @@ def quantize_tx(mono: np.ndarray, ceiling: int) -> np.ndarray:
     return np.rint(scaled).astype("<i2")
 
 
+class _NoStatus:
+    """Stand-in for PortAudio's CallbackFlags when the source is synthesised."""
+
+    input_overflow = False
+
+
 def udp_audio_sender(
     microphone: int | str,
     udp_socket: socket.socket,
@@ -1429,24 +1446,48 @@ def udp_audio_sender(
                 dropped.value += 1
 
     try:
-        stream = sd.InputStream(
-            device=microphone,
-            samplerate=TransmitAudioRouter.NETWORK_SAMPLE_RATE,
-            blocksize=TransmitAudioRouter.BLOCK_SIZE,
-            channels=1,
-            dtype="float32",
-            # Not "high". A high-latency request makes CoreAudio hand over four
-            # blocks back to back and then nothing for 85 ms: measured over 20 s,
-            # 764 of 998 callbacks arrived less than 1 ms apart and 233 gaps
-            # exceeded 60 ms. No cushion this side of a 1 ms packet clock absorbs
-            # that reliably, and it is what put holes in the transmitted audio
-            # every few seconds. Asking for low latency gives one block every
-            # 20.00 ms with a worst case of 20.24 ms, and measures the device
-            # clock as -12 ppm instead of an apparent +2884.
-            latency="low",
-            callback=capture,
-        )
-        stream.start()
+        if TX_TONE_HZ > 0.0:
+            # Synthesised source: behave exactly like a perfect capture device,
+            # one block every 20 ms on absolute deadlines, so the rate servo and
+            # resampler are exercised the same way. The phase accumulates in
+            # integer samples so the tone is exact over any length of run.
+            def generate() -> None:
+                index = 0
+                step = TransmitAudioRouter.BLOCK_SIZE
+                rate = TransmitAudioRouter.NETWORK_SAMPLE_RATE
+                nxt = time.monotonic()
+                while not stop.is_set():
+                    axis = (index + np.arange(step)) / rate
+                    index += step
+                    block = (0.9 * np.sin(2.0 * np.pi * TX_TONE_HZ * axis)).astype(
+                        np.float32
+                    )
+                    capture(block.reshape(-1, 1), step, None, _NoStatus())
+                    nxt += step / rate
+                    time.sleep(max(0.0, nxt - time.monotonic()))
+
+            stream = None
+            threading.Thread(target=generate, name="q900-tx-tone",
+                             daemon=True).start()
+        else:
+            stream = sd.InputStream(
+                device=microphone,
+                samplerate=TransmitAudioRouter.NETWORK_SAMPLE_RATE,
+                blocksize=TransmitAudioRouter.BLOCK_SIZE,
+                channels=1,
+                dtype="float32",
+                # Not "high". A high-latency request makes CoreAudio hand over four
+                # blocks back to back and then nothing for 85 ms: measured over 20 s,
+                # 764 of 998 callbacks arrived less than 1 ms apart and 233 gaps
+                # exceeded 60 ms. No cushion this side of a 1 ms packet clock absorbs
+                # that reliably, and it is what put holes in the transmitted audio
+                # every few seconds. Asking for low latency gives one block every
+                # 20.00 ms with a worst case of 20.24 ms, and measures the device
+                # clock as -12 ppm instead of an apparent +2884.
+                latency="low",
+                callback=capture,
+            )
+            stream.start()
     except Exception as error:  # noqa: BLE001 - report anything the host refuses
         if failure is not None:
             failure.value = f"microphone: {error}".encode()[:255]
@@ -1718,8 +1759,9 @@ def udp_audio_sender(
     finally:
         # This process owns the capture stream now, so it has to close it.
         try:
-            stream.stop()
-            stream.close()
+            if stream is not None:
+                stream.stop()
+                stream.close()
         except Exception:  # noqa: BLE001 - teardown must not mask a real error
             pass
         if record_stream is not None:

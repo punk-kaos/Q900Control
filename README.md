@@ -481,6 +481,42 @@ covered by repeating), `drop` (whole microphone blocks discarded by a full feede
 queue) and `ring` (the depth estimate in ms). A healthy transmission sits in the
 16 to 48 ms window with few skips and no repeats.
 
+### Transmitting A Known Tone
+
+`Q900_TX_TONE` synthesises a sine inside the sender instead of reading the
+microphone. Everything downstream is identical -- the same DC blocker, quantiser,
+resampler, pacing and socket -- so anything a recording shows that is not present
+in an exact sine belongs to this application or the radio.
+
+```bash
+Q900_TX_TONE=1500 python3 q900_control.py
+```
+
+This exists because a tone driven in through a virtual audio device cannot serve
+as a reference. The source application, the virtual device and CoreAudio may each
+resample it, and all of that sits upstream of anything here; a skirt measured on
+the air could belong to any of them. Measuring a transmit path needs a source
+known to be clean.
+
+Measured on the wire with a 1500 Hz synthesised tone, 21 s, ceiling 3637:
+
+| | measured | an exact int16 sine at the same ceiling |
+| --- | --- | --- |
+| THD | -83.1 dB | -76.6 dB |
+| SNR | +74.2 dB | +87.4 dB |
+| energy within +-2 Hz | 100.000 % | 100.000 % |
+| skirt 3-10 Hz | -101.0 dB | -106.2 dB |
+| worst spur within 500 Hz | -112.5 dB | -117.1 dB |
+
+Distortion is *lower* than the naive ideal because rate conversion decorrelates
+the quantiser's error, spreading it as noise rather than leaving it in harmonics;
+that is why the SNR column is worse while the THD column is better. The total
+error power is much the same and noise is the more benign of the two.
+
+The practical use is attribution. If a tone sounds raspy from the microphone path
+but clean with `Q900_TX_TONE`, the defect is in the source chain and nothing in
+this application will change it.
+
 ### Diagnosing Transmit Audio
 
 `--analyze-tx` reads a `Q900_TX_RECORD` capture, which is byte-for-byte what left
