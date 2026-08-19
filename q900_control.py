@@ -19,7 +19,7 @@ import socket
 import sys
 import threading
 import time
-from typing import Callable
+from typing import Callable, Sequence
 
 import numpy as np
 import sounddevice as sd
@@ -281,6 +281,113 @@ class RadioSignals(QObject):
     sdr_stream_changed = pyqtSignal(bool)
 
 
+class AudioSink:
+    """One output device fed from its own copy of a receive stream.
+
+    A PortAudio output callback consumes what it plays, so two devices cannot
+    share a queue: each would get only part of the audio. Every sink therefore
+    holds its own.
+
+    Each device also runs on its own clock, so each drifts against the source
+    independently. There is no resampling on the receive path: the queue is
+    capped and drops from the front when a device runs slow, and counts an
+    underflow when it runs fast. Keeping that per sink is what attributes a click
+    to the device that produced it rather than blaming the whole monitor.
+
+    For simultaneous playback a macOS Multi-Output Device is better than two
+    sinks, because Core Audio resamples the slaved device to the master's clock
+    and only one stream is then drifting against the radio.
+    """
+
+    def __init__(
+        self,
+        device: int,
+        sample_rate: int,
+        blocksize: int,
+        max_queued_frames: int,
+    ) -> None:
+        info = sd.query_devices(device, "output")
+        self.device = device
+        self.name = str(info["name"])
+        self.underflows = 0
+        self._queue: deque[np.ndarray] = deque()
+        self._lock = threading.Lock()
+        self._queued_frames = 0
+        self._max_queued_frames = max_queued_frames
+        self._stream = sd.OutputStream(
+            device=device,
+            samplerate=sample_rate,
+            blocksize=blocksize,
+            channels=min(2, info["max_output_channels"]),
+            dtype="float32",
+            latency="high",
+            callback=self._callback,
+        )
+
+    def start(self) -> None:
+        self._stream.start()
+
+    def _callback(self, outdata, frames, timing, status):  # type: ignore[no-untyped-def]
+        if status.output_underflow:
+            # Playback ran dry: audible as a click, and a symptom of this
+            # process being too busy to service the audio device in time.
+            self.underflows += 1
+        outdata.fill(0)
+        offset = 0
+        with self._lock:
+            while offset < frames and self._queue:
+                block = self._queue[0]
+                count = min(frames - offset, len(block))
+                outdata[offset : offset + count, :] = block[:count, np.newaxis]
+                offset += count
+                if count == len(block):
+                    self._queue.popleft()
+                else:
+                    self._queue[0] = block[count:]
+                self._queued_frames -= count
+
+    def enqueue(self, mono: np.ndarray) -> None:
+        with self._lock:
+            while self._queue and self._queued_frames + len(mono) > self._max_queued_frames:
+                self._queued_frames -= len(self._queue.popleft())
+            self._queue.append(mono)
+            self._queued_frames += len(mono)
+
+    def close(self) -> None:
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except (OSError, sd.PortAudioError):
+            pass
+        with self._lock:
+            self._queue.clear()
+            self._queued_frames = 0
+
+
+def open_audio_sinks(
+    devices: Sequence[int],
+    sample_rate: int,
+    blocksize: int,
+    max_queued_frames: int,
+) -> tuple[list[AudioSink], list[str]]:
+    """Open a sink per device, skipping any that refuse and saying which.
+
+    A second output device failing must not take receive audio down with it, so
+    the caller gets whatever opened plus the reasons for the rest.
+    """
+    sinks: list[AudioSink] = []
+    problems: list[str] = []
+    for device in devices:
+        try:
+            sink = AudioSink(device, sample_rate, blocksize, max_queued_frames)
+            sink.start()
+        except (OSError, sd.PortAudioError, ValueError) as error:
+            problems.append(f"{device}: {error}")
+            continue
+        sinks.append(sink)
+    return sinks, problems
+
+
 class UsbAudioMonitor:
     """Route Q900 USB receive audio to a local speaker device only.
 
@@ -296,6 +403,16 @@ class UsbAudioMonitor:
         self._audio_queue: deque[np.ndarray] = deque()
         self._queue_lock = threading.Lock()
         self._queued_frames = 0
+        self._output_device: int | None = None
+
+    @property
+    def output_device(self) -> int | None:
+        """Which device playback is on, so a re-route can skip a needless restart.
+
+        This monitor negotiates its sample rate against both devices, so it plays
+        one output only and a different destination means restarting both streams.
+        """
+        return self._output_device if self.running else None
 
     @staticmethod
     def input_devices() -> list[tuple[int, str]]:
@@ -340,6 +457,7 @@ class UsbAudioMonitor:
 
     def start(self, input_device: int, output_device: int) -> None:
         self.stop()
+        self._output_device = output_device
         input_info = sd.query_devices(input_device, "input")
         output_info = sd.query_devices(output_device, "output")
         sample_rate = int(min(input_info["default_samplerate"], output_info["default_samplerate"]))
@@ -618,19 +736,18 @@ class NetworkAudioMonitor:
     def __init__(self, signals: RadioSignals) -> None:
         self.signals = signals
         self._socket: socket.socket | None = None
-        self._stream: sd.OutputStream | None = None
+        # One sink per output device. Receive audio is copied to every sink, so
+        # the same stream can play to a virtual device and the speakers at once.
+        self._sinks: list[AudioSink] = []
+        self._sink_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._queue: deque[np.ndarray] = deque()
-        self._queue_lock = threading.Lock()
-        self._queued_frames = 0
         self._packet_count = 0
         self._last_packet_size = 0
         self._format = "waiting"
         self._stats_lock = threading.Lock()
         self._iq_handler: Callable[[np.ndarray], None] | None = None
         self._stream_type = 0
-        self._underflows = 0
         # The radio's media stream is clocked by its own crystal, and neither this
         # application nor the radio's UHSDR firmware rate-matches the two ends.
         # The arrival rate of its packets therefore measures that clock, which is
@@ -652,30 +769,17 @@ class NetworkAudioMonitor:
         self._clock_align_last_ns = 0
         self._clock_align_last_index = 0
 
-    def start(self, output_device: int, port: int = 8000) -> None:
+    def start(self, outputs: int | Sequence[int], port: int = 8000) -> None:
+        """Bind the media port and play what arrives to every listed device."""
         self.stop()
-        output_info = sd.query_devices(output_device, "output")
-        output_channels = min(2, output_info["max_output_channels"])
-        max_queued_frames = self.SAMPLE_RATE * 2
-
-        def output_callback(outdata, frames, timing, status):  # type: ignore[no-untyped-def]
-            if status.output_underflow:
-                # Playback ran dry: audible as a click, and a symptom of this
-                # process being too busy to service the audio device in time.
-                self._underflows += 1
-            outdata.fill(0)
-            offset = 0
-            with self._queue_lock:
-                while offset < frames and self._queue:
-                    block = self._queue[0]
-                    count = min(frames - offset, len(block))
-                    outdata[offset : offset + count, :] = block[:count, np.newaxis]
-                    offset += count
-                    if count == len(block):
-                        self._queue.popleft()
-                    else:
-                        self._queue[0] = block[count:]
-                    self._queued_frames -= count
+        devices = [outputs] if isinstance(outputs, int) else list(outputs)
+        if not devices:
+            raise ValueError("receive audio needs at least one output device")
+        sinks, problems = open_audio_sinks(
+            devices, self.SAMPLE_RATE, self.BLOCK_SIZE, self.SAMPLE_RATE * 2
+        )
+        if not sinks:
+            raise sd.PortAudioError("; ".join(problems) or "no output device opened")
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Do not share UDP/8000. On macOS SO_REUSEADDR allows another local
@@ -685,20 +789,16 @@ class NetworkAudioMonitor:
             sock.bind(("0.0.0.0", port))
         except OSError:
             sock.close()
+            # The sinks are already open at this point; a raise that leaves them
+            # holding the output devices would block the next attempt.
+            for sink in sinks:
+                sink.close()
             raise
         sock.settimeout(0.25)
         self._socket = sock
         self._stop.clear()
-        self._stream = sd.OutputStream(
-            device=output_device,
-            samplerate=self.SAMPLE_RATE,
-            blocksize=self.BLOCK_SIZE,
-            channels=output_channels,
-            dtype="float32",
-            latency="high",
-            callback=output_callback,
-        )
-        self._stream.start()
+        with self._sink_lock:
+            self._sinks = sinks
 
         def receive_loop() -> None:
             set_interactive_qos()
@@ -753,11 +853,7 @@ class NetworkAudioMonitor:
                 else:
                     mono = samples
                     audio_format += " mono"
-                with self._queue_lock:
-                    while self._queue and self._queued_frames + len(mono) > max_queued_frames:
-                        self._queued_frames -= len(self._queue.popleft())
-                    self._queue.append(mono)
-                    self._queued_frames += len(mono)
+                self.enqueue_audio(mono)
                 with self._stats_lock:
                     first_packet = self._packet_count == 0
                     self._packet_count += 1
@@ -780,17 +876,61 @@ class NetworkAudioMonitor:
 
         self._thread = threading.Thread(target=receive_loop, name="q900-udp-audio", daemon=True)
         self._thread.start()
-        self.signals.audio_state_changed.emit(f"Network RX audio: listening on UDP/{port} -> {output_info['name']}")
+        destinations = ", ".join(sink.name for sink in sinks)
+        note = f"  ({'; '.join(problems)})" if problems else ""
+        self.signals.audio_state_changed.emit(
+            f"Network RX audio: listening on UDP/{port} -> {destinations}{note}"
+        )
 
     def set_iq_handler(self, handler: Callable[[np.ndarray], None] | None) -> None:
         self._iq_handler = handler
 
     def enqueue_audio(self, samples: np.ndarray) -> None:
-        with self._queue_lock:
-            while self._queue and self._queued_frames + len(samples) > self.SAMPLE_RATE * 2:
-                self._queued_frames -= len(self._queue.popleft())
-            self._queue.append(samples)
-            self._queued_frames += len(samples)
+        """Hand one block of audio to every output device.
+
+        The single fan-out point: the receive thread and the SDR demodulator both
+        arrive here, so a routing change is invisible to both.
+        """
+        with self._sink_lock:
+            sinks = tuple(self._sinks)
+        for sink in sinks:
+            sink.enqueue(samples)
+
+    def set_output_devices(self, outputs: Sequence[int]) -> list[str]:
+        """Re-route playback without disturbing reception.
+
+        Deliberately does not stop the receiver. stop() closes the media socket
+        and resets the clock accumulator, and the transmit sender process holds
+        that same socket -- so restarting to change a device would release
+        UDP/8000, discard the radio clock measurement that transmit pacing
+        depends on, and cut an in-progress transmission. Only the sinks move.
+
+        Devices already in use keep their stream and their queued audio, so
+        switching one destination does not interrupt the other. Returns the
+        reasons any requested device could not be opened.
+        """
+        wanted = list(dict.fromkeys(outputs))
+        with self._sink_lock:
+            if not self._sinks:
+                return []
+            keep = [sink for sink in self._sinks if sink.device in wanted]
+            drop = [sink for sink in self._sinks if sink.device not in wanted]
+            missing = [d for d in wanted if all(s.device != d for s in keep)]
+        added, problems = open_audio_sinks(
+            missing, self.SAMPLE_RATE, self.BLOCK_SIZE, self.SAMPLE_RATE * 2
+        )
+        if not keep and not added:
+            # Refusing to leave receive audio with nowhere to go: hold the
+            # existing routing and report why.
+            return problems or ["no output device opened"]
+        with self._sink_lock:
+            self._sinks = keep + added
+            names = ", ".join(sink.name for sink in self._sinks)
+        for sink in drop:
+            sink.close()
+        note = f"  ({'; '.join(problems)})" if problems else ""
+        self.signals.audio_state_changed.emit(f"Network RX audio -> {names}{note}")
+        return problems
 
     @property
     def stream_type(self) -> int:
@@ -802,13 +942,10 @@ class NetworkAudioMonitor:
         sock, self._socket = self._socket, None
         if sock:
             sock.close()
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-        self._stream = None
-        with self._queue_lock:
-            self._queue.clear()
-            self._queued_frames = 0
+        with self._sink_lock:
+            sinks, self._sinks = self._sinks, []
+        for sink in sinks:
+            sink.close()
         with self._stats_lock:
             self._packet_count = 0
             self._last_packet_size = 0
@@ -825,7 +962,6 @@ class NetworkAudioMonitor:
             self._clock_align_last_ns = 0
             self._clock_align_last_index = 0
         self._stream_type = 0
-        self._underflows = 0
 
     def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
         """Send from the same UDP/8000 socket used by the Q900 media session."""
@@ -841,7 +977,24 @@ class NetworkAudioMonitor:
 
     @property
     def running(self) -> bool:
-        return self._stream is not None
+        with self._sink_lock:
+            return bool(self._sinks)
+
+    @property
+    def underflows(self) -> int:
+        """Total playback dropouts across every output device."""
+        with self._sink_lock:
+            return sum(sink.underflows for sink in self._sinks)
+
+    @property
+    def output_names(self) -> list[str]:
+        with self._sink_lock:
+            return [sink.name for sink in self._sinks]
+
+    @property
+    def output_devices_in_use(self) -> list[int]:
+        with self._sink_lock:
+            return [sink.device for sink in self._sinks]
 
     def _note_arrival(self, now_ns: int) -> None:
         """Track the radio's media clock. Caller must hold _stats_lock.
@@ -927,7 +1080,8 @@ class NetworkAudioMonitor:
         with self._stats_lock:
             if not self._packet_count:
                 return "UDP waiting"
-            underflows = f"  drops {self._underflows}" if self._underflows else ""
+            drops = self.underflows
+            underflows = f"  drops {drops}" if drops else ""
             gaps = f"  breaks {self._clock_gaps}" if self._clock_gaps else ""
             if self._clock_outliers:
                 gaps += f"  stalls {self._clock_outliers}"
@@ -1197,6 +1351,28 @@ TX_TONE_HZ = float(os.environ.get("Q900_TX_TONE") or 0.0)
 # still has the host audio clock's error to absorb, so a correction larger than
 # this would eat the authority it needs for its actual job.
 TX_RATE_PPM = min(2000.0, max(-2000.0, float(os.environ.get("Q900_TX_PPM") or 0.0)))
+
+# The two virtual audio endpoints a local rigctl client uses. Receive audio is
+# played into VIRTUAL_RX_DEVICE so a decoder can hear it, and rigctl transmit
+# reads its audio from VIRTUAL_TX_DEVICE.
+#
+# Matched by exact name against the Core Audio device list, so they are settings
+# rather than code: change the virtual audio setup and these follow it without an
+# edit. Named devices that are absent are reported rather than silently ignored,
+# because "no audio" and "wrong device" look identical otherwise.
+VIRTUAL_RX_DEVICE = os.environ.get("Q900_VIRTUAL_RX") or "Virtual Desktop Mic"
+VIRTUAL_TX_DEVICE = os.environ.get("Q900_VIRTUAL_TX") or "Virtual Desktop Speakers"
+
+# Where receive audio goes while a rigctl client is connected. Without a client
+# it always follows the output selected in the audio panel.
+RX_TO_VIRTUAL = "virtual"
+RX_TO_SPEAKERS = "speakers"
+RX_TO_BOTH = "both"
+RX_DESTINATIONS = (
+    (RX_TO_VIRTUAL, "RX: virtual only"),
+    (RX_TO_SPEAKERS, "RX: speakers only"),
+    (RX_TO_BOTH, "RX: both"),
+)
 
 # Transmit gain staging. The radio does not scale network audio to suit itself:
 # for stream format 1 the conversion at 0x080397BC multiplies by exactly 2**-16,
@@ -2963,6 +3139,50 @@ def waterfall_argb(rows: np.ndarray, width: int) -> np.ndarray:
     )
 
 
+def receive_outputs(
+    destination: str,
+    rigctl_active: bool,
+    speaker_device: int | None,
+    virtual_device: int | None,
+) -> tuple[list[int], str]:
+    """Resolve which output devices receive audio should play to.
+
+    Returns the device list and a note explaining anything that was asked for but
+    is unavailable, so a missing virtual endpoint is reported rather than looking
+    like silence.
+
+    Without a rigctl client connected there is nothing to route to, so the
+    selected speaker is the only destination whatever the setting says. That
+    keeps the control inert until it means something.
+
+    A request that resolves to nothing falls back to whatever else is available:
+    losing receive audio entirely is a worse outcome than playing it somewhere
+    other than asked.
+    """
+    if not rigctl_active:
+        return ([speaker_device] if speaker_device is not None else []), ""
+    want_virtual = destination in (RX_TO_VIRTUAL, RX_TO_BOTH)
+    want_speakers = destination in (RX_TO_SPEAKERS, RX_TO_BOTH)
+    devices: list[int] = []
+    if want_virtual and virtual_device is not None:
+        devices.append(virtual_device)
+    if want_speakers and speaker_device is not None and speaker_device not in devices:
+        devices.append(speaker_device)
+    if devices:
+        note = ""
+        if want_virtual and virtual_device is None:
+            note = f"{VIRTUAL_RX_DEVICE} unavailable"
+        elif want_speakers and speaker_device is None:
+            note = "no speaker output selected"
+        return devices, note
+    # Nothing asked for could be opened. Fall back rather than go silent.
+    if virtual_device is not None:
+        return [virtual_device], f"no speaker output selected, using {VIRTUAL_RX_DEVICE}"
+    if speaker_device is not None:
+        return [speaker_device], f"{VIRTUAL_RX_DEVICE} unavailable, using the speakers"
+    return [], "no output device available"
+
+
 def should_autostart_audio(
     connected: bool,
     transport: str,
@@ -3216,7 +3436,11 @@ class MainWindow(QMainWindow):
         self.tx_audio = TransmitAudioRouter(self.signals)
         self.rigctl = RigctlServer(self.client, self.signals)
         self._ptt_source: str | None = None
-        self._virtual_receive_active = False
+        # Rigctl client count, and where receive audio should go while any are
+        # connected. Held here rather than derived from the server so the choice
+        # survives a client disconnecting and reconnecting.
+        self._rigctl_clients = 0
+        self._rx_destination = RX_TO_VIRTUAL
         # Whether the operator wants receive audio at all. Connecting starts it
         # automatically, but "Stop Audio" has to stick: status frames arrive twice
         # a second and each one used to restart the stream, so stopping it was
@@ -3399,11 +3623,26 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self.refresh_audio_devices)
         self.audio_button = QPushButton("Start Audio")
         self.audio_button.clicked.connect(self.toggle_audio)
+        # Where receive audio goes while a rigctl client is connected. Inert
+        # without one, because there is nothing to route to: audio then always
+        # follows the output selected to the left.
+        self.rx_destination = QComboBox()
+        for value, label in RX_DESTINATIONS:
+            self.rx_destination.addItem(label, value)
+        self.rx_destination.setCurrentIndex(
+            max(0, self.rx_destination.findData(RX_TO_VIRTUAL))
+        )
+        self.rx_destination.setEnabled(False)
+        self.rx_destination.setToolTip(
+            "Receive audio follows the selected output until a rigctl client connects."
+        )
+        self.rx_destination.currentIndexChanged.connect(self.change_rx_destination)
         audio.addWidget(self.audio_input)
         audio.addWidget(QLabel("to"))
         audio.addWidget(self.audio_output)
         audio.addWidget(refresh)
         audio.addWidget(self.audio_button)
+        audio.addWidget(self.rx_destination)
         self.network_audio_status = QLabel("")
         self.network_audio_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
         audio.addWidget(self.network_audio_status)
@@ -3604,59 +3843,124 @@ class MainWindow(QMainWindow):
         )
 
     def update_rigctl_status(self, count: int) -> None:
+        self._rigctl_clients = count
         if count:
             label = f"rigctl: {count} client{'s' if count != 1 else ''}, virtual audio ready"
             color = "#71db8d"
-            self.start_virtual_receive_audio()
         else:
             label = "rigctl: listening on 127.0.0.1:4532"
             color = "#8ba0ae"
             if self._ptt_source == "rigctl":
                 self.handle_rigctl_ptt(False)
-            self.stop_virtual_receive_audio()
         self.rigctl_status.setText(label)
         self.rigctl_status.setStyleSheet(f"color: {color}; font: 13px Menlo")
+        self.rx_destination.setEnabled(bool(count))
+        # A client arriving or leaving changes where audio should go, so re-route
+        # rather than restart: reception, the media socket and the radio clock
+        # measurement all survive that.
+        self.apply_receive_routing()
 
-    def start_virtual_receive_audio(self) -> None:
-        if not self.client.state.connected or self._virtual_receive_active:
-            return
+    def _virtual_rx_device(self) -> int | None:
+        return UsbAudioMonitor.named_device(VIRTUAL_RX_DEVICE, "output")
+
+    def receive_destinations(self) -> tuple[list[int], str]:
+        """Which outputs receive audio should be playing to, and why."""
+        return receive_outputs(
+            self._rx_destination,
+            bool(self._rigctl_clients),
+            self.audio_output.currentData(),
+            self._virtual_rx_device(),
+        )
+
+    def apply_receive_routing(self) -> None:
+        """Point running receive audio at the currently chosen destinations.
+
+        Re-routes in place on the network transport, which is what keeps UDP/8000
+        bound, the radio clock accumulator intact and any transmission in
+        progress alive. The USB monitor has no such state, so it is restarted.
+        """
+        devices, note = self.receive_destinations()
+        self._update_rx_destination_label(devices, note)
         if not self._audio_wanted:
-            self.rigctl_status.setText(
-                "rigctl: client connected, receive audio is stopped"
+            return
+        if not devices:
+            self.status.setText(f"Receive audio: {note or 'no output device'}")
+            return
+        if self.client.state.transport == "TCP":
+            if not self.network_audio.running:
+                self.start_audio_default()
+                return
+            if self.network_audio.output_devices_in_use == devices:
+                return
+            problems = self.network_audio.set_output_devices(devices)
+            if problems:
+                self.status.setText(f"Receive audio: {'; '.join(problems)}")
+            return
+        if not self.audio.running:
+            self.start_audio_default()
+            return
+        # USB receive plays a single device and negotiates its rate against the
+        # input, so it cannot fan out; use the first destination.
+        if self.audio.output_device == devices[0]:
+            return
+        self._start_receive(devices)
+
+    def _update_rx_destination_label(self, devices: list[int], note: str) -> None:
+        if not self._rigctl_clients:
+            self.rx_destination.setToolTip(
+                "Receive audio follows the selected output until a rigctl client connects."
             )
             return
-        output = UsbAudioMonitor.named_device("Virtual Desktop Mic", "output")
-        if output is None:
-            self.rigctl_status.setText("rigctl: client connected, Virtual Desktop Mic unavailable")
+        # Device indices can go stale when the list is re-enumerated, and this
+        # runs inside a signal slot, so a lookup failure must not propagate.
+        names = []
+        for device in devices:
+            try:
+                names.append(str(sd.query_devices(device)["name"]))
+            except (OSError, sd.PortAudioError, ValueError):
+                names.append(f"device {device}")
+        self.rx_destination.setToolTip(
+            f"Receive audio -> {', '.join(names) or 'nothing'}"
+            + (f"  ({note})" if note else "")
+        )
+
+    def change_rx_destination(self, index: int) -> None:
+        value = self.rx_destination.itemData(index)
+        if value is None or value == self._rx_destination:
             return
+        self._rx_destination = value
+        self.apply_receive_routing()
+
+    def _start_receive(self, devices: Sequence[int]) -> bool:
+        """Start receive audio on `devices` for the active transport.
+
+        The one place receive audio is opened. There were three near-copies of
+        this before, which is how the button label came to disagree with reality
+        and how the rigctl takeover flag came to be left set after a manual stop.
+        """
+        chosen = list(devices)
+        if not chosen:
+            self.status.setText("Select a local speaker output.")
+            return False
         try:
-            # The standard receive monitor auto-starts on the selected local
-            # speaker. A rigctl client explicitly takes ownership of RX and
-            # redirects that stream into its virtual microphone device.
             self.audio.stop()
             self.network_audio.stop()
             self._network_audio_timer.stop()
             if self.client.state.transport == "TCP":
-                self.network_audio.start(output)
+                self.network_audio.start(chosen)
                 self._network_audio_timer.start()
             else:
                 input_device = self.audio_input.currentData()
                 if input_device is None:
-                    return
-                self.audio.start(input_device, output)
-            self._virtual_receive_active = True
+                    self.status.setText("Select a Q900 USB input.")
+                    return False
+                self.audio.start(input_device, chosen[0])
         except (OSError, sd.PortAudioError) as error:
-            self.rigctl_status.setText(f"rigctl virtual RX: {error}")
-
-    def stop_virtual_receive_audio(self) -> None:
-        if not self._virtual_receive_active:
-            return
-        self.audio.stop()
-        self.network_audio.stop()
-        self._network_audio_timer.stop()
-        self._virtual_receive_active = False
-        if self.client.state.connected and self._audio_wanted:
-            QTimer.singleShot(0, self.start_audio_default)
+            self.audio_button.setText("Start Audio")
+            self.status.setText(f"Receive audio not started: {error}")
+            return False
+        self.audio_button.setText("Stop Audio")
+        return True
 
     def handle_rigctl_ptt(self, active: bool) -> None:
         if active and (self._sdr_switch_pending or self._sdr_restore_pending):
@@ -3686,7 +3990,8 @@ class MainWindow(QMainWindow):
                 if target is None:
                     return
                 if not self.network_audio.running:
-                    self.start_virtual_receive_audio()
+                    self._audio_wanted = True
+                    self.start_audio_default()
                 if not self.network_audio.running:
                     return
                 if self._sdr_active:
@@ -3752,44 +4057,22 @@ class MainWindow(QMainWindow):
                 self.status.setText("Receive audio monitor stopped.")
             return
         self._audio_wanted = True
-        if self.client.state.transport == "TCP":
-            output_device = self.audio_output.currentData()
-            if output_device is None:
-                self.status.setText("Select a local speaker output.")
-                return
-            try:
-                self.network_audio.start(output_device)
-                self.audio_button.setText("Stop Audio")
-                self._network_audio_timer.start()
-            except (OSError, sd.PortAudioError) as error:
-                self.show_error(f"Network audio: {error}")
+        devices, note = self.receive_destinations()
+        if not devices:
+            self.status.setText(
+                f"Receive audio: {note or 'select a local speaker output'}"
+            )
             return
-        input_device = self.audio_input.currentData()
-        output_device = self.audio_output.currentData()
-        if input_device is None or output_device is None:
-            self.status.setText("Select a Q900 USB input and a local speaker output.")
-            return
-        try:
-            self.audio.start(input_device, output_device)
-            self.audio_button.setText("Stop Audio")
-        except sd.PortAudioError as error:
-            self.show_error(f"Audio: {error}")
+        self._start_receive(devices)
 
     def start_audio_default(self) -> None:
-        """Start USB or network receive monitoring after a radio connects."""
-        if not self._audio_wanted or self.audio_output.currentData() is None:
+        """Start receive monitoring after a radio connects, or after a re-route."""
+        if not self._audio_wanted:
             return
-        try:
-            if self.client.state.transport == "TCP":
-                self.network_audio.start(self.audio_output.currentData())
-                self._network_audio_timer.start()
-            elif self.audio_input.currentData() is not None:
-                self.audio.start(self.audio_input.currentData(), self.audio_output.currentData())
-            else:
-                return
-            self.audio_button.setText("Stop Audio")
-        except (OSError, sd.PortAudioError) as error:
-            self.status.setText(f"Receive audio not started: {error}")
+        devices, _ = self.receive_destinations()
+        if not devices:
+            return
+        self._start_receive(devices)
 
     def show_audio_state(self, message: str) -> None:
         self.status.setText(message)
@@ -3974,15 +4257,21 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Opening USB serial port {port} at 115200 baud...")
             threading.Thread(target=self.client.connect_usb, args=(port,), daemon=True).start()
         else:
-            output_device = self.audio_output.currentData()
-            if output_device is None:
-                self.status.setText("Select a local speaker output before starting the TCP listener.")
+            # Resolve through the router so an already-connected rigctl client is
+            # honoured here too, rather than audio landing on the speakers and
+            # being moved a moment later.
+            devices, note = self.receive_destinations()
+            if not devices:
+                self.status.setText(
+                    "Select a local speaker output before starting the TCP listener."
+                    + (f" ({note})" if note else "")
+                )
                 return
             self._audio_wanted = True
             try:
                 # The radio may begin sending UDP as soon as its TCP session
                 # completes. Bind the media port before accepting that session.
-                self.network_audio.start(output_device)
+                self.network_audio.start(devices)
                 self._network_audio_timer.start()
                 self.audio_button.setText("Stop Audio")
             except (OSError, sd.PortAudioError) as error:
@@ -4577,6 +4866,40 @@ def self_test() -> None:
     # Stopping receive audio has to stick. Status frames arrive about twice a
     # second and each one asks whether audio should be started, so a rule that
     # ignores the operator's choice makes the stop button do nothing.
+    # Receive audio routing. Without a rigctl client there is nothing to route
+    # to, so the selected speaker is the only destination whatever the setting
+    # says: the control has to be inert until it means something.
+    SPK, VIRT = 7, 9
+    for destination, _ in RX_DESTINATIONS:
+        assert receive_outputs(destination, False, SPK, VIRT) == ([SPK], ""), destination
+        assert receive_outputs(destination, False, SPK, None) == ([SPK], ""), destination
+    # With a client connected each setting selects what it says.
+    assert receive_outputs(RX_TO_VIRTUAL, True, SPK, VIRT) == ([VIRT], "")
+    assert receive_outputs(RX_TO_SPEAKERS, True, SPK, VIRT) == ([SPK], "")
+    assert receive_outputs(RX_TO_BOTH, True, SPK, VIRT) == ([VIRT, SPK], "")
+    # Both with the same device chosen twice must open one sink, not two on the
+    # same endpoint.
+    assert receive_outputs(RX_TO_BOTH, True, VIRT, VIRT) == ([VIRT], "")
+    # A missing endpoint is reported, and never silently swallowed: "no audio"
+    # and "wrong device" are indistinguishable to the operator otherwise.
+    devices, note = receive_outputs(RX_TO_BOTH, True, SPK, None)
+    assert devices == [SPK] and VIRTUAL_RX_DEVICE in note, (devices, note)
+    devices, note = receive_outputs(RX_TO_BOTH, True, None, VIRT)
+    assert devices == [VIRT] and "speaker" in note, (devices, note)
+    # Losing receive audio altogether is worse than playing it somewhere else, so
+    # a request that cannot be met falls back rather than returning nothing.
+    devices, note = receive_outputs(RX_TO_VIRTUAL, True, SPK, None)
+    assert devices == [SPK] and note, (devices, note)
+    devices, note = receive_outputs(RX_TO_SPEAKERS, True, None, VIRT)
+    assert devices == [VIRT] and note, (devices, note)
+    # Nothing available at all must say so rather than pretend.
+    assert receive_outputs(RX_TO_BOTH, True, None, None)[0] == []
+    assert receive_outputs(RX_TO_VIRTUAL, False, None, None)[0] == []
+    # The default must reproduce the behaviour that existed before the control:
+    # a connected client took receive audio to the virtual endpoint alone.
+    assert RX_TO_VIRTUAL == RX_DESTINATIONS[0][0]
+    assert receive_outputs(RX_TO_VIRTUAL, True, SPK, VIRT) == ([VIRT], "")
+
     assert should_autostart_audio(True, "TCP", True, False, False)
     assert should_autostart_audio(True, "USB", True, False, False)
     # Already running: nothing to do, per transport.

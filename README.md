@@ -285,22 +285,65 @@ coalesced to 15 Hz, and spectrum polling stops while transmitting.
 
 ### Rigctl Virtual Audio
 
-Virtual audio is deliberately inactive until at least one local rigctl client
-is connected. When a client connects, it takes ownership of receive audio:
+Virtual audio is deliberately inactive until at least one local rigctl client is
+connected. When a client connects:
 
-- Q900 receive audio is routed to the output endpoint named
-  `Virtual Desktop Mic`.
-- Rigctl PTT reads the input endpoint named `Virtual Desktop Speakers` and
-  routes it to Q900 transmit audio.
+- Receive audio is routed to the output endpoint named `Virtual Desktop Mic`.
+- Rigctl PTT reads the input endpoint named `Virtual Desktop Speakers`.
 
 These names follow the virtual-device endpoint convention: audio presented to
-other applications as a microphone is written to the device's output side;
-audio supplied by other applications through their speaker output is captured
-from the device's input side.
+other applications as a microphone is written to the device's output side; audio
+supplied by other applications through their speaker output is captured from the
+device's input side. Both are settings rather than code -- override them with
+`Q900_VIRTUAL_RX` and `Q900_VIRTUAL_TX` if your virtual audio setup differs. A
+named endpoint that is absent is reported, because "no audio" and "wrong device"
+are otherwise indistinguishable.
 
-When the last rigctl client disconnects, rigctl PTT is released, virtual audio
-stops, and normal receive audio returns to the locally selected speaker.
-GUI PTT and rigctl PTT are mutually exclusive.
+When the last rigctl client disconnects, rigctl PTT is released and receive audio
+returns to the locally selected speaker. GUI PTT and rigctl PTT are mutually
+exclusive.
+
+### Receive Audio Routing
+
+While a rigctl client is connected, the combo in the audio row chooses where
+receive audio goes:
+
+| setting | destination |
+| --- | --- |
+| RX: virtual only | the virtual endpoint, so only the decoder hears it |
+| RX: speakers only | the selected output, so only you hear it |
+| RX: both | both at once |
+
+The control is disabled without a client connected, because there is then
+nothing to route to and audio always follows the output selected beside it. The
+choice survives a client disconnecting and reconnecting; it is not persisted
+across runs, since the application stores no settings.
+
+Changing the destination **re-routes in place and does not restart reception**.
+That matters for more than a click: `stop()` closes the media socket and resets
+the clock accumulator, the transmit sender process holds that same socket, and
+transmit pacing depends on that measurement. Restarting to change a device would
+release UDP/8000 where another process can take it, discard the radio clock
+figure, and cut a transmission in progress. Devices already playing keep their
+stream and their queued audio, so switching one destination does not interrupt
+the other.
+
+A request that cannot be met falls back rather than going silent -- losing
+receive audio is worse than playing it somewhere other than asked -- and says so
+in the status line and the control's tooltip.
+
+`both` is two independent output devices. There is no resampling on the receive
+path: each sink caps its queue and drops from the front if its device runs slow,
+or counts an underflow if it runs fast, so each drifts against the radio
+independently and clicks on its own schedule. The `drops` figure in the audio row
+is the total across sinks. **A macOS Multi-Output Device is better for
+simultaneous playback**, because Core Audio resamples the slaved device to the
+master's clock and only one stream then drifts against the radio; build one in
+Audio MIDI Setup and select it as the output.
+
+USB receive plays one device only. It negotiates its sample rate against both the
+input and the output, so it cannot fan out, and `both` falls back to the first
+destination on that transport.
 
 ## Rigctl Relay
 
