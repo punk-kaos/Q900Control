@@ -3945,6 +3945,36 @@ def self_test() -> None:
     assert int(np.max(np.abs(frames_out))) <= tx_ceiling
     assert int(np.max(np.abs(frames_out))) < 32767
 
+    # The recording analysers lean on _analytic() to recover envelope and phase.
+    # A steady tone must come back with a flat envelope and a straight phase ramp,
+    # because the sensitive splice test measures departures from exactly that.
+    tone_n = np.arange(8192)
+    probe = np.sin(2.0 * np.pi * 1500.0 * tone_n / 48_000)
+    analytic = _analytic(probe)
+    core = np.abs(analytic)[512:-512]
+    assert np.ptp(core) / np.mean(core) < 0.01, float(np.ptp(core) / np.mean(core))
+    ramp = np.unwrap(np.angle(analytic))[512:-512]
+    slope = np.polyfit(np.arange(len(ramp)), ramp, 1)[0]
+    assert abs(slope * 48_000 / (2 * np.pi) - 1500.0) < 1.0, slope
+
+    def phase_departure(samples: np.ndarray) -> float:
+        resid = np.unwrap(np.angle(_analytic(samples)))[512:-512]
+        index = np.arange(len(resid))
+        return float(np.ptp(resid - np.polyval(np.polyfit(index, resid, 1), index)))
+
+    # One dropped sample displaces the phase by one sample's worth of advance,
+    # 2*pi*f0/fs, not by a whole cycle. That is the unit the analyser converts
+    # back into a sample count, so pin the scale factor here: get it wrong and a
+    # splice is reported as the wrong number of samples.
+    per_sample = 2.0 * np.pi * 1500.0 / 48_000
+    departure = phase_departure(np.delete(probe, 4096))
+    assert 0.5 * per_sample < departure < 3.0 * per_sample, (departure, per_sample)
+    # And it has to stand out from an undisturbed tone, or the test cannot see it.
+    assert departure > 10.0 * phase_departure(probe), (
+        departure,
+        phase_departure(probe),
+    )
+
     # The sender must start with more than it holds back, and must never be
     # asked to hold back more than the hard cap allows.
     assert (
@@ -4554,6 +4584,24 @@ def self_test() -> None:
     print("Q900 protocol self-test passed")
 
 
+def _analytic(signal: np.ndarray) -> np.ndarray:
+    """Analytic signal of a real block, via the one-sided FFT.
+
+    Used by the recording analysers to recover instantaneous phase and envelope.
+    A tone's unwrapped phase is a straight line, and a sample the stream gains or
+    loses displaces it by one sample's worth of phase advance, 2*pi*f0/fs. So a
+    splice is measurable even when it is far too small to show up as a
+    sample-to-sample step. Uniformly distributed slips tilt the line instead of
+    displacing it, which is why the analyser reports both the residual and the
+    phase-implied frequency.
+    """
+    length = len(signal)
+    transform = np.fft.fft(signal)
+    transform[length // 2 + 1:] = 0
+    transform[1:(length + 1) // 2] *= 2
+    return np.fft.ifft(transform)
+
+
 def analyze_tx_recording(prefix: str) -> None:
     """Report defects in a Q900_TX_RECORD capture of the transmitted stream.
 
@@ -4650,10 +4698,7 @@ def analyze_tx_recording(prefix: str) -> None:
         tonality = float(spectrum[dominant] / (spectrum.sum() + 1e-30))
         print(f"  dominant {dominant * rate / frames:8.1f} Hz   tonality {tonality:.4f}")
         if tonality > 0.005:
-            transform = np.fft.fft(signal)
-            transform[frames // 2 + 1:] = 0
-            transform[1:(frames + 1) // 2] *= 2
-            analytic = np.fft.ifft(transform)
+            analytic = _analytic(signal)
             step = np.angle(analytic[1:] * np.conj(analytic[:-1]))
             centre = float(np.median(step))
             deviation = np.abs(step - centre)
@@ -4671,6 +4716,94 @@ def analyze_tx_recording(prefix: str) -> None:
     else:
         print("  recording too short or silent")
 
+    tone_clean = True
+    # Restrict the tone measurements to the longest sustained run of audio.
+    # A capture normally opens and closes with silence -- the ring drain, and
+    # whatever was keyed but unspoken -- and silence has no envelope and no phase,
+    # so including it manufactures enormous ripple and slip figures that say
+    # nothing about the tone itself.
+    voiced = np.flatnonzero(~silent)
+    if len(voiced):
+        splits = np.flatnonzero(np.diff(voiced) > 1)
+        runs = np.split(voiced, splits + 1)
+        longest = max(runs, key=len)
+        span = slice(
+            int(longest[0]) * (NETWORK_TX_PACKET_BYTES // 4),
+            (int(longest[-1]) + 1) * (NETWORK_TX_PACKET_BYTES // 4),
+        )
+    else:
+        span = slice(0, 0)
+    sustained = signal[span]
+    if len(sustained) > 8192 and np.any(sustained):
+        spectrum = np.abs(np.fft.rfft(sustained * np.hanning(len(sustained)))) ** 2
+        dominant = int(np.argmax(spectrum))
+        tonality = float(spectrum[dominant] / (spectrum.sum() + 1e-30))
+        if tonality > 0.05:
+            print("\n-- steady tone analysis --")
+            print("  A single tone makes every defect measurable. Drive this with")
+            print("  WSJT-X 'Tune' or any constant carrier: distortion, amplitude")
+            print("  modulation and lost or repeated samples all separate cleanly,")
+            print("  which speech cannot do.")
+            print(f"  measured over the longest unbroken run: "
+                  f"{len(sustained) / rate:.2f} s of {frames / rate:.2f} s")
+            # Work on a whole number of bins so the harmonic search is exact.
+            usable = len(sustained) - (len(sustained) % 2)
+            block = sustained[:usable] - float(np.mean(sustained[:usable]))
+            window = np.hanning(usable)
+            mag = np.abs(np.fft.rfft(block * window))
+            freqs = np.fft.rfftfreq(usable, 1.0 / rate)
+            peak = int(np.argmax(mag))
+            f0 = float(freqs[peak])
+            total = float(np.sum(mag**2))
+
+            def band_power(centre: float, width: float = 30.0) -> float:
+                sel = np.abs(freqs - centre) <= width
+                return float(np.sum(mag[sel] ** 2))
+
+            fundamental = band_power(f0)
+            harmonics = 0.0
+            lines = []
+            for n in range(2, 11):
+                fn = f0 * n
+                if fn >= rate / 2:
+                    break
+                power = band_power(fn)
+                harmonics += power
+                lines.append((n, fn, 10 * np.log10(power / fundamental + 1e-30)))
+            thd = 10 * np.log10(harmonics / fundamental + 1e-30)
+            residual = total - fundamental - harmonics
+            snr = 10 * np.log10(fundamental / (residual + 1e-30))
+            print(f"  fundamental      {f0:9.3f} Hz")
+            print(f"  THD              {thd:+9.1f} dB  (all harmonics vs fundamental)")
+            print(f"  SNR              {snr:+9.1f} dB  (everything else vs fundamental)")
+            for n, fn, level in lines[:5]:
+                print(f"    harmonic {n} at {fn:8.1f} Hz  {level:+7.1f} dB")
+            # Envelope stability. A ring correction, an ALC, or a resampler with a
+            # walking phase all modulate amplitude; a clean tone does not.
+            analytic_mag = np.abs(_analytic(block))
+            core = analytic_mag[256:-256] if len(analytic_mag) > 1024 else analytic_mag
+            envelope_ripple = float(np.ptp(core) / (np.mean(core) + 1e-30))
+            print(f"  envelope ripple  {envelope_ripple * 100:8.2f} %  peak-to-peak")
+            # Lost or repeated samples. For a steady tone the unwrapped phase is a
+            # straight line; a sample gained or lost displaces it by one sample's
+            # worth of advance. Fitting the line and measuring the residual counts
+            # isolated splices, which no amplitude test can do. Slips spread evenly
+            # through the record tilt the line instead, so the fitted frequency is
+            # reported next to the FFT peak: a gap between them is the signature of
+            # a steady drip of corrections rather than a few discrete events.
+            phase = np.unwrap(np.angle(_analytic(block)))
+            index = np.arange(len(phase), dtype=np.float64)
+            trim = slice(256, len(phase) - 256)
+            slope, offset = np.polyfit(index[trim], phase[trim], 1)
+            resid = phase[trim] - (slope * index[trim] + offset)
+            samples_slipped = float(np.ptp(resid) / (2 * np.pi) * (rate / max(f0, 1e-9)))
+            implied = slope * rate / (2 * np.pi)
+            print(f"  phase-implied f0 {implied:9.3f} Hz  "
+                  f"({(implied / max(f0, 1e-9) - 1) * 1e6:+.0f} ppm vs FFT peak)")
+            print(f"  net sample slip  {samples_slipped:8.2f} samples across the record")
+            tone_clean = thd < -55.0 and snr > 45.0 and envelope_ripple < 0.05
+            print(f"  tone verdict     {'clean' if tone_clean else 'DEGRADED'}")
+
     if len(stamps) > 1:
         print("\n-- send pacing --")
         gaps = np.diff(stamps.astype(np.int64)) / 1e6
@@ -4685,20 +4818,21 @@ def analyze_tx_recording(prefix: str) -> None:
         elapsed = (int(stamps[-1]) - int(stamps[0])) / 1e9
         print(f"  achieved rate: {(len(stamps) - 1) / elapsed:.2f} packets/s "
               f"(nominal {1 / NETWORK_TX_PERIOD:.0f})")
-        # The run opens with an unpaced burst that primes the radio's ring. It is
-        # a one-off, so including it overstates the steady-state rate: over a
-        # short recording those 20 packets alone look like several hundred ppm.
-        primed = int(np.argmax(gaps > 0.2)) if np.any(gaps > 0.2) else 0
-        if primed:
-            steady = stamps[primed:]
-            if len(steady) > 2:
-                span = (int(steady[-1]) - int(steady[0])) / 1e9
-                rate = (len(steady) - 1) / span
-                print(f"  after the {primed}-packet priming burst: {rate:.2f} packets/s "
-                      f"over {span:.2f} s")
-                print(f"    median paced interval "
-                      f"{np.median(gaps[gaps > 0.2]):.4f} ms "
-                      f"-> {1000 / np.median(gaps[gaps > 0.2]):.2f} packets/s")
+        # The run opens with a priming burst paced at NETWORK_TX_BURST_GAP, and is
+        # preceded by the ring drain. Both are one-offs, so including them
+        # understates the steady-state rate over a short recording.
+        paced_floor = NETWORK_TX_BURST_GAP * 1000 * 1.5
+        primed = NETWORK_TX_PRIME_PACKETS
+        steady = stamps[primed:] if len(stamps) > primed + 2 else stamps
+        if len(steady) > 2:
+            span = (int(steady[-1]) - int(steady[0])) / 1e9
+            rate_steady = (len(steady) - 1) / span
+            print(f"  after the {primed}-packet priming burst: {rate_steady:.2f} packets/s "
+                  f"over {span:.2f} s")
+            paced = gaps[gaps > paced_floor]
+            if len(paced):
+                print(f"    median paced interval {np.median(paced):.4f} ms "
+                      f"-> {1000 / np.median(paced):.2f} packets/s")
 
     print("\n-- verdict --")
     clean = (
@@ -4706,6 +4840,7 @@ def analyze_tx_recording(prefix: str) -> None:
         and not int(silent.sum())
         and len(events) == 0
         and len(phase_events) == 0
+        and tone_clean
     )
     if clean:
         print("  The stream that left this host is clean: contiguous samples, no")
