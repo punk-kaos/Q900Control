@@ -484,37 +484,65 @@ queue) and `ring` (the depth estimate in ms). A healthy transmission sits in the
 ### Datagram Geometry
 
 `Q900_TX_FRAMES` sets how many stereo frames go in a datagram, clamped to
-48..640, which is 1 to 13.3 ms at 48 kHz. The default of 48 matches the radio's
-own media quantum.
+48..640, which is 1 to 13.3 ms at 48 kHz.
 
-```bash
-Q900_TX_FRAMES=640 python3 q900_control.py
-```
+The default is **640 frames, 2560 bytes, 75 packets a second**. It was chosen on
+the air: recording a second radio while transmitting a tone, going from 48 frames
+to 192 narrowed the skirt around the carrier by 8 to 9 dB and halved the
+frequency wander, and 640 was better again. 640 is also exactly what the
+firmware's receive callback will stage -- one byte more and it truncates the
+datagram and discards the remainder.
 
-640 frames is 2560 bytes, exactly what the firmware's receive callback will stage
-(0x0806C8CA): one byte more and it truncates the datagram and silently discards
-the remainder. Within that limit every word is pushed into the ring, so a larger
-datagram is delivered in full -- the claim that only the first frame was consumed
-was wrong.
+Two mechanisms both predict that improvement and neither has been separated from
+the other. The radio takes an Ethernet interrupt and runs lwIP for every
+datagram, on the same Cortex-M7 that must meet a 666 us DSP block deadline; and
+the ring's rate corrector engages at most once per datagram. Both scale with the
+packet rate.
 
-The reason to want fewer, larger datagrams is interrupt load. At the default the
-radio takes a thousand Ethernet interrupts a second and runs lwIP a thousand
-times, on the same Cortex-M7 that has to meet a 666 us DSP block deadline.
-Measured off the air on a transmitted tone, quartering the packet rate to 250/s
-narrowed the skirt around the carrier by 8 to 9 dB and halved the frequency
-wander. That is the strongest evidence so far about where the remaining roughness
-comes from, and it is not in this application.
+The trade is real and worth knowing:
 
-The cost is that the ring's rate corrector runs once per datagram, so it has
-proportionally less authority, and the repayable schedule debt falls with it --
-at 640 frames it is a single packet. Nothing else changes: the slot period, the
-priming burst, where priming leaves the ring, the debt bound and the burst
-spacing floor are all derived from the geometry rather than written down.
+| frames | bytes | packets/s | Ethernet frames/s | fragmented |
+| --- | --- | --- | --- | --- |
+| 48 | 192 | 1000 | 1000 | no |
+| 320 | 1280 | 150 | 150 | no |
+| 368 | 1472 | 130 | 130 | no, largest that is not |
+| 640 | 2560 | 75 | 150 | yes, two fragments |
 
-Measured on the wire at 48, 96, 192, 320 and 640 frames -- 1000 down to 75
-packets per second -- every geometry gives THD -83 dB, all of the energy within
-+-2 Hz of the tone, a skirt below -90 dB, no skips, no repeats and a ring
-estimate inside the corrector's window.
+2560 bytes does not fit an Ethernet frame, so every datagram is sent as two IP
+fragments. That makes 640 no better than 320 for interrupt load, adds a
+reassembly in the radio for each packet, and loses the whole 13.3 ms datagram if
+either fragment is dropped. It is the default because it is what has been
+measured to work and because it gives the corrector 42 per cent fewer
+opportunities than the MTU-safe size. **If the mechanism turns out to be
+interrupt load rather than the corrector, 368 frames is the better choice.** The
+audio status line says so when the configured size will fragment.
+
+Large datagrams also make the ring coarse. At 640 frames one datagram is 13.3 ms
+of a 32 ms corrector window, so priming settles at 30 ms with only about one
+datagram of margin before the duplication threshold. The ring-aware underrun
+logic protects that boundary, but a datagram lost in the network is invisible to
+this side and costs the whole 13.3 ms.
+
+Everything derived from the geometry is derived rather than written down: the slot
+period, the priming burst, where priming leaves the ring, the debt bound and the
+burst spacing floor. Verified on the wire at 48, 96, 192, 320, 368 and 640 frames:
+THD -83 dB, all energy within +-2 Hz of the tone, skirt below -90 dB, no skips,
+no repeats, and a long-run send rate within a few tens of ppm of the radio's
+clock.
+
+### Correcting The Measured Clock
+
+`Q900_TX_PPM` shifts the send rate against the measured radio clock, bounded at
++-2000 ppm. Positive sends faster. It applies to the conversion ratio as well as
+the period, because the period governs the radio's ring and the ratio governs the
+host's buffer; correcting one without the other fixes one and breaks the other.
+
+The use for it is that the corrector's window is only 32 ms wide. Priming puts
+the ring in the middle, after which it drifts at whatever the error in the
+measured clock is, and 32 ms divided by that error is how long a transmission
+stays clean. So if transmit audio is clean for a while and then turns rough, the
+time it took is a measurement: the error is roughly `16000/seconds` ppm, and this
+cancels it.
 
 ### Transmitting A Known Tone
 

@@ -970,28 +970,37 @@ class NetworkAudioMonitor:
 # The firmware's receive callback stages at most this much of a datagram and
 # silently discards the rest (0x0806C8CA), so it bounds the geometry below.
 NETWORK_TX_MAX_DATAGRAM_BYTES = 2560
+# Largest payload that still fits one Ethernet frame: 1500 less 20 bytes of IP
+# and 8 of UDP, rounded down to a whole stereo frame. Above this the datagram is
+# IP-fragmented, which costs the radio a reassembly for every packet and loses
+# the whole datagram if either fragment is dropped.
+NETWORK_TX_MTU_SAFE_FRAMES = (1500 - 20 - 8) // 4
 
 # Datagram geometry. The radio's own media quantum is 48 stereo frames, 192
-# bytes, 1 ms at 48 kHz, and matching it is the safe default. Set
-# Q900_TX_FRAMES to send fewer, larger datagrams instead: the firmware's receive
+# bytes, 1 ms at 48 kHz. Q900_TX_FRAMES sets ours: the firmware's receive
 # callback stages up to 2560 bytes and pushes every word of them into the ring,
 # so a larger datagram is delivered in full.
 #
-# The reason to want that is interrupt load. At the default the radio takes a
-# thousand Ethernet interrupts a second and runs lwIP a thousand times, on the
-# same Cortex-M7 that has to meet a 666 us DSP block deadline. Measured off the
-# air, quartering the packet rate to 250/s narrowed the skirt on a transmitted
-# tone by 8 to 9 dB, so that load is real and worth trading against.
+# The default is 640 frames, 2560 bytes, 13.3 ms, 75 packets a second. It was
+# chosen on the air: measured off a second radio, going from 48 frames to 192
+# narrowed the skirt around a transmitted tone by 8 to 9 dB and halved the
+# frequency wander, and 640 sounded better again. Two mechanisms both predict
+# that and neither has been separated from the other yet -- the radio takes an
+# Ethernet interrupt and runs lwIP for every datagram on the same Cortex-M7 that
+# must meet a 666 us DSP block deadline, and the ring's rate corrector engages
+# once per datagram, so both scale with the packet rate.
 #
-# Clamped to 48..640 frames, 1 to 13.3 ms. Below 48 the datagram is smaller than
-# the radio's own quantum for no benefit. 640 frames is 2560 bytes, exactly what
-# the firmware's receive callback will stage: one more byte and it truncates the
-# datagram and silently discards the remainder. The cost of going large is that
-# the ring's rate corrector runs once per datagram, so it has proportionally less
-# authority, and the repayable schedule debt falls to a single packet.
+# 640 is past NETWORK_TX_MTU_SAFE_FRAMES, so every datagram is sent as two IP
+# fragments. That means it is no better than 320 frames for Ethernet interrupts
+# -- both put 150 frames a second on the wire -- and it adds a reassembly per
+# packet and loses 13.3 ms of audio whenever either fragment is dropped. It is
+# still the default because it is what has been measured to work, and because it
+# gives the corrector 42 per cent fewer opportunities than the MTU-safe size
+# would. If the mechanism turns out to be interrupt load rather than the
+# corrector, 368 frames is the better choice and is worth comparing.
 NETWORK_TX_PACKET_FRAMES = min(
     NETWORK_TX_MAX_DATAGRAM_BYTES // 4,
-    max(48, int(os.environ.get("Q900_TX_FRAMES") or 48)),
+    max(48, int(os.environ.get("Q900_TX_FRAMES") or 640)),
 )
 NETWORK_TX_PACKET_BYTES = NETWORK_TX_PACKET_FRAMES * 2 * 2
 NETWORK_TX_PERIOD = NETWORK_TX_PACKET_FRAMES / 48_000.0
@@ -1169,6 +1178,26 @@ TX_RECORD_PREFIX = os.environ.get("Q900_TX_RECORD") or None
 # transmit path needs a source that is known to be clean.
 TX_TONE_HZ = float(os.environ.get("Q900_TX_TONE") or 0.0)
 
+# Correction in parts per million applied to the measured radio clock before it
+# sets the send rate. Positive sends faster.
+#
+# The radio's transmit ring is only left alone between 1536 and 4608 words, and
+# outside that the firmware duplicates or drops one frame per datagram. Priming
+# puts the ring in the middle of that window, after which it drifts at whatever
+# the error in the measured clock is: 32 ms of window divided by the error is how
+# long a transmission stays clean. An error of 300 ppm lasts a minute; 3000 ppm
+# lasts six seconds, and after that the corrector engages on every datagram and
+# smears the transmitted audio.
+#
+# So if transmit audio is clean for a while and then turns rough, the time it
+# took is a measurement: the error is roughly 16000/seconds ppm, and this setting
+# cancels it. It also applies to the conversion ratio, so the host buffer stays
+# where it was and only the radio's ring moves.
+# Bounded at +-2000 ppm. The servo's own trim is limited to +-5000 ppm and it
+# still has the host audio clock's error to absorb, so a correction larger than
+# this would eat the authority it needs for its actual job.
+TX_RATE_PPM = min(2000.0, max(-2000.0, float(os.environ.get("Q900_TX_PPM") or 0.0)))
+
 # Transmit gain staging. The radio does not scale network audio to suit itself:
 # for stream format 1 the conversion at 0x080397BC multiplies by exactly 2**-16,
 # which cancels the ring consumer's `<< 16` and leaves the DSP working with the
@@ -1226,10 +1255,15 @@ def tx_pacing(radio_rate: float) -> tuple[float, float]:
     48 times that regardless of how many frames we choose to put in a datagram.
     The period scales with our datagram; the conversion ratio does not, because
     it is input frames per output frame either way.
+
+    TX_RATE_PPM corrects the measured figure. It has to apply to both returned
+    values or the two buffers disagree: the period governs the radio's ring and
+    the ratio governs ours, and they are only consistent when both are derived
+    from the same belief about the radio's clock.
     """
     if radio_rate <= 0.0:
         return NETWORK_TX_PERIOD, 1.0
-    radio_frames_per_second = radio_rate * 48.0
+    radio_frames_per_second = radio_rate * 48.0 * (1.0 + TX_RATE_PPM * 1e-6)
     return (
         NETWORK_TX_PACKET_FRAMES / radio_frames_per_second,
         48_000.0 / radio_frames_per_second,
@@ -2179,8 +2213,17 @@ class TransmitAudioRouter:
         state = (
             f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} "
             f"(48 kHz stereo S16LE{clock}, peak {ceiling} "
-            f"for CMP {compressor} = {TX_PREGAIN_BY_COMPRESSOR[min(max(compressor, 0), 14)]:.2f}x)"
+            f"for CMP {compressor} = {TX_PREGAIN_BY_COMPRESSOR[min(max(compressor, 0), 14)]:.2f}x, "
+            f"{NETWORK_TX_PACKET_BYTES} B every {NETWORK_TX_PERIOD*1000:.1f} ms)"
         )
+        if NETWORK_TX_PACKET_FRAMES > NETWORK_TX_MTU_SAFE_FRAMES:
+            # Not silent: this doubles the frames on the wire, needs a reassembly
+            # in the radio for every packet, and loses the whole datagram if
+            # either fragment is dropped.
+            state += (
+                f" -- IP-fragmented, {NETWORK_TX_MTU_SAFE_FRAMES} frames is the"
+                " largest that is not"
+            )
         if not self._udp_ready.wait(timeout=NETWORK_TX_READY_TIMEOUT):
             state += " -- sender did not report ready, transmit may start late"
         problem = bytes(self._udp_failure.value if self._udp_failure else b"")
@@ -4199,6 +4242,10 @@ def self_test() -> None:
     # 2560 bytes, so a datagram must be whole stereo frames and must fit.
     assert NETWORK_TX_PACKET_BYTES % 4 == 0
     assert NETWORK_TX_PACKET_BYTES <= NETWORK_TX_MAX_DATAGRAM_BYTES
+    # The MTU-safe bound is arithmetic, not a guess: one Ethernet frame less an
+    # IP and a UDP header, rounded down to a whole stereo frame.
+    assert NETWORK_TX_MTU_SAFE_FRAMES * 4 + 28 <= 1500
+    assert (NETWORK_TX_MTU_SAFE_FRAMES + 1) * 4 + 28 > 1500
 
     # Transmit gain staging. The radio multiplies network audio by a pre-gain of
     # up to 13x (CAT 0x10 -> state[0x140] -> table at 0x080DAF14) before an ALC
@@ -4649,7 +4696,7 @@ def self_test() -> None:
         period, base_ratio = tx_pacing(radio_rate)
         # The radio's rate counts its own 48-frame packets, so our slot rate is
         # its frame rate divided by however many frames we put in a datagram.
-        radio_frames = radio_rate * 48.0
+        radio_frames = radio_rate * 48.0 * (1.0 + TX_RATE_PPM * 1e-6)
         assert abs(1.0 / period - radio_frames / NETWORK_TX_PACKET_FRAMES) < 1e-9, (
             radio_rate,
             period,
@@ -4661,6 +4708,22 @@ def self_test() -> None:
         assert abs(base_ratio * NETWORK_TX_PACKET_FRAMES / period - 48_000.0) < 1e-3, (
             radio_rate,
         )
+    # The rate correction has to move the send rate by exactly what it says, and
+    # move the conversion ratio with it: the period governs the radio's ring and
+    # the ratio governs ours, so a correction applied to one and not the other
+    # would fix one buffer by breaking the other. Measure against an explicit
+    # zero rather than whatever the environment happens to have set.
+    saved_ppm = TX_RATE_PPM
+    try:
+        globals()["TX_RATE_PPM"] = 0.0
+        base_period, base_conv = tx_pacing(1_000.0)
+        for ppm in (-2_000.0, -250.0, 250.0, 2_000.0):
+            globals()["TX_RATE_PPM"] = ppm
+            shifted_period, shifted_conv = tx_pacing(1_000.0)
+            assert abs((base_period / shifted_period - 1.0) * 1e6 - ppm) < 1e-3, ppm
+            assert abs((base_conv / shifted_conv - 1.0) * 1e6 - ppm) < 1e-3, ppm
+    finally:
+        globals()["TX_RATE_PPM"] = saved_ppm
 
     # The servo must push back in the right direction and with a bounded trim.
     # Its error is now smoothed, so a single call barely moves: drive it for a
@@ -4692,6 +4755,12 @@ def self_test() -> None:
 
     # With the base ratio deliberately wrong, only the servo can stop the buffer
     # from running away. Model consumption arithmetically so this stays quick.
+    #
+    # Neutralise any operator rate correction here. It exists to cancel an error
+    # in the measured clock, so applying it on top of a deliberately wrong clock
+    # would count the same error twice and test nothing about the servo.
+    saved_ppm = TX_RATE_PPM
+    globals()["TX_RATE_PPM"] = 0.0
     for host_hz, radio_rate in ((48_024.0, 999.5), (47_976.0, 1_000.6)):
         # Derive the slot period the same way the sender does, so this stays
         # correct whatever datagram geometry is configured.
@@ -4710,6 +4779,7 @@ def self_test() -> None:
         # And it must actually settle near the target rather than merely staying
         # inside the limits.
         assert abs(depth - target) < target * 0.5, (host_hz, radio_rate, depth, target)
+    globals()["TX_RATE_PPM"] = saved_ppm
 
     # Depth-to-ratio is a double integrator, so the loop needs damping as well as
     # integral action. Start the buffer at twice its target and check it does not
