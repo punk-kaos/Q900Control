@@ -395,8 +395,36 @@ wrong by the ratio of the two gains.
 The radio's transmit ring holds 6144 words, 64 ms at 48 kHz stereo. Its rate
 corrector leaves 1536..4608 words (16..48 ms) alone; below that it duplicates a
 frame on every datagram and above it drops one, a thousand times a second in
-either direction. Transmit priming therefore aims for the centre of that window,
-and schedule debt after a late wake is repaid rather than discarded, because
-nothing on this path can observe the ring depth: no CAT command reports it, and
-the firmware's own depth and underflow counters are written but never read.
+either direction. That is what roughness on this path sounds like.
+
+Two properties of the firmware make this harder than it looks. The ring is
+consumed **only while PTT is asserted** -- `0x0803432C` tests `state[0xAF]` and
+runs either the receive path or the transmit path, never both -- and **nothing
+ever resets its indices**. Whatever depth was left at the previous unkey is still
+sitting there at the next key-up. Priming on top of it therefore accumulates:
+within a few transmissions the depth passes 4608 words and the firmware starts
+dropping a frame from every datagram, and past 6143 it overflows. An overflow
+advances the read index by a single word, which permanently breaks its 64-word
+alignment, and once misaligned `peek()` straddles the end of the ring -- it has
+no wrap handling -- and reads out of bounds into the receive media ring.
+
+There is no way to flush it from the host. Datagrams sent while unkeyed are
+discarded by the PTT gate, no CAT command reports or clears the ring, and the
+firmware's own depth and underflow counters are written but never read by
+anything. The only mechanism is the consumer itself, so the sender keys the
+transmitter and then deliberately sends nothing for slightly longer than a full
+ring takes to drain, and only then primes. The starting depth is then
+deterministic regardless of how the previous transmission ended.
+
+Priming aims for the centre of the corrector's window. The consumer keeps running
+while the burst is paced out, so a primed packet nets less than its whole 96
+words, and the packet count is derived from the target depth rather than written
+down. Bursts -- priming, catch-up after a late wake, and debt repayment -- are all
+floored to a minimum spacing, because bursting at line rate asks the radio's
+Ethernet and lwIP receive path to absorb a thousand times its steady-state packet
+rate, and a datagram lost there is a millisecond of audio missing with nothing to
+resend it. Schedule debt after a late wake is repaid rather than discarded, since
+discarding it lowers the long-run send rate below the radio's consume rate and
+walks the ring down into the duplication region with nothing able to observe it.
+
 

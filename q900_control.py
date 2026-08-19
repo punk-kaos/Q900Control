@@ -969,30 +969,67 @@ class NetworkAudioMonitor:
 NETWORK_TX_PERIOD = 0.001
 NETWORK_TX_PACKET_BYTES = 48 * 2 * 2
 NETWORK_TX_MAX_DATAGRAM_BYTES = 2560
-# The priming burst is drawn from the preroll, so the steady-state buffer is
-# PREROLL - PRIME, not PREROLL. At 40/20 that left 20 packets, exactly one
-# microphone callback, so the buffer emptied on every mic period and a block
-# arriving 10 ms late produced audible gaps. Keep at least two callbacks of
-# slack, and set the low-water mark to the whole cushion so it is held inside
-# the sender process rather than across the capture feeder pipe.
+# The radio's transmit ring, transcribed from the firmware so the host's choices
+# below can be derived rather than guessed. Depth is measured in int16 words and
+# one stereo frame is two words.
+#   0x0806C7DC  depth = (write - read) mod 6144
+#   0x0806C83A  depth < 1536 -> duplicate the datagram's last frame
+#   0x0806C846  depth > 4608 -> drop it
+#   0x0806C95A  consumer takes 64 words per DSP block, 1500 blocks/s
+# A correction is applied once per datagram, so at 1 ms pacing leaving the
+# 1536..4608 window means a duplicated or dropped frame a thousand times a
+# second. That is what roughness on this path sounds like.
+RADIO_RING_WORDS = 6144
+RADIO_RING_SHALLOW_WORDS = 1536
+RADIO_RING_DEEP_WORDS = 4608
+RADIO_CONSUME_WORDS_PER_S = 96_000
+RADIO_RING_TARGET_WORDS = (RADIO_RING_SHALLOW_WORDS + RADIO_RING_DEEP_WORDS) // 2
+
 NETWORK_TX_PREROLL_PACKETS = 80      # buffered before the transmitter is keyed
-# The radio's TX ring is 6144 words (64 ms) and its rate corrector only leaves
-# 1536..4608 words (16..48 ms) alone: below that it duplicates a frame on every
-# datagram, above it drops one, 1000 times a second either way. Prime to the
-# centre of that window, not to 20 ms, which sat 4 ms above the duplication
-# threshold and gave any downward drift nowhere to go.
-NETWORK_TX_PRIME_PACKETS = 32        # unpaced burst into the radio's TX ring
-NETWORK_TX_LOW_WATER_PACKETS = 60    # cushion held inside the sender process
+# Cushion held inside the sender process, and the depth the startup trim leaves
+# after priming. It has to cover more than one 20 ms microphone callback or the
+# buffer bottoms out every mic period and any late block becomes an audible gap.
+NETWORK_TX_LOW_WATER_PACKETS = 60
 NETWORK_TX_HIGH_WATER_PACKETS = 200  # hard cap on buffered capture
 NETWORK_TX_MAX_CATCHUP_PACKETS = 8
 # Ceiling on schedule debt carried forward after a resync. Debt has to be repaid
 # or the long-run send rate falls below the radio's consume rate and its ring
 # walks down into the duplication region. The useful bound is how far the ring
-# can drain before that happens: from the 3072-word prime point down to the
-# 1536-word threshold is 1536 words, so 16 packets. Falling further behind than
-# that means the firmware has already duplicated frames, and repaying the excess
-# would only add latency without undoing the artifact.
+# can drain before that happens.
 NETWORK_TX_MAX_DEBT_PACKETS = 16
+# The radio consumes its TX ring only while PTT is asserted -- 0x0803432C tests
+# state[0xAF] and runs either the receive path or the transmit path, never both
+# -- and nothing in the firmware ever resets the ring indices. So whatever depth
+# was left at the previous unkey is still sitting there at the next key-up, and
+# priming on top of it accumulates: within a few transmissions the depth passes
+# 4608 words and the firmware drops a frame from every datagram, then passes
+# 6143 and overflows, which advances the read index by a single word and
+# permanently breaks its 64-word alignment. Once misaligned, peek() straddles the
+# end of the ring -- it has no wrap handling -- and reads out of bounds.
+#
+# There is no way to flush it from the host: datagrams sent while unkeyed are
+# discarded by the PTT gate, and no CAT command reports or clears the ring. The
+# only mechanism is the consumer itself, so key the transmitter and send nothing
+# until it has drained. Allow a margin over a completely full ring so the
+# starting depth is deterministic regardless of how the last transmission ended.
+NETWORK_TX_RING_DRAIN = 1.1 * RADIO_RING_WORDS / RADIO_CONSUME_WORDS_PER_S
+# Minimum spacing inside a burst. Bursting at line rate asks the radio's Ethernet
+# and lwIP receive path to absorb a thousand times its steady-state packet rate,
+# and a datagram lost there is a millisecond of audio missing from the ring with
+# nothing to resend it. Four times real time empties a backlog quickly while
+# staying two orders of magnitude below line rate.
+NETWORK_TX_BURST_GAP = NETWORK_TX_PERIOD / 4
+# Priming aims for the centre of the corrector's window so drift in either
+# direction has the most room. The consumer keeps running while the burst is
+# being paced out, so a primed packet does not net its whole 96 words: it nets
+# 96 less whatever is consumed during its own slot. Solving for the target depth
+# is why this is derived rather than written down -- at 20 packets the ring
+# settled just above the duplication threshold, which is where any downward
+# drift immediately became audible.
+NETWORK_TX_PRIME_PACKETS = round(
+    RADIO_RING_TARGET_WORDS
+    / (NETWORK_TX_PACKET_BYTES // 2 - NETWORK_TX_BURST_GAP * RADIO_CONSUME_WORDS_PER_S)
+)
 # Rate-conversion servo. The ratio starts from the radio's measured clock, so the
 # servo only has to absorb the host audio clock's own error, and both gains are
 # deliberately gentle: the buffer holds tens of milliseconds, so there is no need
@@ -1207,6 +1244,37 @@ def udp_audio_sender(
     preroll_bytes = NETWORK_TX_PREROLL_PACKETS * packet_bytes
     low_water = NETWORK_TX_LOW_WATER_PACKETS * packet_bytes
     high_water = NETWORK_TX_HIGH_WATER_PACKETS * packet_bytes
+
+    # Timebase first, because the send rate limiter below depends on it. Raising
+    # the QoS class here rather than in transmit() covers the preroll too.
+    mach_time = mach_wait = None
+    ticks_per_second = 0.0
+    if sys.platform == "darwin":
+        class TimebaseInfo(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+        try:
+            system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            info = TimebaseInfo()
+            system.mach_timebase_info(ctypes.byref(info))
+            system.mach_absolute_time.restype = ctypes.c_uint64
+            system.mach_wait_until.argtypes = (ctypes.c_uint64,)
+            system.pthread_set_qos_class_self_np(0x21, 0)
+            mach_time = system.mach_absolute_time
+            mach_wait = system.mach_wait_until
+            ticks_per_second = 1_000_000_000 * info.denom / info.numer
+        except (AttributeError, OSError):
+            mach_time = mach_wait = None
+    period_ticks = int(period * ticks_per_second)
+    burst_gap_ticks = int(NETWORK_TX_BURST_GAP * ticks_per_second)
+
+    def pause(seconds: float) -> None:
+        """Sleep `seconds`, using the mach timer when it is available."""
+        if mach_time and mach_wait:
+            mach_wait(mach_time() + int(seconds * ticks_per_second))
+        else:
+            time.sleep(seconds)
+
     pending = bytearray()
     while len(pending) < preroll_bytes and not stop.is_set():
         try:
@@ -1231,7 +1299,27 @@ def udp_audio_sender(
                 record_stream.close()
             record_stream = record_times = None
 
+    last_send = [0]
+
     def send(payload: bytes) -> None:
+        # Enforce a floor on the spacing between datagrams here rather than at
+        # each call site. Every path that can emit more than one packet in
+        # succession -- the priming burst, catch-up after a late wake, debt
+        # repayment, and a loop iteration whose deadline has already passed --
+        # would otherwise hand the radio's Ethernet and lwIP receive path a
+        # multi-thousand-packet-per-second burst, and a datagram lost there is a
+        # millisecond of audio missing from the ring with nothing to resend it.
+        if mach_time and mach_wait:
+            now = mach_time()
+            if last_send[0]:
+                earliest = last_send[0] + burst_gap_ticks
+                if now < earliest:
+                    mach_wait(earliest)
+                    # Record when the send actually happens, not when it was due.
+                    # mach_wait can return late, and crediting the intended time
+                    # would let the next gap close by however late it was.
+                    now = mach_time()
+            last_send[0] = now
         try:
             udp_socket.sendto(payload, target)
         except OSError:
@@ -1290,9 +1378,37 @@ def udp_audio_sender(
         payload, resample_phase = converted
         return payload
 
-    # Prime the radio's TX ring before paced delivery begins, so the first
-    # scheduling jitter has something to eat into rather than starving it.
+    # Drain the radio's residual ring, prime it, then pace. The transmitter is
+    # already keyed by the time this runs: the parent sets `keyed` after CAT PTT.
     def transmit() -> None:
+        # Drain whatever the previous transmission left in the radio's ring
+        # before priming, or the depth accumulates across transmissions until the
+        # firmware is correcting on every datagram. See NETWORK_TX_RING_DRAIN.
+        # The transmitter is already keyed, so this is dead air immediately after
+        # key-up, which is where an operator pauses anyway.
+        drain_until = time.monotonic() + NETWORK_TX_RING_DRAIN
+        while time.monotonic() < drain_until:
+            if stop.is_set():
+                return
+            pause(0.002)
+        # Start from a known buffer depth holding current audio. Everything
+        # captured during the preroll and the drain is older than the audio the
+        # operator is speaking now, and keeping it would put its whole duration
+        # into the transmit path as standing latency. This is by design, so it is
+        # not counted as a runaway trim.
+        while True:
+            try:
+                pending.extend(audio_queue.get_nowait())
+            except queue.Empty:
+                break
+        startup_bytes = (
+            NETWORK_TX_PRIME_PACKETS + NETWORK_TX_LOW_WATER_PACKETS
+        ) * packet_bytes
+        if len(pending) > startup_bytes:
+            del pending[: len(pending) - startup_bytes]
+
+        # Prime the ring so the first scheduling jitter has something to eat into
+        # rather than starving it, but pace the burst: see NETWORK_TX_BURST_GAP.
         for _ in range(NETWORK_TX_PRIME_PACKETS):
             if stop.is_set():
                 # Teardown releases `keyed` so this process can exit. Do not
@@ -1300,25 +1416,6 @@ def udp_audio_sender(
                 return
             send(next_payload())
 
-        mach_time = mach_wait = None
-        ticks_per_second = 0.0
-        if sys.platform == "darwin":
-            class TimebaseInfo(ctypes.Structure):
-                _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
-
-            try:
-                system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-                info = TimebaseInfo()
-                system.mach_timebase_info(ctypes.byref(info))
-                system.mach_absolute_time.restype = ctypes.c_uint64
-                system.mach_wait_until.argtypes = (ctypes.c_uint64,)
-                system.pthread_set_qos_class_self_np(0x21, 0)
-                mach_time = system.mach_absolute_time
-                mach_wait = system.mach_wait_until
-                ticks_per_second = 1_000_000_000 * info.denom / info.numer
-            except (AttributeError, OSError):
-                mach_time = mach_wait = None
-        period_ticks = int(period * ticks_per_second)
         deadline = mach_time() if mach_time else time.monotonic()
         debt_packets = 0
         while not stop.is_set():
@@ -3817,38 +3914,66 @@ def self_test() -> None:
     )
     assert NETWORK_TX_PRIME_PACKETS <= NETWORK_TX_PREROLL_PACKETS
     # The radio's ring corrector leaves 1536..4608 words alone and duplicates or
-    # drops a frame on every datagram outside that. Prime into the middle of the
-    # window so drift in either direction has room, rather than sitting just
-    # above the duplication threshold as the 20-packet burst did.
+    # drops a frame on every datagram outside that. The consumer keeps running
+    # while the priming burst is paced out, so the depth the ring actually settles
+    # at is the burst less what was consumed during it. That figure, not the
+    # packet count, is what has to land in the middle of the window.
     prime_words = NETWORK_TX_PRIME_PACKETS * NETWORK_TX_PACKET_BYTES // 2
-    assert 1536 < prime_words < 4608, prime_words
-    assert abs(prime_words - (1536 + 4608) // 2) <= NETWORK_TX_PACKET_BYTES // 2
+    consumed_while_priming = int(
+        NETWORK_TX_PRIME_PACKETS * NETWORK_TX_BURST_GAP * RADIO_CONSUME_WORDS_PER_S
+    )
+    settled = prime_words - consumed_while_priming
+    assert RADIO_RING_SHALLOW_WORDS < settled < RADIO_RING_DEEP_WORDS, settled
+    assert abs(settled - RADIO_RING_TARGET_WORDS) <= NETWORK_TX_PACKET_BYTES // 2, (
+        settled,
+        RADIO_RING_TARGET_WORDS,
+    )
     # Debt is incurred by falling behind, which drains the ring, so the bound is
-    # the drain headroom between the prime point and the duplication threshold.
-    # Beyond that the firmware has already duplicated frames and repaying only
-    # adds latency.
+    # the drain headroom between where the ring settles and the duplication
+    # threshold. Beyond that the firmware has already duplicated frames and
+    # repaying only adds latency.
     assert (
         NETWORK_TX_MAX_DEBT_PACKETS * NETWORK_TX_PACKET_BYTES // 2
-        <= prime_words - 1536
+        <= settled - RADIO_RING_SHALLOW_WORDS
     ), NETWORK_TX_MAX_DEBT_PACKETS
-    # The priming burst is drawn from the preroll, so the steady-state cushion is
-    # the difference, not the preroll itself. It must cover more than a single
-    # microphone callback or the buffer bottoms out every mic period and any
-    # late block becomes an audible gap.
+    # Nothing resets the radio's ring indices and it is only consumed while PTT
+    # is asserted, so the drain must outlast a completely full ring or depth
+    # accumulates across transmissions.
+    assert (
+        NETWORK_TX_RING_DRAIN * RADIO_CONSUME_WORDS_PER_S > RADIO_RING_WORDS
+    ), NETWORK_TX_RING_DRAIN
+    # A paced burst has to be faster than real time to catch up at all, and
+    # slower than line rate to survive the radio's receive path.
+    assert 0.0 < NETWORK_TX_BURST_GAP < NETWORK_TX_PERIOD
+    # The priming burst must still complete promptly once paced.
+    assert NETWORK_TX_PRIME_PACKETS * NETWORK_TX_BURST_GAP < 0.020
+    # The startup trim must leave the sender its full cushion plus the burst it
+    # is about to emit, or priming immediately underruns.
+    assert (
+        NETWORK_TX_PRIME_PACKETS + NETWORK_TX_LOW_WATER_PACKETS
+        <= NETWORK_TX_HIGH_WATER_PACKETS
+    )
+    # The priming burst is no longer drawn from the preroll alone. The sender
+    # accumulates through the preroll, keys, then waits out the ring drain while
+    # capture keeps arriving, and only then trims to the depth it wants. So the
+    # audio on hand when priming starts is the preroll plus the drain, and the
+    # cushion left afterwards is the low-water mark by construction.
     mic_block_packets = (
         TransmitAudioRouter.BLOCK_SIZE * 2 * 2 // NETWORK_TX_PACKET_BYTES
     )
-    steady_state_packets = NETWORK_TX_PREROLL_PACKETS - NETWORK_TX_PRIME_PACKETS
-    assert steady_state_packets >= 2 * mic_block_packets, (
-        steady_state_packets,
-        mic_block_packets,
+    drain_packets = int(NETWORK_TX_RING_DRAIN / NETWORK_TX_PERIOD)
+    available_at_prime = NETWORK_TX_PREROLL_PACKETS + drain_packets
+    startup_packets = NETWORK_TX_PRIME_PACKETS + NETWORK_TX_LOW_WATER_PACKETS
+    assert available_at_prime >= startup_packets, (
+        available_at_prime,
+        startup_packets,
     )
-    # Hold that cushion in the sender process. If the low-water mark is below it
-    # the surplus migrates into the feeder queue, back across the pipe that the
-    # in-process cushion exists to insulate against.
-    assert NETWORK_TX_LOW_WATER_PACKETS >= steady_state_packets, (
+    # The cushion held after priming must cover more than a single microphone
+    # callback or the buffer bottoms out every mic period and any late block
+    # becomes an audible gap.
+    assert NETWORK_TX_LOW_WATER_PACKETS >= 2 * mic_block_packets, (
         NETWORK_TX_LOW_WATER_PACKETS,
-        steady_state_packets,
+        mic_block_packets,
     )
 
     # The vectorized waterfall must reproduce the previous per-pixel mapping
