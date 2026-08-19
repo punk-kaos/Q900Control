@@ -1322,10 +1322,13 @@ def udp_audio_sender(
     send_errors: mp.Value,
     ready: mp.Event,
     radio_rate: float = 0.0,
+    repeats: mp.Value | None = None,
+    ring_depth: mp.Value | None = None,
 ) -> None:
     """Pace TX audio outside the GUI process and its contended Python GIL."""
     packet_bytes = NETWORK_TX_PACKET_BYTES
     frames_per_packet = packet_bytes // 4
+    packet_words = packet_bytes // 2
     # Emit at the radio's own clock when it is known, and convert the host stream
     # to it. Sending at the host rate instead leaves the radio's ring gaining or
     # losing a millisecond of audio every few seconds, which it resolves by
@@ -1403,17 +1406,42 @@ def udp_audio_sender(
 
     last_send = [0]
     skipped = [0]
+    repeated = [0]
+    # Running estimate of the radio's ring depth, in int16 words. One scheduled
+    # slot is exactly one packet's worth of consumption by construction, because
+    # the slot period is 1/radio_rate, so the accounting is +/- one packet per
+    # slot and does not depend on that rate being exactly right.
+    ring_words = [0]
+    last_payload = [b""]
 
     def send_scheduled() -> bool:
-        """Emit one scheduled packet, or skip it if there is no audio for it.
+        """Emit one scheduled packet. Returns False only if nothing was sent.
 
-        Skipping spends the radio's ring slack instead of transmitting a hole.
-        The caller turns a skip into debt so the depth is restored afterwards.
+        With no audio for the slot there are two ways to fail, and which one is
+        right depends on the radio's ring depth.
+
+        Skipping is inaudible while the ring has slack: it holds about 32 ms for
+        exactly this, and the gap is covered. But skipping also spends that
+        slack, and once the ring is empty every later hiccup becomes a hole on
+        the air -- which is how a fix for one hole can produce more of them.
+
+        So skip only while the estimate says the ring can afford it, and repeat
+        the previous packet once it cannot. A repeat is a millisecond of
+        duplicated audio, which is a small click, but it keeps the ring at depth
+        and the schedule exact so the failure cannot cascade.
         """
         payload = next_payload()
         if payload is None:
-            skipped[0] += 1
-            return False
+            affordable = ring_words[0] - packet_words >= RADIO_RING_SHALLOW_WORDS
+            if affordable or not last_payload[0]:
+                skipped[0] += 1
+                return False
+            repeated[0] += 1
+            if repeats is not None:
+                repeats.value = repeated[0]
+            send(last_payload[0])
+            return True
+        last_payload[0] = payload
         send(payload)
         return True
 
@@ -1442,6 +1470,9 @@ def udp_audio_sender(
             send_errors.value += 1
             return
         packets.value += 1
+        ring_words[0] = min(ring_words[0] + packet_words, RADIO_RING_WORDS - 1)
+        if ring_depth is not None:
+            ring_depth.value = ring_words[0]
         if record_stream is not None:
             # Record after a successful send so the file is exactly the stream
             # the radio received, in order, with nothing the socket rejected.
@@ -1541,10 +1572,18 @@ def udp_audio_sender(
                 # emit a burst into a transmitter that is already unkeyed.
                 return
             send_scheduled()
+            ring_words[0] = max(
+                0,
+                ring_words[0]
+                - int(NETWORK_TX_BURST_GAP * RADIO_CONSUME_WORDS_PER_S),
+            )
 
         deadline = mach_time() if mach_time else time.monotonic()
         debt_packets = 0
         while not stop.is_set():
+            # One slot elapses per iteration, and the radio consumes exactly one
+            # packet's worth in it. send() credits what actually goes out.
+            ring_words[0] = max(0, ring_words[0] - packet_words)
             if not send_scheduled():
                 # No audio for this slot. The ring covers it; owe it back.
                 debt_packets = min(debt_packets + 1, NETWORK_TX_MAX_DEBT_PACKETS)
@@ -1574,6 +1613,7 @@ def udp_audio_sender(
                     behind = int(lateness / period)
                     burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
                     for _ in range(burst):
+                        ring_words[0] = max(0, ring_words[0] - packet_words)
                         send_scheduled()
                     deadline += burst * period_ticks
                     if (mach_time() - deadline) / ticks_per_second > period:
@@ -1583,6 +1623,9 @@ def udp_audio_sender(
                         now = mach_time()
                         shortfall = int(
                             (now - deadline) / ticks_per_second / period
+                        )
+                        ring_words[0] = max(
+                            0, ring_words[0] - max(shortfall, 0) * packet_words
                         )
                         debt_packets = min(
                             debt_packets + max(shortfall, 0),
@@ -1597,6 +1640,7 @@ def udp_audio_sender(
                     behind = int(lateness / period)
                     burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
                     for _ in range(burst):
+                        ring_words[0] = max(0, ring_words[0] - packet_words)
                         send_scheduled()
                     deadline += burst * period
                     if time.monotonic() - deadline > period:
@@ -1832,6 +1876,8 @@ class TransmitAudioRouter:
         self._udp_send_errors: mp.Value | None = None
         self._udp_overflows: mp.Value | None = None
         self._udp_dropped: mp.Value | None = None
+        self._udp_repeats: mp.Value | None = None
+        self._udp_ring: mp.Value | None = None
         self._udp_ready: mp.Event | None = None
         self._udp_ceiling = 0
         self._udp_compressor = 0
@@ -1921,6 +1967,8 @@ class TransmitAudioRouter:
         self._udp_send_errors = self._mp.Value("L", 0, lock=False)
         self._udp_overflows = self._mp.Value("L", 0, lock=False)
         self._udp_dropped = self._mp.Value("L", 0, lock=False)
+        self._udp_repeats = self._mp.Value("L", 0, lock=False)
+        self._udp_ring = self._mp.Value("l", 0, lock=False)
         self._udp_ready = self._mp.Event()
 
         def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
@@ -1996,6 +2044,8 @@ class TransmitAudioRouter:
                 # convert the host stream rather than letting the difference
                 # accumulate in the radio's ring.
                 network_audio.measured_packet_rate,
+                self._udp_repeats,
+                self._udp_ring,
             ),
             name="q900-udp-tx",
             daemon=True,
@@ -2154,8 +2204,11 @@ class TransmitAudioRouter:
         errors = self._udp_send_errors.value if self._udp_send_errors else 0
         overflows = self._udp_overflows.value if self._udp_overflows else 0
         dropped = self._udp_dropped.value if self._udp_dropped else 0
+        repeats = self._udp_repeats.value if self._udp_repeats else 0
+        ring = self._udp_ring.value if self._udp_ring else 0
         return (
             f"UDP {packets} pkts  ovf {overflows}  drop {dropped}  skip {underruns}  "
+            f"rep {repeats}  ring {ring / 96.0:.0f}ms  "
             f"trim {trimmed}  err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
             f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
         )

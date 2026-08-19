@@ -425,24 +425,32 @@ integrator wound up against its limit.
 
 ### Transmit Underruns
 
-When the sender has no audio for a scheduled slot it emits nothing, rather than
-substituting a packet of digital silence. The radio's ring holds about 32 ms
-precisely so a brief feeder hiccup costs nothing, and a skipped slot spends that
-slack; the debt mechanism then restores the depth once capture catches up.
+When the sender has no audio for a scheduled slot it has two ways to fail, and
+which one is right depends on how deep the radio's ring is at that moment.
 
-This was measured, not reasoned about. Recording the receiving radio
-electrically and comparing the network path against the radio's own USB path
-showed eight dropouts in 30 s on the network path only, 2 to 12 ms long, one
-every 3.5 s, at -38 dB -- digital silence on the air, and audible as a faint
-pulsing. The mean level never moved, which is what distinguished it from AM,
-receiver AGC or anything acoustic. Modelling the radio's ring from real send
-timestamps, a 12 ms feeder stall now produces no holes at all.
+Skipping the slot is inaudible while the ring has slack, because the ring holds
+about 32 ms for exactly this purpose and covers the gap. But skipping also spends
+that slack, and once the ring is empty every later hiccup becomes a hole on the
+air. Substituting a packet of digital silence, which is what this used to do, is
+worse still: it guarantees a hole immediately.
 
-A stall longer than the ring is deep cannot be covered from this side. Skipping
-still degrades better than silence: the depth falls into the firmware's
-duplication region, where it repeats one frame per datagram, which is mild
-roughness rather than a hole. Skipped slots are counted as `skip` in the audio
-status line, and a whole discarded microphone block as `drop`.
+So the sender keeps a running estimate of the ring depth, skips only while that
+estimate says the ring can afford it, and repeats the previous packet once it
+cannot. A repeat is a millisecond of duplicated audio -- a small click -- but it
+holds the ring at depth and keeps the schedule exact, so a shortfall cannot
+cascade into a run of holes. The estimate is exact in slot units: one scheduled
+slot is one packet's worth of consumption by construction, because the slot
+period is `1/radio_rate`.
+
+Modelling the firmware ring from real send timestamps: a 12 ms feeder stall
+produces no holes at all, and a pathological 120 ms stall repeated every 3.5 s
+puts 4 ms of holes on the air against a 1.5 s shortfall. Sending silence for the
+same shortfall would have put all of it on the air.
+
+The audio status line reports `skip` (slots the ring covered), `rep` (slots
+covered by repeating), `drop` (whole microphone blocks discarded by a full feeder
+queue) and `ring` (the depth estimate in ms). A healthy transmission sits in the
+16 to 48 ms window with few skips and no repeats.
 
 ### Diagnosing Transmit Audio
 
