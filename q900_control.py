@@ -3113,6 +3113,38 @@ class MainWindow(QMainWindow):
         if current_output is not None:
             self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
 
+    def _assert_network_audio_format(self) -> None:
+        """Force the radio into audio stream format before network transmit.
+
+        The radio's transmit path is gated on state[0x131], set only by CAT 0x33.
+        The ingest at 0x0806C80C accepts a datagram only when it is 1 or 2, and
+        the transmit DSP at 0x08039E8E treats 2 as raw I/Q: it copies the first
+        word of each frame into the I array and the second into Q, bypassing the
+        SSB modulator and every speech-processing stage. Feeding duplicated mono
+        into that produces I == Q, a double-sideband signal with no filtering --
+        recognisable audio, but rough, and immune to any amount of level or
+        buffer correction on this side.
+
+        Nothing here used to set it. The firmware substitutes 1 when it enables
+        streaming (0x0806DA70) but only if the value is exactly 0, so a 2 left
+        behind by an earlier SDR session survives indefinitely, and the value
+        lives in .bss so it is whatever the last thing to touch it chose. Assert
+        it explicitly rather than inheriting it.
+
+        The radio's own receive stream reports the same byte back: it frames
+        packets as type 0x67 in audio format and 0x68 in I/Q. So the state is
+        observable, and a mismatch is worth saying out loud rather than silently
+        correcting, because it means transmit audio up to this point was being
+        interpreted as I/Q.
+        """
+        observed = self.network_audio.stream_type
+        self.client.set_stream_format(0)
+        if observed == 0x68:
+            self.status.setText(
+                "Radio was streaming I/Q (0x68): transmit audio would have been "
+                "interpreted as I/Q. Forced audio format (CAT 0x33 = 0)."
+            )
+
     def start_ptt(self) -> None:
         if self._sdr_switch_pending or self._sdr_restore_pending:
             self.status.setText("Wait for the SDR stream transition to complete before transmitting.")
@@ -3156,6 +3188,10 @@ class MainWindow(QMainWindow):
                         self._sdr_tx_invert_q,
                     )
                 else:
+                    # Force audio stream format before any audio leaves the host:
+                    # the radio would otherwise transmit it as raw I/Q if a
+                    # previous SDR session left the format at 2.
+                    self._assert_network_audio_format()
                     self.tx_audio.start_udp(
                         microphone,
                         target,
@@ -3298,6 +3334,10 @@ class MainWindow(QMainWindow):
                         self._sdr_tx_invert_q,
                     )
                 else:
+                    # Force audio stream format before any audio leaves the host:
+                    # the radio would otherwise transmit it as raw I/Q if a
+                    # previous SDR session left the format at 2.
+                    self._assert_network_audio_format()
                     self.tx_audio.start_udp(
                         microphone,
                         target,
