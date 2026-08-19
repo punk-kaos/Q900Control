@@ -11,6 +11,7 @@ from collections import deque
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
+import math
 import multiprocessing as mp
 import os
 import queue
@@ -1399,24 +1400,73 @@ TX_PREGAIN_BY_COMPRESSOR = (
     6.50, 8.00, 9.00, 10.50, 13.00, 13.00, 13.00,
 )
 TX_ALC_THRESHOLD = 30000.0
-# Sit just under the knee. At 1.0 the loudest sample lands exactly on it; less
-# than 1.0 keeps the path linear and predictable, which is what we want while
-# the host has no compressor of its own. Raising this toward and past 1.0 is how
-# you hand dynamics back to the radio.
+# Headroom left below whatever we are aiming at. The resampler measures a peak
+# gain of 1.000 on sines and two-tone, so 3% is insurance against transients
+# rather than a correction for known overshoot; the point is that int16 clipping
+# splatters, so the last few percent are not worth having.
 TX_LEVEL_MARGIN = 0.97
 
 
 def network_tx_ceiling(compressor: int) -> int:
     """Peak int16 magnitude to send for a given radio COMPRESSOR setting.
 
-    Chosen so `peak * pregain` lands just below the radio's 30000 ALC knee, which
-    is where the microphone input sits and therefore what the whole TX chain is
-    calibrated for. The radio never reports this setting back, so the caller is
-    passing the host's own record of it.
+    Chosen so `peak * pregain` lands just below the radio's 30000 ALC knee, so
+    the ALC never acts and the path stays linear. That suits speech, whose
+    envelope a limiter would audibly work on. It is the wrong choice for a
+    constant-envelope digital mode: see tx_ceiling().
+
+    The radio never reports COMPRESSOR back, so the caller is passing the host's
+    own record of it.
     """
     index = min(max(int(compressor), 0), len(TX_PREGAIN_BY_COMPRESSOR) - 1)
     ceiling = TX_ALC_THRESHOLD * TX_LEVEL_MARGIN / TX_PREGAIN_BY_COMPRESSOR[index]
     return int(min(ceiling, 32767.0))
+
+
+def tx_ceiling(compressor: int, digital: bool) -> int:
+    """Peak int16 magnitude to send, given the radio's COMPRESSOR and the source.
+
+    Digital modes drive full scale, because that is what the radio's USB digital
+    input does and it is measurably worth up to 19 dB of transmit power.
+
+    Both transports hand int16 to the same DSP ring at the same gain, so the only
+    difference between them is the number we put there. The USB input receives the
+    application's samples at their native scale, and after the COMPRESSOR pre-gain
+    that saturates the 30000 ALC knee for any level above about 11% of full scale
+    -- so USB radiates full power almost regardless of the application's slider.
+    Scaling to sit *below* the knee instead makes power track that slider
+    linearly, and the ALC cannot make up the difference because its gain is
+    clamped to a maximum of 1.0 (firmware 0x0803990E): it attenuates, never
+    amplifies. Every dB below the knee is simply not transmitted.
+
+    Driving a limiter hard costs a constant-envelope mode nothing. With constant
+    input magnitude the ALC gain converges and then holds, so it applies a fixed
+    scale factor and adds no distortion. Its time constant is 0.001 per sample,
+    about 21 ms, and nothing resets its gain on PTT, so only the first
+    transmission after power-on spends any time settling.
+
+    Speech is the opposite case: it has an envelope for the limiter to act on, so
+    it keeps the linear level and leaves the dynamics to the operator's
+    COMPRESSOR setting.
+    """
+    if digital:
+        return int(32767.0 * TX_LEVEL_MARGIN)
+    return network_tx_ceiling(compressor)
+
+
+def alc_headroom_db(peak: float, ceiling: int, compressor: int) -> float:
+    """dB by which a source peak drives the radio's ALC knee past or short of it.
+
+    Zero or above means the limiter is engaged and the radio is at full output.
+    Below zero is transmit power being discarded, because the ALC cannot amplify.
+    This exists because under-driving is otherwise invisible -- a clip count of
+    zero looks healthy when it can equally mean the signal never came close.
+    """
+    index = min(max(int(compressor), 0), len(TX_PREGAIN_BY_COMPRESSOR) - 1)
+    drive = abs(peak) * float(ceiling) * TX_PREGAIN_BY_COMPRESSOR[index]
+    if drive <= 0.0:
+        return float("-inf")
+    return 20.0 * math.log10(drive / TX_ALC_THRESHOLD)
 
 
 def tx_pacing(radio_rate: float) -> tuple[float, float]:
@@ -2249,6 +2299,7 @@ class TransmitAudioRouter:
         self._udp_ready: mp.Event | None = None
         self._udp_ceiling = 0
         self._udp_compressor = 0
+        self._udp_digital = False
 
     def start_usb(self, microphone: int, q900_output: int) -> None:
         self.stop()
@@ -2313,16 +2364,19 @@ class TransmitAudioRouter:
         target: tuple[str, int],
         network_audio: NetworkAudioMonitor,
         compressor: int = 9,
+        digital: bool = False,
     ) -> None:
         self.stop()
         self._udp_target = target
         # The radio applies a pre-gain of up to 13x before its ALC, selected by
-        # CAT 0x10, and never scales network audio down to compensate. Derive the
-        # peak we may send from that setting. The radio does not report the value
-        # back, so this is the host's own record of it.
-        ceiling = network_tx_ceiling(compressor)
+        # CAT 0x10, and never scales network audio down to compensate. How hard to
+        # drive that chain depends on what the audio is, not on the transport:
+        # see tx_ceiling(). The radio does not report COMPRESSOR back, so this is
+        # the host's own record of it.
+        ceiling = tx_ceiling(compressor, digital)
         self._udp_ceiling = ceiling
         self._udp_compressor = compressor
+        self._udp_digital = digital
         self._udp_stop = self._mp.Event()
         self._udp_keyed = self._mp.Event()
         self._udp_packets = self._mp.Value("L", 0, lock=False)
@@ -2559,11 +2613,22 @@ class TransmitAudioRouter:
         dropped = self._udp_dropped.value if self._udp_dropped else 0
         repeats = self._udp_repeats.value if self._udp_repeats else 0
         ring = self._udp_ring.value if self._udp_ring else 0
+        headroom = alc_headroom_db(self.level, self._udp_ceiling, self._udp_compressor)
+        # Report against the knee rather than against our own ceiling. "clip 0"
+        # alone cannot distinguish a healthy signal from one that never got near
+        # full output, and only the latter costs transmit power.
+        if headroom == float("-inf"):
+            alc = "alc idle"
+        elif headroom >= 0.0:
+            alc = f"alc +{headroom:.1f}dB limiting"
+        else:
+            alc = f"alc {headroom:.1f}dB UNDER"
         return (
             f"UDP {packets} pkts  ovf {overflows}  drop {dropped}  skip {underruns}  "
             f"rep {repeats}  ring {ring / 96.0:.0f}ms  "
             f"trim {trimmed}  err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
             f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
+            f"{'/digital' if self._udp_digital else '/voice'}  {alc}"
         )
 
 
@@ -3718,6 +3783,22 @@ class MainWindow(QMainWindow):
         if current_output is not None:
             self.tx_output.setCurrentIndex(max(0, self.tx_output.findData(current_output)))
 
+    def _tx_source_is_digital(self, microphone: int | None) -> bool:
+        """True when transmit audio comes from the virtual endpoint.
+
+        Audio arriving there was produced by another application -- WSJT-X and
+        friends -- which means a constant-envelope digital mode that wants to be
+        driven into the radio's limiter. A real microphone wants the linear level
+        instead. Keying off the device rather than off which button was pressed
+        means selecting the virtual endpoint by hand behaves the same way as
+        rigctl selecting it, so the drive level never depends on the route taken
+        to get here.
+        """
+        if microphone is None:
+            return False
+        virtual = UsbAudioMonitor.named_device(VIRTUAL_TX_DEVICE, "input")
+        return virtual is not None and microphone == virtual
+
     def _assert_network_audio_format(self) -> None:
         """Force the radio into audio stream format before network transmit.
 
@@ -3802,6 +3883,7 @@ class MainWindow(QMainWindow):
                         target,
                         self.network_audio,
                         self.client.state.compressor,
+                        self._tx_source_is_digital(microphone),
                     )
             # Audio must be established before the transmitter is keyed.
             self.client.set_ptt(True)
@@ -3980,9 +4062,9 @@ class MainWindow(QMainWindow):
             return
         if not self.client.state.connected:
             return
-        microphone = UsbAudioMonitor.named_device("Virtual Desktop Speakers", "input")
+        microphone = UsbAudioMonitor.named_device(VIRTUAL_TX_DEVICE, "input")
         if microphone is None:
-            self.rigctl_status.setText("rigctl: Virtual Desktop Speakers unavailable")
+            self.rigctl_status.setText(f"rigctl: {VIRTUAL_TX_DEVICE} unavailable")
             return
         try:
             if self.client.state.transport == "TCP":
@@ -4014,6 +4096,7 @@ class MainWindow(QMainWindow):
                         target,
                         self.network_audio,
                         self.client.state.compressor,
+                        self._tx_source_is_digital(microphone),
                     )
             else:
                 output = self.tx_output.currentData()
@@ -4548,16 +4631,59 @@ def self_test() -> None:
     for cmp_value in range(15):
         ceiling = network_tx_ceiling(cmp_value)
         assert 0 < ceiling <= 32767, (cmp_value, ceiling)
-        # Whatever the setting, what the radio's ALC sees must land under its
-        # knee. This is the invariant the old full-scale path violated.
+        # The voice level exists to keep the ALC out of the path, so whatever the
+        # setting, what the ALC sees must land under its knee.
         assert (
             ceiling * TX_PREGAIN_BY_COMPRESSOR[cmp_value] <= TX_ALC_THRESHOLD
         ), (cmp_value, ceiling)
     # Out-of-range settings must clamp, never index past the table.
     assert network_tx_ceiling(-5) == network_tx_ceiling(0)
     assert network_tx_ceiling(99) == network_tx_ceiling(14)
-    # The default setting must no longer produce a full-scale stream.
+
+    # Digital drives full scale and voice does not. The digital level must not
+    # depend on COMPRESSOR at all: the whole point is to saturate the ALC rather
+    # than to aim just below a knee whose position we only think we know.
+    digital = tx_ceiling(0, True)
+    assert digital == int(32767 * TX_LEVEL_MARGIN), digital
+    for cmp_value in range(15):
+        assert tx_ceiling(cmp_value, True) == digital, cmp_value
+        assert tx_ceiling(cmp_value, False) == network_tx_ceiling(cmp_value)
+    # Out-of-range settings must clamp on this path too.
+    assert tx_ceiling(-5, False) == tx_ceiling(0, False)
+    assert tx_ceiling(99, False) == tx_ceiling(14, False)
+    # At the default setting, the voice level costs 19 dB against the digital one.
+    # That gap is the whole defect: it was being applied to WSJT-X, and the ALC
+    # cannot recover it because its gain is clamped to 1.0.
     assert network_tx_ceiling(9) < 32767 // 4
+    quiet = 20.0 * math.log10(digital / network_tx_ceiling(9))
+    assert 18.0 < quiet < 20.0, quiet
+
+    # A full-scale digital source must actually reach the knee, and a source well
+    # below full scale must still reach it, because that is what the radio's USB
+    # input does and the point of the change is to match it.
+    assert alc_headroom_db(1.0, digital, 9) > 0.0
+    assert alc_headroom_db(0.222, digital, 9) > 0.0
+    # The measured real-world capture was 0.222 of full scale. On the voice level
+    # that is 13 dB of power thrown away, and the meter has to say so.
+    under = alc_headroom_db(0.222, network_tx_ceiling(9), 9)
+    assert -14.0 < under < -12.0, under
+    # Silence must not raise, and must not read as healthy.
+    assert alc_headroom_db(0.0, digital, 9) == float("-inf")
+    # Doubling the source is 6 dB, and the pre-gain table has to be honoured.
+    assert abs(
+        alc_headroom_db(0.5, digital, 9) - alc_headroom_db(0.25, digital, 9) - 6.02
+    ) < 0.01
+    assert alc_headroom_db(1.0, digital, 0) < alc_headroom_db(1.0, digital, 9)
+
+    # The margin is insurance against transients, so it is only meaningful while
+    # the resampler does not overshoot by more than it covers. Measured peak gain
+    # is 1.000 on sines; assert the bank still cannot exceed the margin on one.
+    probe = np.sin(2 * np.pi * 2500.0 * np.arange(4096) / 48000.0)
+    overshoot = max(
+        float(np.max(np.abs(np.convolve(probe, _RESAMPLE_BANK[phase], mode="valid"))))
+        for phase in range(0, _RESAMPLE_BANK.shape[0], 37)
+    )
+    assert overshoot <= 1.0 / TX_LEVEL_MARGIN, overshoot
 
     # The DC blocker is evaluated in closed form to keep the microphone callback
     # off a per-sample Python loop. It must match the recursion it replaces, and
@@ -4598,14 +4724,18 @@ def self_test() -> None:
         3_750,
         -3_750,
     ]
-    tx_ceiling = network_tx_ceiling(9)
-    words = quantize_tx(tone[:NETWORK_TX_PACKET_FRAMES], tx_ceiling)
+    voice_ceiling = network_tx_ceiling(9)
+    words = quantize_tx(tone[:NETWORK_TX_PACKET_FRAMES], voice_ceiling)
     frames_out = np.repeat(words, 2)
     assert len(frames_out.tobytes()) == NETWORK_TX_PACKET_BYTES
     assert len(frames_out.tobytes()) % 4 == 0
     assert np.array_equal(frames_out[0::2], frames_out[1::2])
-    assert int(np.max(np.abs(frames_out))) <= tx_ceiling
+    assert int(np.max(np.abs(frames_out))) <= voice_ceiling
     assert int(np.max(np.abs(frames_out))) < 32767
+    # Digital drives harder but must still never reach int16 clipping, which
+    # would splatter far worse than the power it would buy.
+    loud = quantize_tx(tone[:NETWORK_TX_PACKET_FRAMES], tx_ceiling(9, True))
+    assert int(np.max(np.abs(loud))) < 32767
 
     # The recording analysers lean on _analytic() to recover envelope and phase.
     # A steady tone must come back with a flat envelope and a straight phase ramp,

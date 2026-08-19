@@ -418,20 +418,59 @@ per-sample ALC whose knee is 30000.
 
 `state[0x1A0]` is selected by CAT `0x10`, the setting labelled COMPRESSOR. It is
 not a ratio; it is a pre-ALC gain of up to 13x, looked up from a table in the
-firmware. That chain is calibrated for the codec's microphone input, which peaks
-well below full scale. Sending int16 full scale instead drove the default
-setting (`9`, a gain of 8.00x) to 262136 against a 30000 knee -- 18.8 dB into
-the limiter -- and the ALC then held roughly 19 dB of gain reduction and
-modulated it at audio rate. That was audible as rough transmit audio with a
-pumping background, from the first moment of transmission rather than
-progressively.
+firmware.
 
-The application therefore derives its peak from the COMPRESSOR setting so that
-`peak * pregain` lands just under the knee, and reports it in the audio status
-line as `peak N/CMP M`. The radio never reports this setting back, so the value
-used is the application's own record of it: if the radio's compressor has been
-changed from the front panel, set it from the host as well or the level will be
-wrong by the ratio of the two gains.
+How hard to drive that chain depends on what the audio is, so the application
+picks the level from the transmit source rather than from the transport, and
+reports which it chose in the audio status line as `peak N/CMP M/digital` or
+`/voice`.
+
+**Digital modes drive full scale**, because that is what the radio's own USB
+digital input does. Both transports hand int16 to the same DSP ring at the same
+gain, so the only difference between them is the number written there: the USB
+input receives the application's samples at their native scale, and after the
+pre-gain that saturates the knee for any level above about 11% of full scale, so
+USB radiates full power almost regardless of the application's output slider.
+Scaling to sit *below* the knee instead makes transmit power track that slider
+linearly, and nothing downstream can recover the difference, because the ALC's
+gain is clamped to a maximum of 1.0 at `0x0803990E` -- it attenuates and never
+amplifies. Every dB below the knee is simply not transmitted. At the level
+measured from a real capture, 0.222 of full scale, that was **13 dB of transmit
+power discarded**, and at low slider settings up to 19 dB.
+
+Driving a limiter hard costs a constant-envelope mode nothing. With constant
+input magnitude the ALC gain converges and then holds, applying a fixed scale
+factor and adding no distortion. Its time constant is 0.001 per sample, about
+21 ms, and nothing in the firmware resets its gain on PTT, so only the first
+transmission after power-on spends any time settling. Measured on the wire, the
+full-scale level is 18.8 dB hotter with SNR 0.26 dB *better* and THD improved
+from -85 to -101 dB, because the quantiser's noise moves 19 dB further below the
+signal. A 3% margin is kept below int16 so that clipping, which splatters far
+worse than the power it would buy, cannot happen.
+
+**Speech keeps the linear level**, sitting just under the knee, because it has an
+envelope for a limiter to act on and the dynamics should stay with the operator's
+COMPRESSOR setting.
+
+An earlier version of this document claimed that driving full scale was itself
+the cause of rough transmit audio, via the ALC modulating its gain at audio rate.
+That was wrong. The roughness was the capture bursting, the resampler's comb and
+the steering loop's wobble, all documented below and all since fixed; the level
+reduction was a defence against a misdiagnosis and it cost 13 dB. What the level
+is actually worth was then measured, not assumed: FT8 coherent capture into one
+6.25 Hz bin is -3.12 dB via USB against -3.13 dB via the network, so spectral
+purity was never the difference between the two paths, and power was.
+
+The radio never reports COMPRESSOR back, so the value used is the application's
+own record of it. If the radio's compressor has been changed from the front
+panel, set it from the host as well or the voice level will be wrong by the ratio
+of the two gains.
+
+Because under-driving is otherwise invisible -- a clip count of zero looks
+healthy when it can equally mean the signal never came close -- the status line
+also reports the drive against the knee as `alc +N dB limiting` or
+`alc -N dB UNDER`. Zero or above means the radio is at full output. Below zero is
+the number of dB being thrown away.
 
 ### Transmit Rate Conversion
 
@@ -644,7 +683,7 @@ which one rather than merely reporting that something is wrong:
 | a frame dropped per datagram (ring above 4608 words) | -34 dB | +25 dB | 16 % |
 | a frame duplicated per datagram (ring below 1536 words) | -34 dB | +25 dB | 16 % |
 | audio being transmitted as I/Q | -87 dB | 0 dB | 157 % |
-| driven into the radio's ALC | -15 dB | +42 dB | 30 % |
+| hard clipping, 6 dB into a clipper | -15 dB | +42 dB | 30 % |
 | host underrun silence | -76 dB | +65 dB | 0.4 % |
 
 Rate-conversion residue does not show up in any of those columns, because it is
@@ -655,6 +694,12 @@ to ppm: a comb at that spacing is the conversion ratio made audible.
 Measure only the steady part of a tone. A Tune transmission ramps up and down on
 purpose, and a ramp inside the analysis window is a real amplitude modulation
 that will report a tone flat to half a per cent as a hundred per cent modulated.
+
+The clipping row is a hard clipper, which is what int16 saturation in the host
+looks like and the reason a margin is kept below full scale. It is *not* what the
+radio's ALC does: that is a gain-controlled limiter with a 21 ms time constant, so
+against a constant-envelope signal it settles to a fixed scale factor and leaves
+no fingerprint at all. Do not read this row as a reason to keep the drive down.
 
 
 ### Transmit Ring
