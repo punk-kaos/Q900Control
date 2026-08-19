@@ -481,6 +481,32 @@ covered by repeating), `drop` (whole microphone blocks discarded by a full feede
 queue) and `ring` (the depth estimate in ms). A healthy transmission sits in the
 16 to 48 ms window with few skips and no repeats.
 
+### Datagram Geometry
+
+`Q900_TX_FRAMES` sets how many stereo frames go in a datagram, clamped to
+48..192, which is 1 to 4 ms at 48 kHz. The default of 48 matches the radio's own
+media quantum. The firmware's receive callback stages up to 2560 bytes and pushes
+every word of them into the ring, so a larger datagram is delivered in full --
+the claim that it consumed only the first frame was wrong.
+
+```bash
+Q900_TX_FRAMES=192 python3 q900_control.py
+```
+
+The reason to want fewer, larger datagrams is interrupt load. At the default the
+radio takes a thousand Ethernet interrupts a second and runs lwIP a thousand
+times, on the same Cortex-M7 that has to meet a 666 us DSP block deadline. The
+cost is that the ring's rate corrector runs once per datagram, so it has
+proportionally less authority, and the repayable schedule debt falls with it;
+above 192 frames the debt bound reaches a single packet, which is why the range
+stops there.
+
+Everything that depends on the geometry is derived rather than written down: the
+slot period, the priming burst, where priming leaves the ring, the debt bound and
+the burst spacing floor. Measured on the wire at 48, 96 and 192 frames -- 1000,
+500 and 250 packets per second -- all three give THD -83 dB, a skirt at 3 to
+10 Hz below -92 dB, no skips, no repeats and a ring estimate on its 32 ms target.
+
 ### Transmitting A Known Tone
 
 `Q900_TX_TONE` synthesises a sine inside the sender instead of reading the

@@ -966,8 +966,27 @@ class NetworkAudioMonitor:
 # will stage, and a payload that must be a whole number of stereo frames -- the
 # word count is derived as `bytes >> 1`, so any length that is not a multiple of
 # 4 permanently shifts the ring's L/R parity.
-NETWORK_TX_PERIOD = 0.001
-NETWORK_TX_PACKET_BYTES = 48 * 2 * 2
+# Datagram geometry. The radio's own media quantum is 48 stereo frames, 192
+# bytes, 1 ms at 48 kHz, and matching it is the safe default. Set
+# Q900_TX_FRAMES to send fewer, larger datagrams instead: the firmware's receive
+# callback stages up to 2560 bytes and pushes every word of them into the ring,
+# so a larger datagram is delivered in full.
+#
+# The reason to want that is interrupt load. At the default the radio takes a
+# thousand Ethernet interrupts a second and runs lwIP a thousand times, on the
+# same Cortex-M7 that has to meet a 666 us DSP block deadline. Halving or
+# quartering the packet rate is the cheapest way to find out whether that load
+# is what smears the transmitted tone. The cost is that the ring's rate
+# corrector runs once per datagram, so it has proportionally less authority.
+#
+# Clamped to 48..192 frames, 1 to 4 ms. Below 48 the datagram is smaller than the
+# radio's own quantum for no benefit; above 192 the corrector gets too few
+# opportunities and the repayable debt falls to a single packet.
+NETWORK_TX_PACKET_FRAMES = min(
+    192, max(48, int(os.environ.get("Q900_TX_FRAMES") or 48))
+)
+NETWORK_TX_PACKET_BYTES = NETWORK_TX_PACKET_FRAMES * 2 * 2
+NETWORK_TX_PERIOD = NETWORK_TX_PACKET_FRAMES / 48_000.0
 NETWORK_TX_MAX_DATAGRAM_BYTES = 2560
 # The radio's transmit ring, transcribed from the firmware so the host's choices
 # below can be derived rather than guessed. Depth is measured in int16 words and
@@ -992,11 +1011,6 @@ NETWORK_TX_PREROLL_PACKETS = 80      # buffered before the transmitter is keyed
 NETWORK_TX_LOW_WATER_PACKETS = 60
 NETWORK_TX_HIGH_WATER_PACKETS = 200  # hard cap on buffered capture
 NETWORK_TX_MAX_CATCHUP_PACKETS = 8
-# Ceiling on schedule debt carried forward after a resync. Debt has to be repaid
-# or the long-run send rate falls below the radio's consume rate and its ring
-# walks down into the duplication region. The useful bound is how far the ring
-# can drain before that happens.
-NETWORK_TX_MAX_DEBT_PACKETS = 16
 # The radio consumes its TX ring only while PTT is asserted -- 0x0803432C tests
 # state[0xAF] and runs either the receive path or the transmit path, never both
 # -- and nothing in the firmware ever resets the ring indices. So whatever depth
@@ -1029,6 +1043,24 @@ NETWORK_TX_BURST_GAP = NETWORK_TX_PERIOD / 4
 NETWORK_TX_PRIME_PACKETS = round(
     RADIO_RING_TARGET_WORDS
     / (NETWORK_TX_PACKET_BYTES // 2 - NETWORK_TX_BURST_GAP * RADIO_CONSUME_WORDS_PER_S)
+)
+# Where that burst actually leaves the ring, which is what every later decision
+# about headroom has to be measured against.
+NETWORK_TX_SETTLED_WORDS = NETWORK_TX_PRIME_PACKETS * (
+    NETWORK_TX_PACKET_BYTES // 2
+) - int(
+    NETWORK_TX_PRIME_PACKETS * NETWORK_TX_BURST_GAP * RADIO_CONSUME_WORDS_PER_S
+)
+# Ceiling on schedule debt carried forward after a resync. Debt has to be repaid
+# or the long-run send rate falls below the radio's consume rate and its ring
+# walks down into the duplication region. The bound is how far the ring can
+# drain before that happens: the headroom between where priming leaves it and
+# the duplication threshold. That is a number of words, so the packet count
+# follows from whatever datagram geometry is in use.
+NETWORK_TX_MAX_DEBT_PACKETS = max(
+    1,
+    (NETWORK_TX_SETTLED_WORDS - RADIO_RING_SHALLOW_WORDS)
+    // (NETWORK_TX_PACKET_BYTES // 2),
 )
 # Rate-conversion servo. The ratio starts from the radio's measured clock, so the
 # servo only has to absorb the host audio clock's own error, and both gains are
@@ -1182,10 +1214,19 @@ def tx_pacing(radio_rate: float) -> tuple[float, float]:
     only arrangement that leaves neither end's buffer drifting. A rate of zero
     means the clock has not been measured yet, so fall back to nominal and
     convert nothing.
+
+    `radio_rate` counts the radio's own 48-frame packets, so its frame rate is
+    48 times that regardless of how many frames we choose to put in a datagram.
+    The period scales with our datagram; the conversion ratio does not, because
+    it is input frames per output frame either way.
     """
     if radio_rate <= 0.0:
         return NETWORK_TX_PERIOD, 1.0
-    return 1.0 / radio_rate, (1.0 / NETWORK_TX_PERIOD) / radio_rate
+    radio_frames_per_second = radio_rate * 48.0
+    return (
+        NETWORK_TX_PACKET_FRAMES / radio_frames_per_second,
+        48_000.0 / radio_frames_per_second,
+    )
 
 
 def resample_ratio(
@@ -4131,19 +4172,22 @@ def self_test() -> None:
     assert len(captured_audio[9:]) == 192
     raw_tx = np.zeros(96, dtype="<i2").tobytes()
     assert len(raw_tx) == 192
-    # A network TX datagram is one 1 ms media frame: 48 interleaved stereo
-    # frames, 96 int16 words, 192 bytes -- the same quantum the radio sends on
-    # RX. Tie the assertion to the captured RX payload so the two directions
-    # cannot silently drift apart again.
+    # The radio's own media quantum is 192 bytes: 48 interleaved stereo frames,
+    # 96 int16 words, 1 ms at 48 kHz. Tie it to the captured RX payload so the
+    # two directions cannot silently drift apart.
     mono_tx = np.arange(48, dtype="<i2")
     stereo_tx = np.repeat(mono_tx, 2)
     assert len(stereo_tx) == 96
     assert len(stereo_tx.tobytes()) == 192 == len(captured_audio[9:])
     assert np.array_equal(stereo_tx[0::2], stereo_tx[1::2])
-    # Pin the TX geometry to the captured RX payload and to the 48 kHz stereo
-    # byte rate. Either identity would have caught the 384-byte/2 ms datagram.
-    assert NETWORK_TX_PACKET_BYTES == 192 == len(captured_audio[9:])
-    assert NETWORK_TX_PACKET_BYTES / NETWORK_TX_PERIOD == 48_000 * 2 * 2
+    # Our datagram defaults to that quantum but may be a multiple of it, so pin
+    # the byte rate rather than the size: whatever the geometry, the stream has
+    # to carry 48 kHz stereo S16LE and nothing else. That identity would have
+    # caught the 384-byte datagram still being paced at 1 ms.
+    assert NETWORK_TX_PACKET_BYTES == NETWORK_TX_PACKET_FRAMES * 4
+    assert abs(NETWORK_TX_PACKET_BYTES / NETWORK_TX_PERIOD - 48_000 * 2 * 2) < 1e-6
+    if NETWORK_TX_PACKET_FRAMES == 48:
+        assert NETWORK_TX_PACKET_BYTES == 192 == len(captured_audio[9:])
     # The firmware derives its word count as `bytes >> 1` and stages at most
     # 2560 bytes, so a datagram must be whole stereo frames and must fit.
     assert NETWORK_TX_PACKET_BYTES % 4 == 0
@@ -4212,7 +4256,7 @@ def self_test() -> None:
         -3_750,
     ]
     tx_ceiling = network_tx_ceiling(9)
-    words = quantize_tx(tone[:48], tx_ceiling)
+    words = quantize_tx(tone[:NETWORK_TX_PACKET_FRAMES], tx_ceiling)
     frames_out = np.repeat(words, 2)
     assert len(frames_out.tobytes()) == NETWORK_TX_PACKET_BYTES
     assert len(frames_out.tobytes()) % 4 == 0
@@ -4515,8 +4559,15 @@ def self_test() -> None:
         ).astype("<i2")
         return np.repeat(mono, 2).tobytes()
 
-    def convert(ratio: float, packets: int, keep: int = 200) -> tuple[bytes, int, int]:
-        """Return (output, frames consumed, frames produced) for a steady ratio."""
+    def convert(
+        ratio: float, packets: int, keep: int = 0
+    ) -> tuple[bytes, int, int]:
+        """Return (output, frames consumed, frames produced) for a steady ratio.
+
+        The working buffer has to hold a whole output packet plus the filter's
+        reach either side of it, so it scales with the datagram geometry.
+        """
+        keep = keep or max(200, frames_per_packet * 3)
         buffer = bytearray()
         supplied = 0
         output = bytearray()
@@ -4589,10 +4640,20 @@ def self_test() -> None:
     assert tx_pacing(0.0) == (NETWORK_TX_PERIOD, 1.0)
     for radio_rate in (999.3, 1_000.0, 1_000.7):
         period, base_ratio = tx_pacing(radio_rate)
-        assert abs(1.0 / period - radio_rate) < 1e-9, radio_rate
+        # The radio's rate counts its own 48-frame packets, so our slot rate is
+        # its frame rate divided by however many frames we put in a datagram.
+        radio_frames = radio_rate * 48.0
+        assert abs(1.0 / period - radio_frames / NETWORK_TX_PACKET_FRAMES) < 1e-9, (
+            radio_rate,
+            period,
+        )
         # One second of host audio must convert to exactly one second of radio
-        # packets, which is what stops either buffer from drifting.
-        assert abs(base_ratio * radio_rate - 1.0 / NETWORK_TX_PERIOD) < 1e-6, radio_rate
+        # frames, which is what stops either buffer from drifting, and that has
+        # to hold independently of the datagram geometry.
+        assert abs(base_ratio * radio_frames - 48_000.0) < 1e-6, radio_rate
+        assert abs(base_ratio * NETWORK_TX_PACKET_FRAMES / period - 48_000.0) < 1e-3, (
+            radio_rate,
+        )
 
     # The servo must push back in the right direction and with a bounded trim.
     # Its error is now smoothed, so a single call barely moves: drive it for a
@@ -4625,7 +4686,9 @@ def self_test() -> None:
     # With the base ratio deliberately wrong, only the servo can stop the buffer
     # from running away. Model consumption arithmetically so this stays quick.
     for host_hz, radio_rate in ((48_024.0, 999.5), (47_976.0, 1_000.6)):
-        emit_period = 1.0 / radio_rate
+        # Derive the slot period the same way the sender does, so this stays
+        # correct whatever datagram geometry is configured.
+        emit_period, _ = tx_pacing(radio_rate)
         depth = float(target)
         trim, smooth = 0.0, (0.0, 0.0)
         deepest, shallowest = depth, depth
