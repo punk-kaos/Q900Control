@@ -966,6 +966,11 @@ class NetworkAudioMonitor:
 # will stage, and a payload that must be a whole number of stereo frames -- the
 # word count is derived as `bytes >> 1`, so any length that is not a multiple of
 # 4 permanently shifts the ring's L/R parity.
+
+# The firmware's receive callback stages at most this much of a datagram and
+# silently discards the rest (0x0806C8CA), so it bounds the geometry below.
+NETWORK_TX_MAX_DATAGRAM_BYTES = 2560
+
 # Datagram geometry. The radio's own media quantum is 48 stereo frames, 192
 # bytes, 1 ms at 48 kHz, and matching it is the safe default. Set
 # Q900_TX_FRAMES to send fewer, larger datagrams instead: the firmware's receive
@@ -974,20 +979,22 @@ class NetworkAudioMonitor:
 #
 # The reason to want that is interrupt load. At the default the radio takes a
 # thousand Ethernet interrupts a second and runs lwIP a thousand times, on the
-# same Cortex-M7 that has to meet a 666 us DSP block deadline. Halving or
-# quartering the packet rate is the cheapest way to find out whether that load
-# is what smears the transmitted tone. The cost is that the ring's rate
-# corrector runs once per datagram, so it has proportionally less authority.
+# same Cortex-M7 that has to meet a 666 us DSP block deadline. Measured off the
+# air, quartering the packet rate to 250/s narrowed the skirt on a transmitted
+# tone by 8 to 9 dB, so that load is real and worth trading against.
 #
-# Clamped to 48..192 frames, 1 to 4 ms. Below 48 the datagram is smaller than the
-# radio's own quantum for no benefit; above 192 the corrector gets too few
-# opportunities and the repayable debt falls to a single packet.
+# Clamped to 48..640 frames, 1 to 13.3 ms. Below 48 the datagram is smaller than
+# the radio's own quantum for no benefit. 640 frames is 2560 bytes, exactly what
+# the firmware's receive callback will stage: one more byte and it truncates the
+# datagram and silently discards the remainder. The cost of going large is that
+# the ring's rate corrector runs once per datagram, so it has proportionally less
+# authority, and the repayable schedule debt falls to a single packet.
 NETWORK_TX_PACKET_FRAMES = min(
-    192, max(48, int(os.environ.get("Q900_TX_FRAMES") or 48))
+    NETWORK_TX_MAX_DATAGRAM_BYTES // 4,
+    max(48, int(os.environ.get("Q900_TX_FRAMES") or 48)),
 )
 NETWORK_TX_PACKET_BYTES = NETWORK_TX_PACKET_FRAMES * 2 * 2
 NETWORK_TX_PERIOD = NETWORK_TX_PACKET_FRAMES / 48_000.0
-NETWORK_TX_MAX_DATAGRAM_BYTES = 2560
 # The radio's transmit ring, transcribed from the firmware so the host's choices
 # below can be derived rather than guessed. Depth is measured in int16 words and
 # one stereo frame is two words.
@@ -4626,7 +4633,7 @@ def self_test() -> None:
     # begins _RESAMPLE_HISTORY frames in, because the filter needs that much
     # history, so compare against the input from there.
     distinct = bytearray()
-    for frame in range(400):
+    for frame in range(frames_per_packet + RESAMPLE_TAPS + 8):
         distinct += int(frame % 1000).to_bytes(2, "little", signed=True)
         distinct += int(-(frame % 1000)).to_bytes(2, "little", signed=True)
     step = resample_stereo(distinct, frames_per_packet, 1.0, 0.0)

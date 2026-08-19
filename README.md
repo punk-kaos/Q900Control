@@ -484,28 +484,37 @@ queue) and `ring` (the depth estimate in ms). A healthy transmission sits in the
 ### Datagram Geometry
 
 `Q900_TX_FRAMES` sets how many stereo frames go in a datagram, clamped to
-48..192, which is 1 to 4 ms at 48 kHz. The default of 48 matches the radio's own
-media quantum. The firmware's receive callback stages up to 2560 bytes and pushes
-every word of them into the ring, so a larger datagram is delivered in full --
-the claim that it consumed only the first frame was wrong.
+48..640, which is 1 to 13.3 ms at 48 kHz. The default of 48 matches the radio's
+own media quantum.
 
 ```bash
-Q900_TX_FRAMES=192 python3 q900_control.py
+Q900_TX_FRAMES=640 python3 q900_control.py
 ```
+
+640 frames is 2560 bytes, exactly what the firmware's receive callback will stage
+(0x0806C8CA): one byte more and it truncates the datagram and silently discards
+the remainder. Within that limit every word is pushed into the ring, so a larger
+datagram is delivered in full -- the claim that only the first frame was consumed
+was wrong.
 
 The reason to want fewer, larger datagrams is interrupt load. At the default the
 radio takes a thousand Ethernet interrupts a second and runs lwIP a thousand
-times, on the same Cortex-M7 that has to meet a 666 us DSP block deadline. The
-cost is that the ring's rate corrector runs once per datagram, so it has
-proportionally less authority, and the repayable schedule debt falls with it;
-above 192 frames the debt bound reaches a single packet, which is why the range
-stops there.
+times, on the same Cortex-M7 that has to meet a 666 us DSP block deadline.
+Measured off the air on a transmitted tone, quartering the packet rate to 250/s
+narrowed the skirt around the carrier by 8 to 9 dB and halved the frequency
+wander. That is the strongest evidence so far about where the remaining roughness
+comes from, and it is not in this application.
 
-Everything that depends on the geometry is derived rather than written down: the
-slot period, the priming burst, where priming leaves the ring, the debt bound and
-the burst spacing floor. Measured on the wire at 48, 96 and 192 frames -- 1000,
-500 and 250 packets per second -- all three give THD -83 dB, a skirt at 3 to
-10 Hz below -92 dB, no skips, no repeats and a ring estimate on its 32 ms target.
+The cost is that the ring's rate corrector runs once per datagram, so it has
+proportionally less authority, and the repayable schedule debt falls with it --
+at 640 frames it is a single packet. Nothing else changes: the slot period, the
+priming burst, where priming leaves the ring, the debt bound and the burst
+spacing floor are all derived from the geometry rather than written down.
+
+Measured on the wire at 48, 96, 192, 320 and 640 frames -- 1000 down to 75
+packets per second -- every geometry gives THD -83 dB, all of the energy within
++-2 Hz of the tone, a skirt below -90 dB, no skips, no repeats and a ring
+estimate inside the corrector's window.
 
 ### Transmitting A Known Tone
 
