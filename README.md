@@ -423,6 +423,35 @@ rather than at the low-water mark itself. Aiming at the mark meant the measured
 depth could never fall below the target, so the error never changed sign and the
 integrator wound up against its limit.
 
+### Capture Latency And Where Capture Runs
+
+Two things about the microphone stream mattered more than anything in the audio
+path itself.
+
+**The latency hint.** Requesting `latency="high"` makes CoreAudio hand over
+several blocks back to back and then nothing for 85 ms. Measured over 20 s on a
+USB input: 764 of 998 callbacks arrived less than 1 ms apart, and 233 gaps
+exceeded 60 ms. Nothing on a 1 ms packet clock absorbs that reliably -- the
+cushion was 60 ms and the radio's ring another 32 ms, so an 85 ms gap was only
+just covered and any jitter punched through as a hole in the transmitted audio.
+Requesting `latency="low"` gives one block every 20.00 ms with a worst case of
+20.24 ms, and measures the device clock as -12 ppm instead of an apparent
++2884 ppm. Transmit capture therefore asks for low latency. Playback streams
+still ask for high, where a deep buffer is what you want.
+
+**Which process it runs in.** Capture now runs inside the sender process rather
+than the GUI. The callback shares a GIL with everything else in its process, and
+in the GUI that includes spectrum and waterfall repaints; the project's own notes
+already identified that paint cost becomes transmit audio quality. There is also
+no longer a queue between capture and pacing, so a block cannot be delayed or
+dropped in transit. The GUI passes the device by name, not index, so the two
+processes cannot disagree about a renumbered device list, and the transmit meter
+reads the level the sender last saw.
+
+With both changes, a twenty second transmission measures zero skips, zero
+repeats, zero discarded blocks, no capture overflows, worst send gap 1.7 ms, and
+a ring estimate sitting exactly on its 32 ms target.
+
 ### Transmit Underruns
 
 When the sender has no audio for a scheduled slot it has two ways to fail, and

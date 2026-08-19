@@ -1310,7 +1310,7 @@ def quantize_tx(mono: np.ndarray, ceiling: int) -> np.ndarray:
 
 
 def udp_audio_sender(
-    audio_queue: mp.Queue,
+    microphone: int | str,
     udp_socket: socket.socket,
     target: tuple[str, int],
     stop: mp.Event,
@@ -1324,8 +1324,28 @@ def udp_audio_sender(
     radio_rate: float = 0.0,
     repeats: mp.Value | None = None,
     ring_depth: mp.Value | None = None,
+    ceiling: int = 3637,
+    level: mp.Value | None = None,
+    clipped: mp.Value | None = None,
+    overflows: mp.Value | None = None,
+    dropped: mp.Value | None = None,
+    failure: mp.Array | None = None,
 ) -> None:
-    """Pace TX audio outside the GUI process and its contended Python GIL."""
+    """Capture and pace transmit audio, both outside the GUI process.
+
+    Capture lives here rather than in the GUI because the microphone callback
+    shares a GIL with whatever else is running in its process, and in the GUI
+    that includes spectrum and waterfall repaints. Measured on the air, the
+    result was a hole in the transmitted audio every few seconds: the callback
+    was delayed long enough to empty a 60 ms cushion. Here the only other work
+    in the process is this pacing loop.
+
+    There is no queue between capture and pacing any more, so a block cannot be
+    delayed or dropped in transit either.
+    """
+    # A tight switch interval keeps the capture callback responsive against the
+    # pacing loop, which wakes a thousand times a second in the same process.
+    sys.setswitchinterval(0.001)
     packet_bytes = NETWORK_TX_PACKET_BYTES
     frames_per_packet = packet_bytes // 4
     packet_words = packet_bytes // 2
@@ -1347,7 +1367,6 @@ def udp_audio_sender(
     ratio_trim = 0.0
     ratio_smooth = (0.0, 0.0)
     preroll_bytes = NETWORK_TX_PREROLL_PACKETS * packet_bytes
-    low_water = NETWORK_TX_LOW_WATER_PACKETS * packet_bytes
     high_water = NETWORK_TX_HIGH_WATER_PACKETS * packet_bytes
 
     # Timebase first, because the send rate limiter below depends on it. Raising
@@ -1380,16 +1399,77 @@ def udp_audio_sender(
         else:
             time.sleep(seconds)
 
+    # Capture lands here. deque.append and popleft are both atomic under the GIL,
+    # so the callback and the pacing loop need no lock between them.
+    incoming: deque[bytes] = deque()
+    dc_blocker = DcBlocker(sample_rate=TransmitAudioRouter.NETWORK_SAMPLE_RATE)
+    # Cap the handover so a stalled pacing loop cannot grow it without bound.
+    # Whole blocks, oldest first, exactly as the cross-process queue used to.
+    max_incoming = NETWORK_TX_HIGH_WATER_PACKETS * packet_bytes
+
+    def capture(indata, frames, timing, status):  # type: ignore[no-untyped-def]
+        if overflows is not None and status.input_overflow:
+            # Samples were lost before they reached us, so the byte stream stays
+            # contiguous and this is a splice rather than a gap: no downstream
+            # counter can see it. In the GUI process this was GIL starvation by
+            # repaints, which is why capture now lives here.
+            overflows.value += 1
+        raw = indata[:, 0]
+        peak = float(np.max(np.abs(raw))) if len(raw) else 0.0
+        if level is not None:
+            level.value = peak
+        if clipped is not None and peak >= 0.98:
+            clipped.value += 1
+        words = quantize_tx(dc_blocker.process(raw), ceiling)
+        incoming.append(np.repeat(words, 2).tobytes())
+        held = sum(len(chunk) for chunk in incoming)
+        while held > max_incoming and incoming:
+            held -= len(incoming.popleft())
+            if dropped is not None:
+                dropped.value += 1
+
+    try:
+        stream = sd.InputStream(
+            device=microphone,
+            samplerate=TransmitAudioRouter.NETWORK_SAMPLE_RATE,
+            blocksize=TransmitAudioRouter.BLOCK_SIZE,
+            channels=1,
+            dtype="float32",
+            # Not "high". A high-latency request makes CoreAudio hand over four
+            # blocks back to back and then nothing for 85 ms: measured over 20 s,
+            # 764 of 998 callbacks arrived less than 1 ms apart and 233 gaps
+            # exceeded 60 ms. No cushion this side of a 1 ms packet clock absorbs
+            # that reliably, and it is what put holes in the transmitted audio
+            # every few seconds. Asking for low latency gives one block every
+            # 20.00 ms with a worst case of 20.24 ms, and measures the device
+            # clock as -12 ppm instead of an apparent +2884.
+            latency="low",
+            callback=capture,
+        )
+        stream.start()
+    except Exception as error:  # noqa: BLE001 - report anything the host refuses
+        if failure is not None:
+            failure.value = f"microphone: {error}".encode()[:255]
+        ready.set()
+        return
+
     pending = bytearray()
+
+    def take_captured() -> None:
+        while incoming:
+            pending.extend(incoming.popleft())
+
+    deadline_preroll = time.monotonic() + NETWORK_TX_READY_TIMEOUT
     while len(pending) < preroll_bytes and not stop.is_set():
-        try:
-            pending.extend(audio_queue.get(timeout=0.05))
-        except queue.Empty:
-            continue
-    # Spawning this process costs a fresh interpreter and a full module import,
-    # which is far longer than the preroll. Report readiness explicitly so the
-    # caller keys the transmitter only once audio can actually leave the host;
-    # a fixed pre-key sleep would either waste latency or open a dead-air gap.
+        take_captured()
+        if time.monotonic() > deadline_preroll:
+            if failure is not None and not len(pending):
+                failure.value = b"microphone delivered no audio"
+            break
+        time.sleep(0.005)
+    # Report readiness explicitly so the caller keys the transmitter only once
+    # audio can actually leave the host; a fixed pre-key sleep would either waste
+    # latency or open a dead-air gap.
     ready.set()
     while not keyed.wait(0.05) and not stop.is_set():
         pass
@@ -1480,28 +1560,12 @@ def udp_audio_sender(
             record_times.write(time.monotonic_ns().to_bytes(8, "little"))
 
     def refill() -> None:
-        """Keep a cushion of captured audio inside this process.
+        """Move captured blocks into the pacing buffer.
 
-        Refilling only once `pending` has run dry migrates the entire buffer
-        across the feeder pipe and leaves the pacer with zero slack: it then has
-        to complete a cross-process read inside a single packet period, once per
-        microphone block, or emit silence. Drain opportunistically instead so
-        the blocking read stays off the steady-state path.
+        Capture is in this process now, so this is a deque handover rather than a
+        cross-process read: there is no pipe to block on and no feeder to race.
         """
-        while len(pending) < low_water:
-            try:
-                pending.extend(audio_queue.get_nowait())
-            except queue.Empty:
-                break
-        if len(pending) < packet_bytes:
-            try:
-                # Capture arrives in 20 ms blocks through a feeder pipe. At
-                # block boundaries get_nowait() can race that feeder and turn
-                # available audio into a false underrun. Wait no longer than
-                # one native packet before substituting silence.
-                pending.extend(audio_queue.get(timeout=period))
-            except queue.Empty:
-                pass
+        take_captured()
 
     def next_payload() -> bytes | None:
         nonlocal resample_phase, ratio_trim, ratio_smooth
@@ -1553,11 +1617,7 @@ def udp_audio_sender(
         # operator is speaking now, and keeping it would put its whole duration
         # into the transmit path as standing latency. This is by design, so it is
         # not counted as a runaway trim.
-        while True:
-            try:
-                pending.extend(audio_queue.get_nowait())
-            except queue.Empty:
-                break
+        take_captured()
         startup_bytes = (
             NETWORK_TX_PRIME_PACKETS + NETWORK_TX_LOW_WATER_PACKETS
         ) * packet_bytes
@@ -1656,6 +1716,12 @@ def udp_audio_sender(
     try:
         transmit()
     finally:
+        # This process owns the capture stream now, so it has to close it.
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:  # noqa: BLE001 - teardown must not mask a real error
+            pass
         if record_stream is not None:
             record_stream.close()
             record_times.close()
@@ -1878,6 +1944,8 @@ class TransmitAudioRouter:
         self._udp_dropped: mp.Value | None = None
         self._udp_repeats: mp.Value | None = None
         self._udp_ring: mp.Value | None = None
+        self._udp_level: mp.Value | None = None
+        self._udp_failure: mp.Array | None = None
         self._udp_ready: mp.Event | None = None
         self._udp_ceiling = 0
         self._udp_compressor = 0
@@ -1955,8 +2023,6 @@ class TransmitAudioRouter:
         ceiling = network_tx_ceiling(compressor)
         self._udp_ceiling = ceiling
         self._udp_compressor = compressor
-        dc_blocker = DcBlocker(sample_rate=self.NETWORK_SAMPLE_RATE)
-        self._udp_queue = self._mp.Queue(maxsize=50)
         self._udp_stop = self._mp.Event()
         self._udp_keyed = self._mp.Event()
         self._udp_packets = self._mp.Value("L", 0, lock=False)
@@ -1969,67 +2035,24 @@ class TransmitAudioRouter:
         self._udp_dropped = self._mp.Value("L", 0, lock=False)
         self._udp_repeats = self._mp.Value("L", 0, lock=False)
         self._udp_ring = self._mp.Value("l", 0, lock=False)
+        self._udp_level = self._mp.Value("d", 0.0, lock=False)
+        self._udp_failure = self._mp.Array("c", 256, lock=False)
         self._udp_ready = self._mp.Event()
 
-        def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
-            if self._udp_overflows and status.input_overflow:
-                # Capture samples were lost before they reached us. The byte
-                # stream stays contiguous, so this is a splice rather than a
-                # gap: no downstream counter can see it, and it reaches the air
-                # as a broadband click. Almost always GIL starvation of this
-                # callback by expensive work elsewhere in the GUI process.
-                self._udp_overflows.value += 1
-            raw = indata[:, 0]
-            with self._level_lock:
-                self._level = float(np.max(np.abs(raw)))
-                self._output_level = self._level
-            if self._udp_clipped and np.any(np.abs(raw) >= 0.98):
-                self._udp_clipped.value += 1
-            # Remove DC and subsonic energy the firmware will not filter for us.
-            pcm = dc_blocker.process(raw)
-            # Scale to the level the radio's TX gain chain expects rather than to
-            # int16 full scale. Sending full scale overdrove the pre-gain that
-            # CAT 0x10 selects and left the radio's ALC in permanent heavy
-            # limiting, which is what made the audio rough.
-            samples = quantize_tx(pcm, ceiling)
-            # Only the first word of each stereo frame is read by the firmware
-            # (0x08039846 takes element 0 and discards element 1). Duplicating
-            # mono keeps the frame geometry the ring consumer requires and makes
-            # a one-word ring misalignment inaudible instead of channel-swapping.
-            payload = np.repeat(samples, 2).tobytes()
-            if self._udp_queue:
-                try:
-                    self._udp_queue.put_nowait(payload)
-                except queue.Full:
-                    # Drop the oldest buffered block so the newest microphone
-                    # audio is never silently lost. Count it: this discards a
-                    # whole 20 ms of audio, which reaches the air as a splice,
-                    # and it used to be the one event on this path that no
-                    # counter could see.
-                    if self._udp_dropped:
-                        self._udp_dropped.value += 1
-                    try:
-                        self._udp_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        self._udp_queue.put_nowait(payload)
-                    except queue.Full:
-                        pass
-
-        self._input_stream = sd.InputStream(
-            device=microphone,
-            samplerate=self.NETWORK_SAMPLE_RATE,
-            blocksize=self.BLOCK_SIZE,
-            channels=1,
-            dtype="float32",
-            latency="high",
-            callback=callback,
-        )
+        # Capture runs inside the sender process, not here. The microphone
+        # callback shares a GIL with everything else in its process, and in this
+        # one that includes spectrum and waterfall repaints; on the air that
+        # showed up as a hole in the transmitted audio every few seconds. Passing
+        # the device by name rather than index also survives the device list
+        # being renumbered between the two processes.
+        try:
+            device_name = sd.query_devices(microphone)["name"]
+        except Exception:  # noqa: BLE001 - fall back to the index we were given
+            device_name = microphone
         self._udp_sender = self._mp.Process(
             target=udp_audio_sender,
             args=(
-                self._udp_queue,
+                device_name,
                 network_audio.socket,
                 target,
                 self._udp_stop,
@@ -2046,12 +2069,17 @@ class TransmitAudioRouter:
                 network_audio.measured_packet_rate,
                 self._udp_repeats,
                 self._udp_ring,
+                ceiling,
+                self._udp_level,
+                self._udp_clipped,
+                self._udp_overflows,
+                self._udp_dropped,
+                self._udp_failure,
             ),
             name="q900-udp-tx",
             daemon=True,
         )
         self._udp_sender.start()
-        self._input_stream.start()
         radio_rate = network_audio.measured_packet_rate
         clock = (
             f", radio clock {radio_rate:.2f} pkt/s"
@@ -2065,6 +2093,9 @@ class TransmitAudioRouter:
         )
         if not self._udp_ready.wait(timeout=NETWORK_TX_READY_TIMEOUT):
             state += " -- sender did not report ready, transmit may start late"
+        problem = bytes(self._udp_failure.value if self._udp_failure else b"")
+        if problem:
+            state += f" -- {problem.decode(errors='replace')}"
         self.signals.audio_state_changed.emit(state)
 
     def start_iq_udp(
@@ -2123,7 +2154,11 @@ class TransmitAudioRouter:
             blocksize=self.BLOCK_SIZE,
             channels=1,
             dtype="float32",
-            latency="high",
+            # Low, not high: a high-latency request makes CoreAudio deliver
+            # several blocks at once and then nothing for 85 ms, which no
+            # cushion on a 1 ms packet clock absorbs. See the capture stream in
+            # udp_audio_sender.
+            latency="low",
             callback=callback,
         )
         self._udp_sender = self._mp.Process(
@@ -2154,7 +2189,10 @@ class TransmitAudioRouter:
         if self._udp_keyed:
             self._udp_keyed.set()
         if self._udp_sender:
-            self._udp_sender.join(timeout=0.5)
+            # It owns the capture stream, so give it long enough to close that
+            # before resorting to terminate: killing it mid-callback leaves the
+            # device claimed and the next transmission cannot open it.
+            self._udp_sender.join(timeout=1.5)
             if self._udp_sender.is_alive():
                 self._udp_sender.terminate()
                 self._udp_sender.join(timeout=0.5)
@@ -2163,6 +2201,8 @@ class TransmitAudioRouter:
         self._udp_stop = None
         self._udp_keyed = None
         self._udp_ready = None
+        self._udp_level = None
+        self._udp_failure = None
         for stream in (self._input_stream, self._output_stream):
             if stream:
                 stream.stop()
@@ -2186,6 +2226,10 @@ class TransmitAudioRouter:
 
     @property
     def level(self) -> float:
+        # Capture lives in the sender process, so the transmit meter reads what
+        # that process last saw rather than a local callback.
+        if self._udp_level is not None:
+            return float(self._udp_level.value)
         with self._level_lock:
             return self._level
 
