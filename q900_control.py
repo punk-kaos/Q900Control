@@ -954,12 +954,21 @@ class NetworkAudioMonitor:
 # One network TX datagram is the radio's native media quantum: 48 interleaved
 # stereo frames, 96 signed 16-bit words, 192 bytes, 1 ms at 48 kHz. That is the
 # payload size the radio itself sends on RX and the size the working I/Q sender
-# uses. A 384-byte 2 ms datagram carries the correct 192 kB/s aggregate and is
-# still wrong: the firmware consumes only the first media frame of a datagram.
-# Every other quantity on this path is expressed in whole packets so the parent
-# and the sender process cannot disagree about the unit again.
+# uses. Every other quantity on this path is expressed in whole packets so the
+# parent and the sender process cannot disagree about the unit again.
+#
+# The firmware's UDP receive callback (0x0806C8A8) pushes every word of a
+# datagram into the ring, so a larger datagram is not truncated as previously
+# recorded here. It is still the wrong choice: the ring's rate corrector runs
+# once per datagram (0x0806C80C), so a longer datagram buys proportionally less
+# correction authority and interacts more coarsely with the radio's 64-word
+# consumer block. The only hard limits are a 2560-byte cap on what the callback
+# will stage, and a payload that must be a whole number of stereo frames -- the
+# word count is derived as `bytes >> 1`, so any length that is not a multiple of
+# 4 permanently shifts the ring's L/R parity.
 NETWORK_TX_PERIOD = 0.001
 NETWORK_TX_PACKET_BYTES = 48 * 2 * 2
+NETWORK_TX_MAX_DATAGRAM_BYTES = 2560
 # The priming burst is drawn from the preroll, so the steady-state buffer is
 # PREROLL - PRIME, not PREROLL. At 40/20 that left 20 packets, exactly one
 # microphone callback, so the buffer emptied on every mic period and a block
@@ -967,10 +976,23 @@ NETWORK_TX_PACKET_BYTES = 48 * 2 * 2
 # slack, and set the low-water mark to the whole cushion so it is held inside
 # the sender process rather than across the capture feeder pipe.
 NETWORK_TX_PREROLL_PACKETS = 80      # buffered before the transmitter is keyed
-NETWORK_TX_PRIME_PACKETS = 20        # unpaced burst into the radio's TX ring
+# The radio's TX ring is 6144 words (64 ms) and its rate corrector only leaves
+# 1536..4608 words (16..48 ms) alone: below that it duplicates a frame on every
+# datagram, above it drops one, 1000 times a second either way. Prime to the
+# centre of that window, not to 20 ms, which sat 4 ms above the duplication
+# threshold and gave any downward drift nowhere to go.
+NETWORK_TX_PRIME_PACKETS = 32        # unpaced burst into the radio's TX ring
 NETWORK_TX_LOW_WATER_PACKETS = 60    # cushion held inside the sender process
 NETWORK_TX_HIGH_WATER_PACKETS = 200  # hard cap on buffered capture
 NETWORK_TX_MAX_CATCHUP_PACKETS = 8
+# Ceiling on schedule debt carried forward after a resync. Debt has to be repaid
+# or the long-run send rate falls below the radio's consume rate and its ring
+# walks down into the duplication region. The useful bound is how far the ring
+# can drain before that happens: from the 3072-word prime point down to the
+# 1536-word threshold is 1536 words, so 16 packets. Falling further behind than
+# that means the firmware has already duplicated frames, and repaying the excess
+# would only add latency without undoing the artifact.
+NETWORK_TX_MAX_DEBT_PACKETS = 16
 # Rate-conversion servo. The ratio starts from the radio's measured clock, so the
 # servo only has to absorb the host audio clock's own error, and both gains are
 # deliberately gentle: the buffer holds tens of milliseconds, so there is no need
@@ -988,6 +1010,50 @@ NETWORK_TX_READY_TIMEOUT = 3.0
 # host-side defect from a radio-side or network-side one: if the recording is
 # clean, nothing above the socket is responsible.
 TX_RECORD_PREFIX = os.environ.get("Q900_TX_RECORD") or None
+
+# Transmit gain staging. The radio does not scale network audio to suit itself:
+# for stream format 1 the conversion at 0x080397BC multiplies by exactly 2**-16,
+# which cancels the ring consumer's `<< 16` and leaves the DSP working with the
+# raw int16 value. Unity. What follows is the radio's own TX gain chain
+# (0x08039898): a pre-gain of `0.5 + 0.5 * state[0x1A0]`, then a per-sample ALC
+# whose knee is 30000.
+#
+# state[0x1A0] is selected by CAT 0x10 (COMPRESSOR): the handler at 0x080585CC
+# stores `state[0x140] = payload - 1` and looks the gain up in the table at
+# 0x080DAF14. So COMPRESSOR is not a ratio, it is a pre-ALC gain of up to 13x.
+# The chain is calibrated for the codec's microphone input, which peaks well
+# below full scale; sending int16 full scale instead drove the default setting
+# (9 => 8.00x) to 262136 against a 30000 knee, 18.8 dB into the limiter, and the
+# ALC then held ~19 dB of gain reduction and modulated it at audio rate. That is
+# what made network transmit audio rough from the first moment of transmission.
+#
+# Indexed by the CAT 0x10 payload, 0..14. Payload 0 leaves state[0x140] negative
+# and 0x080398A4 then bypasses pre-gain and ALC together, so unity with no
+# limiter. Payload 14 selects a runtime value we cannot read, so assume the
+# worst case rather than overdriving.
+TX_PREGAIN_BY_COMPRESSOR = (
+    1.00, 1.00, 1.50, 2.50, 3.50, 4.00, 4.50, 5.50,
+    6.50, 8.00, 9.00, 10.50, 13.00, 13.00, 13.00,
+)
+TX_ALC_THRESHOLD = 30000.0
+# Sit just under the knee. At 1.0 the loudest sample lands exactly on it; less
+# than 1.0 keeps the path linear and predictable, which is what we want while
+# the host has no compressor of its own. Raising this toward and past 1.0 is how
+# you hand dynamics back to the radio.
+TX_LEVEL_MARGIN = 0.97
+
+
+def network_tx_ceiling(compressor: int) -> int:
+    """Peak int16 magnitude to send for a given radio COMPRESSOR setting.
+
+    Chosen so `peak * pregain` lands just below the radio's 30000 ALC knee, which
+    is where the microphone input sits and therefore what the whole TX chain is
+    calibrated for. The radio never reports this setting back, so the caller is
+    passing the host's own record of it.
+    """
+    index = min(max(int(compressor), 0), len(TX_PREGAIN_BY_COMPRESSOR) - 1)
+    ceiling = TX_ALC_THRESHOLD * TX_LEVEL_MARGIN / TX_PREGAIN_BY_COMPRESSOR[index]
+    return int(min(ceiling, 32767.0))
 
 
 def tx_pacing(radio_rate: float) -> tuple[float, float]:
@@ -1056,6 +1122,61 @@ def resample_stereo(
     consumed = int(advance)
     del pending[: consumed * 4]
     return payload, advance - consumed
+
+
+class DcBlocker:
+    """Single-pole DC blocker: y[n] = x[n] - x[n-1] + a*y[n-1].
+
+    The firmware skips one of its TX filter stages when the stream format is 1
+    (0x08039540 returns early), so DC and subsonic energy from the capture device
+    reach the SSB modulator unfiltered. There DC becomes carrier leak and rumble
+    burns headroom in the radio's ALC.
+
+    Evaluated in closed form rather than sample by sample, because a Python loop
+    over 960 samples in the microphone callback would hold the GIL for longer
+    than the DSP is worth. The recursion y[n] = a*y[n-1] + d[n] has the solution
+    y[n] = a**n * (a*y0 + cumsum(d * a**-n)[n]); with `a` this close to 1 the
+    a**-n term only reaches ~12 across a block, so float64 carries it exactly.
+
+    The corner is deliberately far below the voice band: at 300 Hz a 20 Hz
+    single pole costs under 0.01 dB, so this cannot be blamed for thin audio.
+    """
+
+    def __init__(self, cutoff_hz: float = 20.0, sample_rate: int = 48_000) -> None:
+        self._a = float(np.exp(-2.0 * np.pi * cutoff_hz / sample_rate))
+        self._last_input = 0.0
+        self._last_output = 0.0
+
+    def reset(self) -> None:
+        self._last_input = 0.0
+        self._last_output = 0.0
+
+    def process(self, block: np.ndarray) -> np.ndarray:
+        samples = np.asarray(block, dtype=np.float64)
+        if samples.size == 0:
+            return samples.astype(np.float32)
+        a = self._a
+        diff = np.empty_like(samples)
+        diff[0] = samples[0] - self._last_input
+        np.subtract(samples[1:], samples[:-1], out=diff[1:])
+        decay = a ** np.arange(samples.size, dtype=np.float64)
+        out = decay * (a * self._last_output + np.cumsum(diff / decay))
+        self._last_input = float(samples[-1])
+        self._last_output = float(out[-1])
+        return out.astype(np.float32)
+
+
+def quantize_tx(mono: np.ndarray, ceiling: int) -> np.ndarray:
+    """Scale float mono audio to int16 at `ceiling`, rounding rather than truncating.
+
+    `ceiling` is the radio's expected peak, not int16 full scale: see
+    network_tx_ceiling(). Rounding matters because the previous
+    `(pcm * 32767).astype()` truncated toward zero on every sample, which is
+    undithered and correlated with the signal.
+    """
+    scaled = np.asarray(mono, dtype=np.float32) * float(ceiling)
+    np.clip(scaled, -float(ceiling), float(ceiling), out=scaled)
+    return np.rint(scaled).astype("<i2")
 
 
 def udp_audio_sender(
@@ -1199,8 +1320,19 @@ def udp_audio_sender(
                 mach_time = mach_wait = None
         period_ticks = int(period * ticks_per_second)
         deadline = mach_time() if mach_time else time.monotonic()
+        debt_packets = 0
         while not stop.is_set():
             send(next_payload())
+            if debt_packets:
+                # Repay abandoned schedule debt one packet per period. Dropping
+                # it instead makes the long-run send rate lower than the radio's
+                # consume rate, and because nothing on this path can observe the
+                # radio's ring depth, that deficit is never recovered: the ring
+                # walks down past 1536 words and the firmware then duplicates a
+                # frame on every single datagram. Repaying gradually keeps the
+                # ring inside the corrector's dead zone without bursting.
+                send(next_payload())
+                debt_packets -= 1
             if mach_time and mach_wait:
                 deadline += period_ticks
                 mach_wait(deadline)
@@ -1214,25 +1346,41 @@ def udp_audio_sender(
                     # is only safe because refill() keeps a cushion in this
                     # process; with a dry buffer a stale deadline would turn one
                     # delayed wake into a run of audio underruns.
-                    behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
-                    for _ in range(behind):
+                    behind = int(lateness / period)
+                    burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
+                    for _ in range(burst):
                         send(next_payload())
-                    deadline += behind * period_ticks
+                    deadline += burst * period_ticks
                     if (mach_time() - deadline) / ticks_per_second > period:
                         # Further behind than the catch-up bound allows. Resync
-                        # rather than spiral into unbounded schedule debt.
-                        deadline = mach_time()
+                        # rather than spiral into unbounded schedule debt, but
+                        # carry the shortfall so it is repaid above.
+                        now = mach_time()
+                        shortfall = int(
+                            (now - deadline) / ticks_per_second / period
+                        )
+                        debt_packets = min(
+                            debt_packets + max(shortfall, 0),
+                            NETWORK_TX_MAX_DEBT_PACKETS,
+                        )
+                        deadline = now
             else:
                 deadline += period
                 lateness = time.monotonic() - deadline
                 if lateness > 0:
                     late_ms.value = max(late_ms.value, lateness * 1000)
-                    behind = min(int(lateness / period), NETWORK_TX_MAX_CATCHUP_PACKETS)
-                    for _ in range(behind):
+                    behind = int(lateness / period)
+                    burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
+                    for _ in range(burst):
                         send(next_payload())
-                    deadline += behind * period
+                    deadline += burst * period
                     if time.monotonic() - deadline > period:
-                        deadline = time.monotonic()
+                        now = time.monotonic()
+                        debt_packets = min(
+                            debt_packets + max(int((now - deadline) / period), 0),
+                            NETWORK_TX_MAX_DEBT_PACKETS,
+                        )
+                        deadline = now
                 else:
                     time.sleep(-lateness)
 
@@ -1459,6 +1607,8 @@ class TransmitAudioRouter:
         self._udp_send_errors: mp.Value | None = None
         self._udp_overflows: mp.Value | None = None
         self._udp_ready: mp.Event | None = None
+        self._udp_ceiling = 0
+        self._udp_compressor = 0
 
     def start_usb(self, microphone: int, q900_output: int) -> None:
         self.stop()
@@ -1517,9 +1667,23 @@ class TransmitAudioRouter:
         self._input_stream.start()
         self.signals.audio_state_changed.emit("PTT audio: microphone -> Q900 USB speaker/output")
 
-    def start_udp(self, microphone: int, target: tuple[str, int], network_audio: NetworkAudioMonitor) -> None:
+    def start_udp(
+        self,
+        microphone: int,
+        target: tuple[str, int],
+        network_audio: NetworkAudioMonitor,
+        compressor: int = 9,
+    ) -> None:
         self.stop()
         self._udp_target = target
+        # The radio applies a pre-gain of up to 13x before its ALC, selected by
+        # CAT 0x10, and never scales network audio down to compensate. Derive the
+        # peak we may send from that setting. The radio does not report the value
+        # back, so this is the host's own record of it.
+        ceiling = network_tx_ceiling(compressor)
+        self._udp_ceiling = ceiling
+        self._udp_compressor = compressor
+        dc_blocker = DcBlocker(sample_rate=self.NETWORK_SAMPLE_RATE)
         self._udp_queue = self._mp.Queue(maxsize=50)
         self._udp_stop = self._mp.Event()
         self._udp_keyed = self._mp.Event()
@@ -1540,15 +1704,23 @@ class TransmitAudioRouter:
                 # as a broadband click. Almost always GIL starvation of this
                 # callback by expensive work elsewhere in the GUI process.
                 self._udp_overflows.value += 1
-            pcm = np.clip(indata[:, 0], -1, 1)
+            raw = indata[:, 0]
             with self._level_lock:
-                self._level = float(np.max(np.abs(pcm)))
+                self._level = float(np.max(np.abs(raw)))
                 self._output_level = self._level
-            if self._udp_clipped and np.any(np.abs(pcm) >= 0.98):
+            if self._udp_clipped and np.any(np.abs(raw) >= 0.98):
                 self._udp_clipped.value += 1
-            samples = (pcm * 32767).astype("<i2")
-            # Firmware consumes 48 kHz stereo frames from the network ring.
-            # Duplicate mono microphone samples as interleaved L/R words.
+            # Remove DC and subsonic energy the firmware will not filter for us.
+            pcm = dc_blocker.process(raw)
+            # Scale to the level the radio's TX gain chain expects rather than to
+            # int16 full scale. Sending full scale overdrove the pre-gain that
+            # CAT 0x10 selects and left the radio's ALC in permanent heavy
+            # limiting, which is what made the audio rough.
+            samples = quantize_tx(pcm, ceiling)
+            # Only the first word of each stereo frame is read by the firmware
+            # (0x08039846 takes element 0 and discards element 1). Duplicating
+            # mono keeps the frame geometry the ring consumer requires and makes
+            # a one-word ring misalignment inaudible instead of channel-swapping.
             payload = np.repeat(samples, 2).tobytes()
             if self._udp_queue:
                 try:
@@ -1606,7 +1778,8 @@ class TransmitAudioRouter:
         )
         state = (
             f"PTT audio: microphone -> Q900 UDP {target[0]}:{target[1]} "
-            f"(48 kHz stereo S16LE{clock})"
+            f"(48 kHz stereo S16LE{clock}, peak {ceiling} "
+            f"for CMP {compressor} = {TX_PREGAIN_BY_COMPRESSOR[min(max(compressor, 0), 14)]:.2f}x)"
         )
         if not self._udp_ready.wait(timeout=NETWORK_TX_READY_TIMEOUT):
             state += " -- sender did not report ready, transmit may start late"
@@ -1750,7 +1923,8 @@ class TransmitAudioRouter:
         overflows = self._udp_overflows.value if self._udp_overflows else 0
         return (
             f"UDP {packets} pkts  ovf {overflows}  gaps {underruns}  trim {trimmed}  "
-            f"err {errors}  late {late_ms:.1f} ms  clip {clipped}"
+            f"err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
+            f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
         )
 
 
@@ -2885,7 +3059,12 @@ class MainWindow(QMainWindow):
                         self._sdr_tx_invert_q,
                     )
                 else:
-                    self.tx_audio.start_udp(microphone, target, self.network_audio)
+                    self.tx_audio.start_udp(
+                        microphone,
+                        target,
+                        self.network_audio,
+                        self.client.state.compressor,
+                    )
             # Audio must be established before the transmitter is keyed.
             self.client.set_ptt(True)
             self._ptt_source = "gui"
@@ -3022,7 +3201,12 @@ class MainWindow(QMainWindow):
                         self._sdr_tx_invert_q,
                     )
                 else:
-                    self.tx_audio.start_udp(microphone, target, self.network_audio)
+                    self.tx_audio.start_udp(
+                        microphone,
+                        target,
+                        self.network_audio,
+                        self.client.state.compressor,
+                    )
             else:
                 output = self.tx_output.currentData()
                 if output is None:
@@ -3548,6 +3732,82 @@ def self_test() -> None:
     # byte rate. Either identity would have caught the 384-byte/2 ms datagram.
     assert NETWORK_TX_PACKET_BYTES == 192 == len(captured_audio[9:])
     assert NETWORK_TX_PACKET_BYTES / NETWORK_TX_PERIOD == 48_000 * 2 * 2
+    # The firmware derives its word count as `bytes >> 1` and stages at most
+    # 2560 bytes, so a datagram must be whole stereo frames and must fit.
+    assert NETWORK_TX_PACKET_BYTES % 4 == 0
+    assert NETWORK_TX_PACKET_BYTES <= NETWORK_TX_MAX_DATAGRAM_BYTES
+
+    # Transmit gain staging. The radio multiplies network audio by a pre-gain of
+    # up to 13x (CAT 0x10 -> state[0x140] -> table at 0x080DAF14) before an ALC
+    # whose knee is 30000, and never scales it down to compensate. Sending int16
+    # full scale at the default CMP 9 drove 8x into that knee: 18.8 dB of
+    # permanent limiting, which is what made transmit audio rough.
+    assert len(TX_PREGAIN_BY_COMPRESSOR) == 15
+    assert TX_PREGAIN_BY_COMPRESSOR[0] == TX_PREGAIN_BY_COMPRESSOR[1] == 1.00
+    assert TX_PREGAIN_BY_COMPRESSOR[9] == 8.00
+    assert TX_PREGAIN_BY_COMPRESSOR[12] == 13.00
+    for cmp_value in range(15):
+        ceiling = network_tx_ceiling(cmp_value)
+        assert 0 < ceiling <= 32767, (cmp_value, ceiling)
+        # Whatever the setting, what the radio's ALC sees must land under its
+        # knee. This is the invariant the old full-scale path violated.
+        assert (
+            ceiling * TX_PREGAIN_BY_COMPRESSOR[cmp_value] <= TX_ALC_THRESHOLD
+        ), (cmp_value, ceiling)
+    # Out-of-range settings must clamp, never index past the table.
+    assert network_tx_ceiling(-5) == network_tx_ceiling(0)
+    assert network_tx_ceiling(99) == network_tx_ceiling(14)
+    # The default setting must no longer produce a full-scale stream.
+    assert network_tx_ceiling(9) < 32767 // 4
+
+    # The DC blocker is evaluated in closed form to keep the microphone callback
+    # off a per-sample Python loop. It must match the recursion it replaces, and
+    # must stay continuous across block boundaries: a discontinuity there is a
+    # click at the block rate, which is exactly the class of defect that the
+    # carried-state convolution elsewhere in this file was added to fix.
+    def dc_reference(samples: np.ndarray, a: float) -> np.ndarray:
+        out = np.empty(len(samples), dtype=np.float64)
+        last_in = last_out = 0.0
+        for i, value in enumerate(samples):
+            last_out = float(value) - last_in + a * last_out
+            last_in = float(value)
+            out[i] = last_out
+        return out
+
+    rng = np.random.default_rng(1)
+    signal = rng.standard_normal(2048).astype(np.float32) * 0.25 + 0.4
+    blocker = DcBlocker()
+    blocked = np.concatenate(
+        [blocker.process(signal[start : start + 512]) for start in range(0, 2048, 512)]
+    )
+    assert np.allclose(blocked, dc_reference(signal, blocker._a), atol=2e-5)
+    # A constant input must decay to nothing, and the removal must not eat the
+    # voice band: a 20 Hz single pole is under 0.1 dB down at 300 Hz.
+    steady = DcBlocker()
+    steady.process(np.full(48_000, 0.5, dtype=np.float32))
+    assert abs(float(steady.process(np.full(4_800, 0.5, dtype=np.float32))[-1])) < 1e-3
+    tone_n = np.arange(48_000)
+    tone = np.sin(2.0 * np.pi * 300.0 * tone_n / 48_000).astype(np.float32)
+    passed = DcBlocker().process(tone)[24_000:]
+    assert 0.99 < float(np.max(np.abs(passed))) <= 1.0, float(np.max(np.abs(passed)))
+
+    # quantize_tx must round rather than truncate, must honour the ceiling, and
+    # must never emit int16 full scale when the ceiling is lower.
+    assert quantize_tx(np.array([0.5], dtype=np.float32), 30_000)[0] == 15_000
+    assert quantize_tx(np.array([1.0 / 3.0], dtype=np.float32), 10)[0] == 3
+    assert quantize_tx(np.array([2.0, -2.0], dtype=np.float32), 3_750).tolist() == [
+        3_750,
+        -3_750,
+    ]
+    tx_ceiling = network_tx_ceiling(9)
+    words = quantize_tx(tone[:48], tx_ceiling)
+    frames_out = np.repeat(words, 2)
+    assert len(frames_out.tobytes()) == NETWORK_TX_PACKET_BYTES
+    assert len(frames_out.tobytes()) % 4 == 0
+    assert np.array_equal(frames_out[0::2], frames_out[1::2])
+    assert int(np.max(np.abs(frames_out))) <= tx_ceiling
+    assert int(np.max(np.abs(frames_out))) < 32767
+
     # The sender must start with more than it holds back, and must never be
     # asked to hold back more than the hard cap allows.
     assert (
@@ -3556,6 +3816,21 @@ def self_test() -> None:
         <= NETWORK_TX_HIGH_WATER_PACKETS
     )
     assert NETWORK_TX_PRIME_PACKETS <= NETWORK_TX_PREROLL_PACKETS
+    # The radio's ring corrector leaves 1536..4608 words alone and duplicates or
+    # drops a frame on every datagram outside that. Prime into the middle of the
+    # window so drift in either direction has room, rather than sitting just
+    # above the duplication threshold as the 20-packet burst did.
+    prime_words = NETWORK_TX_PRIME_PACKETS * NETWORK_TX_PACKET_BYTES // 2
+    assert 1536 < prime_words < 4608, prime_words
+    assert abs(prime_words - (1536 + 4608) // 2) <= NETWORK_TX_PACKET_BYTES // 2
+    # Debt is incurred by falling behind, which drains the ring, so the bound is
+    # the drain headroom between the prime point and the duplication threshold.
+    # Beyond that the firmware has already duplicated frames and repaying only
+    # adds latency.
+    assert (
+        NETWORK_TX_MAX_DEBT_PACKETS * NETWORK_TX_PACKET_BYTES // 2
+        <= prime_words - 1536
+    ), NETWORK_TX_MAX_DEBT_PACKETS
     # The priming burst is drawn from the preroll, so the steady-state cushion is
     # the difference, not the preroll itself. It must cover more than a single
     # microphone callback or the buffer bottoms out every mic period and any

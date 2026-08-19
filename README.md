@@ -116,14 +116,23 @@ opposite fixes, and the timestamps tell them apart: a starved reader leaves an
 otherwise evenly paced stream interrupted by stalls, whereas a grouping radio
 produces almost no evenly paced intervals at all.
 
+The Q900 is a grouping radio, and this is by design rather than a fault. Its DSP
+runs 32-sample blocks at 48 kHz, so 1500 blocks per second, each pushing 64
+words into a ring from which the sender emits one 96-word packet whenever 96
+words are available. Two packets therefore leave for every three blocks, and the
+gaps alternate between roughly 0.667 ms and 1.333 ms while averaging exactly
+1.000 ms. A rate estimator that treats that alternation as jitter rather than
+structure will misread the clock.
+
 This matters because nothing rate-matches the two ends. The radio runs UHSDR on
-an STM32H7 whose codec is clocked by the radio's own crystal, and neither its
-firmware nor this application resamples. Transmit audio is paced from the host
-clock at 1000 packets per second. Any difference between the two accumulates in
-the radio's transmit ring until it slips a frame, and each slip is a
-discontinuity that reaches the air as a broadband click. A steady offset of a few
-hundred ppm produces a click every few seconds; larger offsets produce an audible
-tapping.
+an STM32H7 whose codec is clocked by the radio's own crystal, and its firmware
+does not resample. Transmit audio is paced from the radio's measured clock when
+one is available, and the host stream is rate-converted to it; without a
+measurement it falls back to a nominal 1000 packets per second. Any residual
+difference accumulates in the radio's transmit ring until it leaves the range
+its corrector tolerates, after which the firmware duplicates or drops a frame on
+every datagram until the depth returns.
+
 
 A reading near `+0 ppm` rules that mechanism out. A reading of hundreds of ppm or
 more means transmit audio has to be paced from the radio's clock rather than the
@@ -335,9 +344,59 @@ A5 A5 A5 A5 | length | command | payload | CRC-16/CCITT-FALSE (big-endian)
 
 Network RX/TX audio uses UDP port `8000`. The radio-to-PC packets are Q900
 framed: a nine-byte header whose fifth byte is the stream type (`0x67` audio,
-`0x68` I/Q), followed by a 192-byte payload. PC-to-radio payloads are raw
-stereo PCM16LE without an application header, but use the same 192-byte
-payload size and 1 ms cadence. Sending a larger datagram at a
-proportionally slower rate delivers the correct aggregate byte rate and is
-still wrong: the firmware consumes only the first media frame of each
-datagram and discards the remainder.
+`0x68` I/Q) and whose bytes 5..8 are the radio's device ID word, followed by a
+192-byte payload. PC-to-radio payloads are raw stereo PCM16LE without an
+application header, using the same 192-byte payload size and 1 ms cadence.
+
+The radio will only accept a datagram whose **source port is also 8000** and
+whose source address matches its configured `REMOTE_IP`: the firmware calls
+`udp_connect` on its media socket, so lwIP drops anything else before the
+application sees it. Payload length must be a whole number of stereo frames,
+because the word count is derived as `bytes >> 1` and an odd word count
+permanently shifts the ring's left/right parity. At most 2560 bytes of a
+datagram are staged.
+
+Only the **first word of each stereo frame is used** for audio. The firmware
+takes element 0 and discards element 1, so the duplicated right channel exists
+only to satisfy the ring consumer's frame geometry.
+
+A larger datagram at a proportionally slower rate is not truncated -- the
+receive callback pushes every staged word into the ring -- but it is still the
+wrong choice, because the ring's rate corrector runs once per datagram and a
+longer datagram therefore buys proportionally less correction authority.
+
+### Transmit Level
+
+The radio does not scale network audio to suit itself. For stream format 1 the
+conversion applies exactly `2**-16`, which cancels the ring consumer's `<< 16`
+and leaves the DSP working with the raw int16 value: unity. What follows is the
+radio's own TX gain chain, a pre-gain of `0.5 + 0.5 * state[0x1A0]` and then a
+per-sample ALC whose knee is 30000.
+
+`state[0x1A0]` is selected by CAT `0x10`, the setting labelled COMPRESSOR. It is
+not a ratio; it is a pre-ALC gain of up to 13x, looked up from a table in the
+firmware. That chain is calibrated for the codec's microphone input, which peaks
+well below full scale. Sending int16 full scale instead drove the default
+setting (`9`, a gain of 8.00x) to 262136 against a 30000 knee -- 18.8 dB into
+the limiter -- and the ALC then held roughly 19 dB of gain reduction and
+modulated it at audio rate. That was audible as rough transmit audio with a
+pumping background, from the first moment of transmission rather than
+progressively.
+
+The application therefore derives its peak from the COMPRESSOR setting so that
+`peak * pregain` lands just under the knee, and reports it in the audio status
+line as `peak N/CMP M`. The radio never reports this setting back, so the value
+used is the application's own record of it: if the radio's compressor has been
+changed from the front panel, set it from the host as well or the level will be
+wrong by the ratio of the two gains.
+
+### Transmit Ring
+
+The radio's transmit ring holds 6144 words, 64 ms at 48 kHz stereo. Its rate
+corrector leaves 1536..4608 words (16..48 ms) alone; below that it duplicates a
+frame on every datagram and above it drops one, a thousand times a second in
+either direction. Transmit priming therefore aims for the centre of that window,
+and schedule debt after a late wake is repaid rather than discarded, because
+nothing on this path can observe the ring depth: no CAT command reports it, and
+the firmware's own depth and underflow counters are written but never read.
+
