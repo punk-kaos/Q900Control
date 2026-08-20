@@ -474,18 +474,29 @@ the number of dB being thrown away.
 
 ### Status Lines
 
-The transmit and receive status lines are ordered by diagnostic priority rather
-than by convenience, because they are elided to whatever width their row can
-spare: the drive figure and anything actually wrong come first, so they are
-readable without hovering, and the steady-state volume trails.
+The bottom rows carry status, not diagnostics. The transmit row reads
+`MIC 88%  TX 91%  alc +5.5dB limiting` and the receive row reads
+`Q900 framed S16LE stereo`. Every counter -- packets, ovf, drop, skip, rep, ring,
+late, trim, err, clip, clock rate, drift, breaks, stalls, drops -- is on the
+tooltip.
 
-The transmit line's seven fault counters collapse to whichever are non-zero, and
-read `clean` when none are. Printing `ovf 0  drop 0  skip 0  rep 0  trim 0
-err 0  clip 0` spent about forty characters saying that nothing had happened and
-pushed the figures that do change out of view. `clean` keeps the absence
-explicit, so a quiet line still distinguishes healthy from not-yet-reporting.
+The drive figure stays in the row because it is a level meter rather than debug
+output: it is the difference between full output and quietly transmitting 13 dB
+down, which should not need a hover to notice.
 
-Hovering any status label gives the untruncated string.
+When any fault counter is non-zero the row gains the word `faults`. It is a flag
+and not a count, so a fault cannot pass unnoticed merely because the numbers moved
+to the tooltip, and the row does not change width as the numbers grow.
+
+The tooltip repeats the row only when the row was truncated. It has two jobs --
+completing a row that did not fit and expanding on one that did -- and doing both
+unconditionally showed the same reading twice. Within the tooltip, anomalies lead
+and the steady-state volume trails, because it is read top-down when something
+looks wrong. The transmit detail collapses its seven fault counters to whichever
+are non-zero and reads `clean` when none are: printing `ovf 0  drop 0  skip 0
+rep 0  trim 0  err 0  clip 0` spent about forty characters to say that nothing had
+happened. Blanking a row clears its tooltip with it, so a reading cannot outlive
+the stream it described.
 
 These labels cannot resize the window, and that is deliberate. A QLabel with word
 wrap off reports its full text width as its *minimum* size hint, and the main

@@ -1086,16 +1086,29 @@ class NetworkAudioMonitor:
             return self._clock_run()[0]
 
     @property
+    def summary(self) -> str:
+        """What belongs in the audio row: the stream format, and whether to look.
+
+        Packet counts, clock rate and drift are diagnostic detail rather than
+        status, so they move to the tooltip. "faults" is a flag rather than a count,
+        so a stream that is dropping audio or losing clock cannot look healthy just
+        because the numbers left the row.
+        """
+        with self._stats_lock:
+            if not self._packet_count:
+                return "UDP waiting"
+            troubled = bool(self.underflows or self._clock_gaps or self._clock_outliers)
+            return f"{self._format}  faults" if troubled else self._format
+
+    @property
     def status(self) -> str:
+        """The full detail, for the tooltip."""
         with self._stats_lock:
             if not self._packet_count:
                 return "UDP waiting"
             drops = self.underflows
-            # Anomaly counters lead, and the steady-state volume trails. This line
-            # is elided to whatever width the row can spare, so the order is the
-            # priority order: something that is wrong has to be visible without
-            # hovering for the tooltip. All three of these are absent while clean,
-            # so leading with them costs nothing in the normal case.
+            # Anomalies lead and the steady-state volume trails, because the tooltip
+            # is read top-down when something looks wrong.
             underflows = f"drops {drops}  " if drops else ""
             gaps = f"breaks {self._clock_gaps}  " if self._clock_gaps else ""
             if self._clock_outliers:
@@ -2616,53 +2629,64 @@ class TransmitAudioRouter:
         with self._level_lock:
             return self._output_level
 
-    @property
-    def network_status(self) -> str:
-        packets = self._udp_packets.value if self._udp_packets else 0
-        underruns = self._udp_underruns.value if self._udp_underruns else 0
-        late_ms = self._udp_late_ms.value if self._udp_late_ms else 0.0
-        clipped = self._udp_clipped.value if self._udp_clipped else 0
-        trimmed = self._udp_trimmed.value if self._udp_trimmed else 0
-        errors = self._udp_send_errors.value if self._udp_send_errors else 0
-        overflows = self._udp_overflows.value if self._udp_overflows else 0
-        dropped = self._udp_dropped.value if self._udp_dropped else 0
-        repeats = self._udp_repeats.value if self._udp_repeats else 0
-        ring = self._udp_ring.value if self._udp_ring else 0
+    def _alc_text(self) -> str:
+        """The drive level against the radio's ALC knee.
+
+        Reported against the knee rather than against our own ceiling, because a
+        clip count of zero cannot distinguish a healthy signal from one that never
+        came close to full output, and only the latter costs transmit power.
+        """
         headroom = alc_headroom_db(self.level, self._udp_ceiling, self._udp_compressor)
-        # Report against the knee rather than against our own ceiling. "clip 0"
-        # alone cannot distinguish a healthy signal from one that never got near
-        # full output, and only the latter costs transmit power.
         if headroom == float("-inf"):
-            alc = "alc idle"
-        elif headroom >= 0.0:
-            alc = f"alc +{headroom:.1f}dB limiting"
-        else:
-            alc = f"alc {headroom:.1f}dB UNDER"
-        # Ordered by diagnostic priority, because the row elides this to whatever
-        # width it can spare: the drive figure and anything actually wrong have to
-        # be readable without hovering for the tooltip.
-        #
-        # The seven fault counters are collapsed to the ones that are non-zero.
-        # Printing "ovf 0  drop 0  skip 0  rep 0  trim 0  err 0  clip 0" spent
-        # about forty characters of a limited budget to say that nothing happened,
-        # which pushed the figures that do change out of view. "clean" keeps the
-        # absence explicit, so a quiet line still distinguishes healthy from
-        # not-yet-reporting.
-        faults = " ".join(
+            return "alc idle"
+        if headroom >= 0.0:
+            return f"alc +{headroom:.1f}dB limiting"
+        return f"alc {headroom:.1f}dB UNDER"
+
+    def _fault_text(self) -> str:
+        """Non-zero fault counters only, or "" when there are none.
+
+        Printing "ovf 0  drop 0  skip 0  rep 0  trim 0  err 0  clip 0" spent about
+        forty characters to say that nothing had happened, and buried the figures
+        that do move.
+        """
+        return " ".join(
             f"{name} {count}"
             for name, count in (
-                ("ovf", overflows),
-                ("drop", dropped),
-                ("skip", underruns),
-                ("rep", repeats),
-                ("trim", trimmed),
-                ("err", errors),
-                ("clip", clipped),
+                ("ovf", self._udp_overflows.value if self._udp_overflows else 0),
+                ("drop", self._udp_dropped.value if self._udp_dropped else 0),
+                ("skip", self._udp_underruns.value if self._udp_underruns else 0),
+                ("rep", self._udp_repeats.value if self._udp_repeats else 0),
+                ("trim", self._udp_trimmed.value if self._udp_trimmed else 0),
+                ("err", self._udp_send_errors.value if self._udp_send_errors else 0),
+                ("clip", self._udp_clipped.value if self._udp_clipped else 0),
             )
             if count
         )
+
+    @property
+    def network_summary(self) -> str:
+        """What belongs in the transmit row: the drive level, and whether to look.
+
+        The counters live on the tooltip instead. They are diagnostic detail and
+        reading them was never the job of a status bar. The drive figure stays,
+        because it is a level meter rather than debug output -- it is the difference
+        between full output and quietly transmitting 13 dB down, which is not
+        something to find out by hovering.
+
+        "faults" is a flag rather than a count, so a fault cannot pass unnoticed
+        merely because the numbers moved out of the row.
+        """
+        return f"{self._alc_text()}  faults" if self._fault_text() else self._alc_text()
+
+    @property
+    def network_status(self) -> str:
+        """The full detail, for the tooltip and for recordings."""
+        packets = self._udp_packets.value if self._udp_packets else 0
+        late_ms = self._udp_late_ms.value if self._udp_late_ms else 0.0
+        ring = self._udp_ring.value if self._udp_ring else 0
         return (
-            f"{alc}  {faults or 'clean'}  "
+            f"{self._alc_text()}  {self._fault_text() or 'clean'}  "
             f"ring {ring / 96.0:.0f}ms  late {late_ms:.1f} ms  UDP {packets} pkts  "
             f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
             f"{'/digital' if self._udp_digital else '/voice'}"
@@ -3184,6 +3208,8 @@ class ElidedLabel(QLabel):
     def __init__(self, text: str = "", minimum_width: int = 80) -> None:
         super().__init__()
         self._full = text
+        self._detail = ""
+        self._elided = False
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         # A constant floor, so it cannot ratchet: the defect was a minimum that
         # tracked the text, not a minimum as such. Without it a crowded row hands
@@ -3194,8 +3220,27 @@ class ElidedLabel(QLabel):
 
     def setText(self, text: str) -> None:  # noqa: N802 - Qt's casing
         self._full = text
-        self.setToolTip(text)
         self._apply()
+        self._sync_tooltip()
+
+    def set_detail(self, detail: str) -> None:
+        """Attach detail that belongs on hover rather than in the row.
+
+        Kept apart from the displayed text so the bar can stay readable while the
+        numbers behind it stay reachable. Deleting them outright would have meant
+        losing the measurements that the last several fixes depended on.
+        """
+        self._detail = detail
+        self._sync_tooltip()
+
+    def _sync_tooltip(self) -> None:
+        # The row text is repeated only when it did not fit, since the tooltip has
+        # two jobs -- completing a truncated row and expanding on a complete one --
+        # and doing both unconditionally shows the same reading twice.
+        parts = [self._full] if self._elided or not self._detail else []
+        if self._detail:
+            parts.append(self._detail)
+        self.setToolTip("\n\n".join(part for part in parts if part))
 
     def full_text(self) -> str:
         """The text as set, since text() returns whatever survived elision."""
@@ -3206,11 +3251,13 @@ class ElidedLabel(QLabel):
         # eliding to the outer width would let the tail run under it.
         available = self.contentsRect().width()
         if available <= 0:
+            self._elided = False
             super().setText(self._full)
             return
         elided = self.fontMetrics().elidedText(
             self._full, Qt.TextElideMode.ElideRight, available
         )
+        self._elided = elided != self._full
         super().setText(elided)
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt's casing
@@ -3218,6 +3265,9 @@ class ElidedLabel(QLabel):
         # Re-eliding cannot resize this widget, because the policy above means its
         # hint is ignored, so this does not recurse.
         self._apply()
+        # Resizing can start or stop truncating the row, which changes whether the
+        # tooltip needs to repeat it.
+        self._sync_tooltip()
 
 
 class Meter(QWidget):
@@ -3609,6 +3659,7 @@ class MainWindow(QMainWindow):
         # releasing the media port is the only way to hand the audio elsewhere.
         self._audio_wanted = True
         self._last_ptt_network_status = ""
+        self._last_ptt_network_summary = ""
         self._sdr_active = False
         self._sdr_switch_pending = False
         self._sdr_restore_pending = False
@@ -4165,11 +4216,14 @@ class MainWindow(QMainWindow):
         except (ConnectionError, OSError, serial.SerialException):
             pass
         if self.client.state.transport == "TCP":
+            # Read before stop(), which discards the counters.
             self._last_ptt_network_status = self.tx_audio.network_status
+            self._last_ptt_network_summary = self.tx_audio.network_summary
         self.tx_audio.stop()
         self._ptt_source = None
         self._ptt_meter_timer.stop()
-        self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_status}")
+        self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_summary}")
+        self.ptt_level.set_detail(self._last_ptt_network_status)
         self.ptt_button.setText("Hold To Talk")
         self.ptt_button.setStyleSheet(
             "background: #132535; border: 1px solid #3689a3; border-radius: 10px; "
@@ -4370,10 +4424,12 @@ class MainWindow(QMainWindow):
     def update_ptt_meter(self) -> None:
         level = min(1.0, getattr(self.tx_audio, "level", 0.0))
         output_level = min(1.0, getattr(self.tx_audio, "output_level", 0.0))
-        status = self.tx_audio.network_status if self.client.state.transport == "TCP" else ""
+        network = self.client.state.transport == "TCP"
+        summary = self.tx_audio.network_summary if network else ""
         self.ptt_level.setText(
-            f"MIC {round(level * 100):d}%  TX {round(output_level * 100):d}%  {status}"
+            f"MIC {round(level * 100):d}%  TX {round(output_level * 100):d}%  {summary}"
         )
+        self.ptt_level.set_detail(self.tx_audio.network_status if network else "")
 
     def toggle_audio(self) -> None:
         if self.audio.running or self.network_audio.running:
@@ -4381,7 +4437,7 @@ class MainWindow(QMainWindow):
             self.audio.stop()
             self.network_audio.stop()
             self._network_audio_timer.stop()
-            self.network_audio_status.setText("")
+            self._clear_network_audio_status()
             self.audio_button.setText("Start Audio")
             if self.client.state.transport == "TCP":
                 self.status.setText(
@@ -4412,12 +4468,22 @@ class MainWindow(QMainWindow):
     def show_audio_state(self, message: str) -> None:
         self.status.setText(message)
 
+    def _clear_network_audio_status(self) -> None:
+        """Blank the row and the tooltip together.
+
+        Clearing only the text would leave the last reading reachable on hover
+        after the stream it described had stopped.
+        """
+        self.network_audio_status.setText("")
+        self.network_audio_status.set_detail("")
+
     def update_network_audio_status(self) -> None:
         if self.network_audio.running:
-            self.network_audio_status.setText(self.network_audio.status)
+            self.network_audio_status.setText(self.network_audio.summary)
+            self.network_audio_status.set_detail(self.network_audio.status)
         else:
             self._network_audio_timer.stop()
-            self.network_audio_status.setText("")
+            self._clear_network_audio_status()
 
     def toggle_sdr(self) -> None:
         if self._sdr_active:
@@ -4582,7 +4648,7 @@ class MainWindow(QMainWindow):
             self.client.disconnect()
             self.network_audio.stop()
             self._network_audio_timer.stop()
-            self.network_audio_status.setText("")
+            self._clear_network_audio_status()
             self.audio_button.setText("Start Audio")
         elif self.transport.currentIndex() == 1:
             port = self.serial_port.currentData()
@@ -4814,7 +4880,7 @@ class MainWindow(QMainWindow):
         if not state.connected and not state.listening and self.network_audio.running:
             self.network_audio.stop()
             self._network_audio_timer.stop()
-            self.network_audio_status.setText("")
+            self._clear_network_audio_status()
             self.audio_button.setText("Start Audio")
 
     def show_error(self, message: str) -> None:
@@ -4941,9 +5007,7 @@ def _check_elided_labels() -> None:
     assert label.text() == long_text, label.text()
     host.close()
 
-    # The transmit line leads with the drive figure and any fault, because it gets
-    # elided: those must survive a narrow row, and the quiet case must still say
-    # something rather than read as absent.
+    # The row shows the drive level and nothing else; the counters belong on hover.
     router = TransmitAudioRouter(RadioSignals())
     router._udp_ceiling = tx_ceiling(9, True)
     router._udp_compressor = 9
@@ -4954,12 +5018,52 @@ def _check_elided_labels() -> None:
             self.value = value
 
     router._udp_level = _Value(0.222)
-    assert router.network_status.startswith("alc ")
-    assert "clean" in router.network_status
+    summary = router.network_summary
+    assert summary.startswith("alc "), summary
+    # The drive figure survives, because it is a level meter: it distinguishes full
+    # output from transmitting 13 dB down, which should not need a hover.
+    assert "limiting" in summary or "UNDER" in summary, summary
+    # No counter reaches the row.
+    for noise in ("UDP", "pkts", "ring", "late", "peak", "CMP", "clean"):
+        assert noise not in summary, (noise, summary)
+    detail = router.network_status
+    for kept in ("UDP", "ring", "late", "peak", "CMP", "clean"):
+        assert kept in detail, (kept, detail)
+
+    # A fault must not be able to hide just because the counts left the row.
     router._udp_underruns = _Value(12)
-    faulty = router.network_status
-    assert "clean" not in faulty
-    assert faulty.index("skip 12") < faulty.index("UDP"), faulty
+    faulty = router.network_summary
+    assert "faults" in faulty, faulty
+    assert "12" not in faulty, "the flag reports that there is a fault, not how many"
+    assert "skip 12" in router.network_status
+    assert "clean" not in router.network_status
+    # And it must go away again once the counter is clear.
+    router._udp_underruns = _Value(0)
+    assert "faults" not in router.network_summary
+
+    # The label keeps text and detail apart. The tooltip has two jobs -- expanding
+    # on a row that fits, and completing one that does not -- so it repeats the row
+    # only when the row was truncated, or the same reading appears twice.
+    pair = ElidedLabel("alc +5.5dB limiting")
+    pair.set_detail("UDP 5 pkts  ring 3120ms")
+    assert pair.full_text() == "alc +5.5dB limiting"
+    assert pair.toolTip() == "UDP 5 pkts  ring 3120ms", pair.toolTip()
+    pair.set_detail("")
+    assert pair.toolTip() == "alc +5.5dB limiting"
+
+    pair_host = QWidget()
+    pair_row = QHBoxLayout(pair_host)
+    pair_row.addWidget(pair, 1)
+    pair_host.resize(120, 40)
+    pair_host.show()
+    application.processEvents()
+    pair.setText("alc +5.5dB limiting and a good deal more text than will ever fit")
+    pair.set_detail("UDP 5 pkts  ring 3120ms")
+    application.processEvents()
+    assert pair.text().endswith("\u2026"), pair.text()
+    assert pair.full_text() in pair.toolTip(), pair.toolTip()
+    assert "UDP 5 pkts" in pair.toolTip(), pair.toolTip()
+    pair_host.close()
 
 
 def ui_self_test() -> int:
