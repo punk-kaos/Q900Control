@@ -3622,6 +3622,13 @@ class MainWindow(QMainWindow):
         self._network_audio_timer = QTimer(self)
         self._network_audio_timer.setInterval(500)
         self._network_audio_timer.timeout.connect(self.update_network_audio_status)
+        # A window wider than the display cannot be corrected after the fact, so
+        # the only useful response is to say which widget is responsible.
+        self._width_reported = 0
+        self._width_timer = QTimer(self)
+        self._width_timer.setInterval(1000)
+        self._width_timer.timeout.connect(self._check_width)
+        self._width_timer.start()
         self._sdr_switch_timer = QTimer(self)
         self._sdr_switch_timer.setSingleShot(True)
         self._sdr_switch_timer.timeout.connect(self.sdr_switch_timeout)
@@ -3684,17 +3691,130 @@ class MainWindow(QMainWindow):
         if screen is None:
             return
         available = screen.availableGeometry()
-        minimum = self.minimumSizeHint()
-        width = max(minimum.width(), min(self.width(), available.width()))
-        height = max(minimum.height(), min(self.height(), available.height()))
-        if (width, height) != (self.width(), self.height()):
-            self.resize(width, height)
+        # Qt will not size a window below its layout minimum, and that minimum is
+        # cached. After the widget that inflated it is gone the cache still holds
+        # the old value, so a resize here would be clamped to a figure that is no
+        # longer true. invalidate() discards it; activate() recomputes it now rather
+        # than on some later event.
+        for layout in (self.centralWidget().layout() if self.centralWidget() else None, self.layout()):
+            if layout is not None:
+                layout.invalidate()
+                layout.activate()
+        target_width = min(self.width(), available.width())
+        target_height = min(self.height(), available.height())
+        if (target_width, target_height) != (self.width(), self.height()):
+            # Qt refuses to size a window below its own layout minimum, so ask for
+            # the clamped size and let it settle wherever it can. That is why no
+            # minimum is consulted here: reading a cached minimum to predict the
+            # outcome is what made an earlier version of this pick the wrong branch.
+            self.resize(target_width, target_height)
         # A clamped window can still be positioned off the edge, which hides the
         # same controls by another route.
         frame = self.frameGeometry()
         frame.moveLeft(max(available.left(), min(frame.left(), available.right() - frame.width())))
         frame.moveTop(max(available.top(), min(frame.top(), available.bottom() - frame.height())))
         self.move(frame.topLeft())
+
+    def _width_pressure(self, limit: int) -> list[str]:
+        """Name the widgets forcing a window minimum wider than `limit`.
+
+        A layout minimum always beats a maximum size: setting maximumWidth on a
+        window whose layout demands more is simply ignored, and Qt grows the window
+        anyway -- measured at 13806 px against a 600 px cap. So a window too wide
+        for its display cannot be clamped, resized or capped back; some widget is
+        insisting on the width and the only fix is to find it. Hence this reports
+        rather than corrects.
+
+        Reports the deepest offender in each branch. A parent's minimum is mostly
+        the sum of its children's, so listing parents as well would bury the one
+        widget that actually needs changing.
+        """
+        blame: list[tuple[int, str]] = []
+        children = self.findChildren(QWidget)
+        claims = {
+            child: max(child.minimumSizeHint().width(), child.minimumWidth())
+            for child in children
+        }
+        for child, claim in claims.items():
+            if claim < limit // 8:
+                continue
+            # Skip a widget whose own minimum is essentially just that of something
+            # inside it. A parent's minimum is mostly the sum of its children's, so
+            # reporting parents too would bury the one widget to actually change.
+            # The tolerance is proportional because layout spacing and margins add
+            # a little at every level.
+            if any(
+                other is not child
+                and claims[other] >= claim * 0.9
+                and child.isAncestorOf(other)
+                for other in children
+            ):
+                continue
+            name = child.objectName() or child.__class__.__name__
+            detail = ""
+            if isinstance(child, QLabel):
+                shown = child.full_text() if isinstance(child, ElidedLabel) else child.text()
+                detail = f" text[{len(shown)}]={shown[:60]!r}"
+            elif isinstance(child, QComboBox):
+                detail = f" items={child.count()} current={child.currentText()[:40]!r}"
+            blame.append((claim, f"{claim:6d}px  {child.__class__.__name__}/{name}{detail}"))
+        blame.sort(reverse=True)
+        return [line for _, line in blame[:8]]
+
+    def _check_width(self) -> None:
+        """Keep the window inside the display, and report it when that is refused.
+
+        Two faults look identical to the operator and only one can be corrected, so
+        this tries the correction and diagnoses only if it does not hold.
+
+        A window merely too *wide* is the aftermath of a transient: Qt enlarges a
+        window when a layout minimum rises but never shrinks it when the minimum
+        falls again, so one brief spike leaves the window permanently oversized.
+        Recoverable, and checking only at startup was not enough because the spike
+        happens during the session.
+
+        A window whose layout *minimum* exceeds the display cannot be fixed at all.
+        A minimum beats a maximum size -- a window whose layout demands more simply
+        ignores maximumWidth, measured at 13806 px against a 600 px cap -- so it
+        cannot be clamped, resized or capped back. All that can be done is name the
+        widget responsible.
+
+        Which case applies is decided by resizing and seeing whether it sticks,
+        rather than by reading a cached minimum to predict it. The minimum goes
+        stale at exactly the moment a spike clears, which is when this runs, and
+        predicting from that picked the wrong branch and reported an unfixable
+        minimum for a window that only needed shrinking.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        if self.width() <= available.width() and self.height() <= available.height():
+            return
+        oversize = f"{self.width()}x{self.height()}"
+        self._fit_to_screen()
+        if self.width() <= available.width() and self.height() <= available.height():
+            if self._width_reported != -1:
+                self._width_reported = -1
+                print(
+                    f"q900: window was {oversize} on a {available.width()}"
+                    f"x{available.height()} display; shrank it back to "
+                    f"{self.width()}x{self.height()}.",
+                    file=sys.stderr,
+                )
+            return
+        minimum = max(self.minimumWidth(), self.minimumSizeHint().width())
+        if minimum <= self._width_reported:
+            return
+        self._width_reported = minimum
+        print(
+            f"q900: window is {self.width()}x{self.height()} and will not shrink: its "
+            f"layout minimum is {minimum}px against a {available.width()}px display. "
+            f"Widgets demanding the width:",
+            file=sys.stderr,
+        )
+        for line in self._width_pressure(minimum):
+            print(f"  {line}", file=sys.stderr)
 
     def _top_panel(self) -> QHBoxLayout:
         top = QHBoxLayout()
@@ -4840,6 +4960,88 @@ def _check_elided_labels() -> None:
     faulty = router.network_status
     assert "clean" not in faulty
     assert faulty.index("skip 12") < faulty.index("UDP"), faulty
+
+
+def ui_self_test() -> int:
+    """Check the window cannot end up wider than the display. Needs a real display.
+
+    Separate from self_test() because it cannot run offscreen. The offscreen
+    platform says so itself -- "This plugin does not support
+    propagateSizeHints()" -- and propagating size hints to the window manager is
+    the entire mechanism under test. An earlier version of this check did run
+    offscreen, passed, and the window kept growing anyway, which is the most
+    expensive kind of green test: one that cannot observe what it claims to.
+    """
+    application = QApplication.instance() or QApplication(sys.argv)
+    application.setStyleSheet(STYLESHEET)
+    application.setFont(QFont("Arial", 10))
+    if application.platformName() == "offscreen":
+        print("ui self-test needs a real display: offscreen cannot propagate size hints")
+        return 1
+
+    window = MainWindow()
+    window.show()
+    application.processEvents()
+    available = (window.screen() or application.primaryScreen()).availableGeometry()
+    failures = 0
+
+    def check(name: str, condition: bool, detail: str = "") -> None:
+        nonlocal failures
+        if not condition:
+            failures += 1
+        print(f"  [{'PASS' if condition else 'FAIL'}] {name}  {detail}")
+
+    print(f"display {available.width()}x{available.height()}, "
+          f"window {window.width()}x{window.height()}, "
+          f"minimum {window.minimumWidth()}px")
+    check("opens inside the display",
+          window.width() <= available.width() and window.height() <= available.height(),
+          f"{window.width()}x{window.height()}")
+
+    row = window.ptt_level.parentWidget().layout()
+    baseline = window.minimumWidth()
+
+    # The diagnostic labels are the ones that carry counters, so they are the ones
+    # that used to ratchet the window wider on every update.
+    worst = ("MIC 88%  TX 91%  alc -13.3dB UNDER  ovf 999999 skip 999999  "
+             "ring 3120ms  late 999.9 ms  UDP 999999999 pkts  peak 31783/CMP 9/digital")
+    for index in range(50):
+        window.ptt_level.setText(f"{worst} {index}")
+        window.network_audio_status.setText(f"{worst} {index}")
+        window.rigctl_status.setText(f"rigctl: unavailable ([Errno 48] in use) {index}")
+        window.status.setText(f"{worst} {index}")
+        application.processEvents()
+    check("counters never widen the window", window.minimumWidth() == baseline,
+          f"{window.minimumWidth()} vs {baseline}")
+    check("still inside the display", window.width() <= available.width())
+
+    # A window left oversized by a spike that has since passed must recover, because
+    # Qt grows a window to meet a rising minimum and never shrinks it afterwards.
+    spike = QLabel("Z" * 600)
+    row.addWidget(spike)
+    application.processEvents()
+    grew = window.width()
+    spike.setParent(None)
+    spike.deleteLater()
+    application.processEvents()
+    check("a spike does grow the window, so this test can see the fault",
+          grew > available.width(), f"{grew}px")
+    window._check_width()
+    application.processEvents()
+    check("window recovers after the spike clears",
+          window.width() <= available.width(), f"{window.width()}px")
+
+    # Repeated checks must settle rather than oscillate.
+    widths = set()
+    for _ in range(5):
+        window._check_width()
+        application.processEvents()
+        widths.add(window.width())
+    check("stable across repeated checks", len(widths) == 1, f"{widths}")
+
+    window.close()
+    print("ui self-test passed" if not failures else f"ui self-test: {failures} failure(s)")
+    return 1 if failures else 0
 
 
 def self_test() -> None:
@@ -6153,6 +6355,8 @@ def main() -> None:
     if "--self-test" in sys.argv:
         self_test()
         return
+    if "--self-test-ui" in sys.argv:
+        sys.exit(ui_self_test())
     if "--analyze-rx" in sys.argv:
         index = sys.argv.index("--analyze-rx")
         if index + 1 >= len(sys.argv):

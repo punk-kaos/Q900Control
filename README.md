@@ -501,6 +501,37 @@ Do not change that policy back to `Preferred`.
 The window is also clamped to the display it opens on, which nothing did before,
 and which is what recovers a window that an earlier run left oversized.
 
+A window that has become too wide cannot be clamped back by capping it. **A
+layout minimum beats a maximum size**: a window whose layout demands more width
+than `setMaximumWidth` allows simply ignores the cap, measured at 13806 px
+against a 600 px limit. So there are two distinct faults that look identical, and
+only one is recoverable:
+
+- The window is merely too *wide*, with a sane minimum. This is the aftermath of a
+  transient, because Qt enlarges a window when a layout minimum rises and never
+  shrinks it when the minimum falls again -- one brief spike leaves the window
+  permanently oversized. Recoverable.
+- The window's layout *minimum* exceeds the display. Nothing can fix this from
+  the outside; some widget is insisting on the width and that widget has to
+  change.
+
+A once-per-second check handles the first and diagnoses the second, naming the
+widgets responsible on stderr with their text, so the culprit does not have to be
+guessed at. It decides which case applies by resizing and seeing whether it
+sticks, rather than by reading the minimum to predict it: the minimum is cached
+and goes stale at exactly the moment a spike clears, and predicting from it
+reported an unfixable minimum for a window that only needed shrinking. Clearing
+that cache needs `invalidate()`, not just `activate()`, or the resize is clamped
+to a figure that is no longer true.
+
+`--self-test-ui` covers this, and is separate from `--self-test` because it
+**cannot run offscreen**. The offscreen platform says so itself, "This plugin does
+not support propagateSizeHints()", and propagating size hints to the window
+manager is the whole mechanism. An earlier version of this check did run
+offscreen, passed, and the window kept growing regardless -- so the test now
+asserts that a planted spike *does* grow the window before asserting that the
+window recovers, because a test that cannot observe the fault is worse than none.
+
 ### Transmit Rate Conversion
 
 The host produces audio on its own clock and the radio consumes on its crystal,
