@@ -468,9 +468,38 @@ of the two gains.
 
 Because under-driving is otherwise invisible -- a clip count of zero looks
 healthy when it can equally mean the signal never came close -- the status line
-also reports the drive against the knee as `alc +N dB limiting` or
+leads with the drive against the knee as `alc +N dB limiting` or
 `alc -N dB UNDER`. Zero or above means the radio is at full output. Below zero is
 the number of dB being thrown away.
+
+### Status Lines
+
+The transmit and receive status lines are ordered by diagnostic priority rather
+than by convenience, because they are elided to whatever width their row can
+spare: the drive figure and anything actually wrong come first, so they are
+readable without hovering, and the steady-state volume trails.
+
+The transmit line's seven fault counters collapse to whichever are non-zero, and
+read `clean` when none are. Printing `ovf 0  drop 0  skip 0  rep 0  trim 0
+err 0  clip 0` spent about forty characters saying that nothing had happened and
+pushed the figures that do change out of view. `clean` keeps the absence
+explicit, so a quiet line still distinguishes healthy from not-yet-reporting.
+
+Hovering any status label gives the untruncated string.
+
+These labels cannot resize the window, and that is deliberate. A QLabel with word
+wrap off reports its full text width as its *minimum* size hint, and the main
+window's root layout turns a layout minimum into a window minimum, which Qt then
+enlarges the window to satisfy -- and never shrinks again when the minimum falls.
+Labels carrying counters therefore widened the window every time a counter gained
+a digit, a one-way ratchet that ended up larger than the display; the transmit
+label alone moved the window's minimum by 1063 px. They use an `Ignored`
+horizontal size policy so their text cannot reach the layout at all, with a
+constant minimum width so that a crowded row cannot hide them entirely either.
+Do not change that policy back to `Preferred`.
+
+The window is also clamped to the display it opens on, which nothing did before,
+and which is what recovers a window that an earlier run left oversized.
 
 ### Transmit Rate Conversion
 

@@ -27,7 +27,15 @@ import sounddevice as sd
 import serial
 from serial.tools import list_ports
 
-from PyQt6.QtCore import QObject, QPoint, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QObject,
+    QPoint,
+    QRectF,
+    Qt,
+    QTimer,
+    pyqtSignal,
+    qInstallMessageHandler,
+)
 from PyQt6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -44,6 +52,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -1082,10 +1091,15 @@ class NetworkAudioMonitor:
             if not self._packet_count:
                 return "UDP waiting"
             drops = self.underflows
-            underflows = f"  drops {drops}" if drops else ""
-            gaps = f"  breaks {self._clock_gaps}" if self._clock_gaps else ""
+            # Anomaly counters lead, and the steady-state volume trails. This line
+            # is elided to whatever width the row can spare, so the order is the
+            # priority order: something that is wrong has to be visible without
+            # hovering for the tooltip. All three of these are absent while clean,
+            # so leading with them costs nothing in the normal case.
+            underflows = f"drops {drops}  " if drops else ""
+            gaps = f"breaks {self._clock_gaps}  " if self._clock_gaps else ""
             if self._clock_outliers:
-                gaps += f"  stalls {self._clock_outliers}"
+                gaps += f"stalls {self._clock_outliers}  "
             rate, seconds, run_packets = self._clock_run()
             if rate:
                 # Report the implied sample rate as well. It validates the
@@ -1095,15 +1109,16 @@ class NetworkAudioMonitor:
                 frames = NETWORK_TX_PACKET_BYTES // 4
                 nominal = 1.0 / NETWORK_TX_PERIOD
                 clock = (
-                    f"  radio {rate:.2f} pkt/s = {rate * frames:.0f} Hz "
+                    f"radio {rate:.2f} pkt/s = {rate * frames:.0f} Hz "
                     f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm) over {seconds:.0f}s"
                 )
             else:
-                clock = f"  radio clock: {run_packets}/{CLOCK_MIN_RUN_PACKETS} pkts"
+                clock = f"radio clock: {run_packets}/{CLOCK_MIN_RUN_PACKETS} pkts"
             return (
+                f"{gaps}{underflows}{clock}  "
                 f"UDP {self._packet_count} pkts  {self._last_packet_size} B  "
-                f"{self._format}{clock}{gaps}{underflows}"
-            )
+                f"{self._format}"
+            ).lstrip()
 
 
 # One network TX datagram is the radio's native media quantum: 48 interleaved
@@ -2623,12 +2638,34 @@ class TransmitAudioRouter:
             alc = f"alc +{headroom:.1f}dB limiting"
         else:
             alc = f"alc {headroom:.1f}dB UNDER"
+        # Ordered by diagnostic priority, because the row elides this to whatever
+        # width it can spare: the drive figure and anything actually wrong have to
+        # be readable without hovering for the tooltip.
+        #
+        # The seven fault counters are collapsed to the ones that are non-zero.
+        # Printing "ovf 0  drop 0  skip 0  rep 0  trim 0  err 0  clip 0" spent
+        # about forty characters of a limited budget to say that nothing happened,
+        # which pushed the figures that do change out of view. "clean" keeps the
+        # absence explicit, so a quiet line still distinguishes healthy from
+        # not-yet-reporting.
+        faults = " ".join(
+            f"{name} {count}"
+            for name, count in (
+                ("ovf", overflows),
+                ("drop", dropped),
+                ("skip", underruns),
+                ("rep", repeats),
+                ("trim", trimmed),
+                ("err", errors),
+                ("clip", clipped),
+            )
+            if count
+        )
         return (
-            f"UDP {packets} pkts  ovf {overflows}  drop {dropped}  skip {underruns}  "
-            f"rep {repeats}  ring {ring / 96.0:.0f}ms  "
-            f"trim {trimmed}  err {errors}  late {late_ms:.1f} ms  clip {clipped}  "
+            f"{alc}  {faults or 'clean'}  "
+            f"ring {ring / 96.0:.0f}ms  late {late_ms:.1f} ms  UDP {packets} pkts  "
             f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
-            f"{'/digital' if self._udp_digital else '/voice'}  {alc}"
+            f"{'/digital' if self._udp_digital else '/voice'}"
         )
 
 
@@ -3124,6 +3161,65 @@ QFrame#fill { background: #71db8d; border-radius: 4px; }
 """
 
 
+class ElidedLabel(QLabel):
+    """A label whose text can never widen its window.
+
+    A QLabel with word wrap off reports its full single-line width as its
+    *minimum* size hint, and the main window's root layout runs with Qt's default
+    SetDefaultConstraint, which turns the layout's minimum into the window's
+    minimum. So a label carrying a counter grows the window every time the
+    counter gains a digit -- and because Qt enlarges a window to satisfy a new
+    minimum but never shrinks it again when the minimum falls, that is a one-way
+    ratchet that eventually runs past the display. The diagnostic labels here
+    carry nine monotonic counters between them and update as often as every
+    100 ms, so left alone they will do this within a session.
+
+    The horizontal policy is therefore Ignored, which is what decouples the text
+    from the layout: do not "tidy" it back to Preferred. Ignored on its own would
+    clip mid-character and silently swallow the last counter, so the text is
+    elided to the width actually available and the untruncated string is kept on
+    the tooltip.
+    """
+
+    def __init__(self, text: str = "", minimum_width: int = 80) -> None:
+        super().__init__()
+        self._full = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        # A constant floor, so it cannot ratchet: the defect was a minimum that
+        # tracked the text, not a minimum as such. Without it a crowded row hands
+        # the label zero width and the reading disappears with no indication that
+        # there was one, which is worse than being truncated.
+        self.setMinimumWidth(minimum_width)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt's casing
+        self._full = text
+        self.setToolTip(text)
+        self._apply()
+
+    def full_text(self) -> str:
+        """The text as set, since text() returns whatever survived elision."""
+        return self._full
+
+    def _apply(self) -> None:
+        # contentsRect(), not width(): these labels carry stylesheet padding, and
+        # eliding to the outer width would let the tail run under it.
+        available = self.contentsRect().width()
+        if available <= 0:
+            super().setText(self._full)
+            return
+        elided = self.fontMetrics().elidedText(
+            self._full, Qt.TextElideMode.ElideRight, available
+        )
+        super().setText(elided)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt's casing
+        super().resizeEvent(event)
+        # Re-eliding cannot resize this widget, because the policy above means its
+        # hint is ignored, so this does not recurse.
+        self._apply()
+
+
 class Meter(QWidget):
     def __init__(self, title: str, color: str = "#83e99a") -> None:
         super().__init__()
@@ -3559,7 +3655,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.spectrum, 1)
         layout.addLayout(self._audio_panel())
         layout.addLayout(self._ptt_panel())
-        self.status = QLabel("Listener stopped. Start TCP listening or connect over USB.")
+        self.status = ElidedLabel("Listener stopped. Start TCP listening or connect over USB.")
         self.status.setStyleSheet("color: #9aaab5; padding: 4px 10px")
         layout.addWidget(self.status)
         try:
@@ -3567,6 +3663,38 @@ class MainWindow(QMainWindow):
         except OSError as error:
             self.rigctl_status.setText(f"rigctl: unavailable ({error})")
             self.rigctl_status.setStyleSheet("color: #eeae63; font: 13px Menlo")
+        # Last, so the layout's real minimum is known.
+        self._fit_to_screen()
+
+    def _fit_to_screen(self) -> None:
+        """Hold the window inside the display it is on.
+
+        The preferred size is larger than some laptop screens on its own, and
+        nothing else here bounds it: a window that opens wider than the display
+        has controls that cannot be reached. This also recovers a window that a
+        previous run left oversized, because Qt enlarges a window to satisfy a
+        layout minimum but will not shrink it again afterwards.
+
+        Clamped against the layout minimum rather than blindly, so that if a
+        display really is smaller than the interface can be drawn, the result is a
+        window overflowing a tiny screen rather than one with its own contents
+        crushed.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        minimum = self.minimumSizeHint()
+        width = max(minimum.width(), min(self.width(), available.width()))
+        height = max(minimum.height(), min(self.height(), available.height()))
+        if (width, height) != (self.width(), self.height()):
+            self.resize(width, height)
+        # A clamped window can still be positioned off the edge, which hides the
+        # same controls by another route.
+        frame = self.frameGeometry()
+        frame.moveLeft(max(available.left(), min(frame.left(), available.right() - frame.width())))
+        frame.moveTop(max(available.top(), min(frame.top(), available.bottom() - frame.height())))
+        self.move(frame.topLeft())
 
     def _top_panel(self) -> QHBoxLayout:
         top = QHBoxLayout()
@@ -3708,13 +3836,16 @@ class MainWindow(QMainWindow):
         audio.addWidget(refresh)
         audio.addWidget(self.audio_button)
         audio.addWidget(self.rx_destination)
-        self.network_audio_status = QLabel("")
+        self.network_audio_status = ElidedLabel("")
         self.network_audio_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
-        audio.addWidget(self.network_audio_status)
-        self.rigctl_status = QLabel("rigctl: listening on 127.0.0.1:4532")
+        # These take the row's leftover width, in place of a stretch item. An
+        # Ignored size policy means they claim no width of their own, so without a
+        # stretch factor here the trailing stretch would take everything and leave
+        # them zero pixels wide -- invisible rather than merely truncated.
+        audio.addWidget(self.network_audio_status, 3)
+        self.rigctl_status = ElidedLabel("rigctl: listening on 127.0.0.1:4532")
         self.rigctl_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
-        audio.addWidget(self.rigctl_status)
-        audio.addStretch()
+        audio.addWidget(self.rigctl_status, 2)
         return audio
 
     def _ptt_panel(self) -> QHBoxLayout:
@@ -3732,15 +3863,16 @@ class MainWindow(QMainWindow):
         )
         self.ptt_button.pressed.connect(self.start_ptt)
         self.ptt_button.released.connect(self.stop_ptt)
-        self.ptt_level = QLabel("MIC 0%  TX 0%")
+        self.ptt_level = ElidedLabel("MIC 0%  TX 0%")
         self.ptt_level.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
         panel.addWidget(self.microphone)
         panel.addWidget(QLabel("USB TX device"))
         panel.addWidget(self.tx_output)
         panel.addWidget(refresh)
         panel.addWidget(self.ptt_button)
-        panel.addWidget(self.ptt_level)
-        panel.addStretch()
+        # Takes the row's leftover width rather than a stretch item: see
+        # _audio_panel().
+        panel.addWidget(self.ptt_level, 1)
         return panel
 
     def refresh_audio_devices(self) -> None:
@@ -4582,6 +4714,132 @@ class MainWindow(QMainWindow):
         self.network_audio.stop()
         self.client.disconnect()
         event.accept()
+
+
+def _self_test_elided_labels() -> None:
+    """A diagnostic label must never be able to widen the window that holds it.
+
+    This is a regression test for a real defect: the status labels carry counters,
+    a QLabel without word wrap reports its full text width as its *minimum* size
+    hint, and the window's root layout turns a layout minimum into a window
+    minimum. Qt then grows the window to satisfy it and never shrinks back, so the
+    window crept wider every time a counter gained a digit until it was larger
+    than the display. Adding one field to the transmit status line was enough to
+    trigger it, which is exactly why this is checked rather than reasoned about.
+
+    Widgets need a QApplication, so this runs offscreen and skips rather than
+    fails if no Qt platform can be started at all.
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # The offscreen plugin warns about propagateSizeHints and missing fonts on
+    # every top-level resize, and those warnings carry no logging category so
+    # QT_LOGGING_RULES cannot filter them. None of it bears on what is being
+    # checked and it would drown the one line this test should print, so swallow
+    # Qt's output for the duration and put it back afterwards.
+    previous_handler = qInstallMessageHandler(lambda *_arguments: None)
+    try:
+        _check_elided_labels()
+    finally:
+        qInstallMessageHandler(previous_handler)
+
+
+def _check_elided_labels() -> None:
+    application = QApplication.instance()
+    try:
+        if application is None:
+            application = QApplication([])
+    except Exception:  # pragma: no cover - no usable Qt platform
+        return
+
+    label = ElidedLabel("short")
+    assert label.full_text() == "short"
+    # The mechanism: an Ignored horizontal policy is what decouples the text from
+    # the layout. The label's own sizeHint still reports the text width -- Ignored
+    # means the layout disregards that hint, not that the hint changes -- so the
+    # invariant has to be checked on the container, below.
+    floor = label.minimumWidth()
+    assert floor > 0, "a zero floor lets a crowded row hide the reading entirely"
+    assert label.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+    label.setText("x" * 4000)
+    # The floor is a constant, not a function of the text. That distinction is the
+    # whole fix.
+    assert label.minimumWidth() == floor
+    # Setting text must not lose it, however much is displayed.
+    assert label.full_text() == "x" * 4000
+    assert label.toolTip() == "x" * 4000
+
+    # The actual invariant, and the defect: growing the text must not widen the
+    # widget that contains the label.
+    host = QWidget()
+    row = QHBoxLayout(host)
+    row.addWidget(QLabel("fixed"))
+    row.addWidget(label, 1)
+    host.resize(300, 40)
+    host.show()
+    application.processEvents()
+    label.setText("short")
+    application.processEvents()
+    before = host.minimumSizeHint().width()
+    label.setText("y" * 4000)
+    application.processEvents()
+    assert host.minimumSizeHint().width() == before, (
+        host.minimumSizeHint().width(),
+        before,
+    )
+    # A plain QLabel is what this replaces, and it must be shown to fail the same
+    # check -- otherwise the test would pass for the wrong reason if the policy
+    # were quietly dropped.
+    plain_host = QWidget()
+    plain_row = QHBoxLayout(plain_host)
+    plain = QLabel("short")
+    plain_row.addWidget(plain, 1)
+    plain_host.show()
+    application.processEvents()
+    plain_before = plain_host.minimumSizeHint().width()
+    plain.setText("y" * 400)
+    application.processEvents()
+    assert plain_host.minimumSizeHint().width() > plain_before, (
+        "a plain QLabel no longer grows its parent, so this guard is obsolete"
+    )
+    plain_host.close()
+
+    # In a row it must elide to the width it is given, and keep the full string
+    # reachable. A label that silently dropped its tail would hide the very
+    # counters it exists to show.
+    long_text = "alc +5.5dB limiting  clean  ring 3120ms  UDP 1873402 pkts"
+    host.resize(300, 40)
+    application.processEvents()
+    label.setText(long_text)
+    application.processEvents()
+    assert 0 < label.width() < 4000
+    assert label.text() != long_text, "text wider than the row should have been elided"
+    assert label.text().endswith("\u2026"), label.text()
+    assert label.full_text() == long_text
+    # Widen and the same label must show more, not stay truncated.
+    host.resize(2000, 40)
+    application.processEvents()
+    assert label.text() == long_text, label.text()
+    host.close()
+
+    # The transmit line leads with the drive figure and any fault, because it gets
+    # elided: those must survive a narrow row, and the quiet case must still say
+    # something rather than read as absent.
+    router = TransmitAudioRouter(RadioSignals())
+    router._udp_ceiling = tx_ceiling(9, True)
+    router._udp_compressor = 9
+    router._udp_digital = True
+
+    class _Value:
+        def __init__(self, value: float) -> None:
+            self.value = value
+
+    router._udp_level = _Value(0.222)
+    assert router.network_status.startswith("alc ")
+    assert "clean" in router.network_status
+    router._udp_underruns = _Value(12)
+    faulty = router.network_status
+    assert "clean" not in faulty
+    assert faulty.index("skip 12") < faulty.index("UDP"), faulty
 
 
 def self_test() -> None:
@@ -5456,6 +5714,7 @@ def self_test() -> None:
         np.abs(identity_spectrum[image_bin]),
         np.abs(identity_spectrum[wanted_bin]),
     )
+    _self_test_elided_labels()
     print("Q900 protocol self-test passed")
 
 
