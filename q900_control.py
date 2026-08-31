@@ -68,6 +68,11 @@ SPECTRUM_BINS = 512
 # callback, so paint cost is transmit audio quality.
 SPECTRUM_MAX_REPAINT_HZ = 15
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
+METER_MAX = 34
+S_METER_TICKS = ((0, "S0"), (2, "S1"), (6, "S3"), (10, "S5"),
+                 (14, "S7"), (18, "S9"), (23, "+20"), (28, "+40"),
+                 (33, "+60 dB"))
+LEVEL_METER_TICKS = tuple((value, str(value)) for value in range(0, 33, 4))
 # Measuring the radio's media clock needs an uninterrupted run of packets.
 # Within a run the rate is packets divided by the elapsed time between its first
 # and last arrival, so arrival jitter only enters through the two endpoints and
@@ -253,8 +258,11 @@ class RadioState:
     vfo_b_mode: Mode = Mode.NFM
     active_vfo_b: bool = False
     ptt: bool = False
-    s_meter: int = 0
-    swr: int = 0
+    ptt_requested: bool = False
+    primary_meter: int = 0
+    primary_meter_is_power: bool = False
+    secondary_meter: int = 0
+    secondary_meter_kind: int = 0
     span_index: int = 2
     utc: tuple[int, int, int] = (0, 0, 0)
     status_flags: int = 0
@@ -279,6 +287,24 @@ class RadioState:
     noise_blanker_threshold: int = 7
     peak_threshold: int = 15
     cw_txrx_delay: int = 100
+
+
+def tx_meter_value(state: RadioState) -> int:
+    """Keep the TX-only meter visible while CAT status catches up with local PTT."""
+    return state.secondary_meter if state.ptt_requested or state.ptt else 0
+
+
+def secondary_meter_name(kind: int) -> str:
+    """Return the Q900's selected secondary TX meter name."""
+    return ("SWR", "ALC", "AUD")[kind] if kind < 3 else "TX Meter"
+
+
+def s_meter_label(value: int) -> str:
+    """Format the Q900's 0--34 S-meter table as an S-unit."""
+    value = max(0, min(METER_MAX, value))
+    if value <= 18:
+        return f"S{value // 2}"
+    return f"S9+{(value - 18) * 4} dB"
 
 
 class RadioSignals(QObject):
@@ -2928,10 +2954,12 @@ class RadioClient:
             except (OSError, serial.SerialException):
                 pass
             sock.close()
-        if self.state.connected or self.state.listening:
+        was_active = self.state.connected or self.state.listening or self.state.ptt or self.state.ptt_requested
+        self.state.ptt = False
+        self.state.ptt_requested = False
+        if was_active:
             self.state.listening = False
             self.state.connected = False
-            self.state.ptt = False
             self._emit_state()
 
     def send(self, data: bytes) -> None:
@@ -2943,6 +2971,7 @@ class RadioClient:
     def set_ptt(self, active: bool) -> None:
         self.send(encode_frame(Command.PTT, bytes((0 if active else 1,))))
         self.state.ptt = active
+        self.state.ptt_requested = active
         self._emit_state()
 
     def set_stream_format(self, value: int) -> None:
@@ -3093,7 +3122,7 @@ class RadioClient:
                     if now - last_status >= 0.49:
                         self.send(encode_frame(Command.STATUS))
                         last_status = now
-                    if self.state.ptt:
+                    if self.state.ptt_requested or self.state.ptt:
                         # Do not ask the radio to compute and stream a 516-byte
                         # FFT frame while it is transmitting. The spectrum shows
                         # the receive passband and is not meaningful on air, and
@@ -3130,6 +3159,7 @@ class RadioClient:
         finally:
             self.state.connected = False
             self.state.ptt = False
+            self.state.ptt_requested = False
             self._emit_state()
 
     def _handle_status(self, data: bytes) -> None:
@@ -3158,8 +3188,12 @@ class RadioClient:
         self.state.span_index = data[16] if data[16] < len(SPAN_HZ) else 2
         self.state.utc = tuple(data[18:21])
         self.state.status_flags = data[21]
-        self.state.s_meter = data[22]
-        self.state.swr = data[23] & 0x3F
+        # Q900 protocol V1.5: bit 7 switches the primary S/PO meter, while
+        # bits 7..6 select the secondary SWR, ALC, or AUD meter.
+        self.state.primary_meter = data[22] & 0x3F
+        self.state.primary_meter_is_power = bool(data[22] & 0x80)
+        self.state.secondary_meter = data[23] & 0x3F
+        self.state.secondary_meter_kind = data[23] >> 6
         self._emit_state()
 
     def _emit_state(self) -> None:
@@ -3270,23 +3304,52 @@ class ElidedLabel(QLabel):
         self._sync_tooltip()
 
 
+class MeterScale(QWidget):
+    """Native Q900 meter labels positioned against the corresponding bar values."""
+
+    def __init__(self, ticks: tuple[tuple[int, str], ...]) -> None:
+        super().__init__()
+        self._ticks = ticks
+        self.setFixedHeight(18)
+        self.setStyleSheet("background: transparent;")
+
+    def set_ticks(self, ticks: tuple[tuple[int, str], ...]) -> None:
+        self._ticks = ticks
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt's casing
+        painter = QPainter(self)
+        painter.setPen(QColor("#aab0bc"))
+        font = QFont("Menlo", 10)
+        font.setBold(True)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        for value, text in self._ticks:
+            text_width = metrics.horizontalAdvance(text)
+            center = self.width() * value / METER_MAX
+            left = max(0, min(self.width() - text_width, round(center - text_width / 2)))
+            painter.drawText(QRectF(left, 0, text_width, self.height()), Qt.AlignmentFlag.AlignCenter, text)
+
+
 class Meter(QWidget):
-    def __init__(self, title: str, color: str = "#83e99a") -> None:
+    def __init__(self, title: str, ticks: tuple[tuple[int, str], ...], color: str = "#83e99a") -> None:
         super().__init__()
         self._color = color
+        self._value = 0
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         row = QHBoxLayout()
-        label = QLabel(title)
-        label.setObjectName("meterLabel")
-        self.value = QLabel("0")
+        self.label = QLabel(title)
+        self.label.setObjectName("meterLabel")
+        self.value = QLabel()
         self.value.setStyleSheet(f"color: {color}; font: 700 16px Menlo")
-        row.addWidget(label)
+        row.addWidget(self.label)
         row.addStretch()
         row.addWidget(self.value)
         layout.addLayout(row)
         bar = QFrame()
         bar.setObjectName("bar")
+        self.bar = bar
         inner = QHBoxLayout(bar)
         inner.setContentsMargins(0, 0, 0, 0)
         self.fill = QFrame()
@@ -3296,13 +3359,25 @@ class Meter(QWidget):
         inner.addWidget(self.fill)
         inner.addStretch()
         layout.addWidget(bar)
+        self.scale = MeterScale(ticks)
+        layout.addWidget(self.scale)
 
-    def set_value(self, value: int) -> None:
-        value = max(0, min(34, value))
-        self.value.setText(str(value))
-        # QFrame has no useful horizontal size hint; use a fixed fill width so
-        # the adjacent stretch cannot collapse the meter to zero pixels.
-        self.fill.setFixedWidth(max(1, value * 9))
+    def set_value(self, value: int, title: str, text: str, ticks: tuple[tuple[int, str], ...]) -> None:
+        self._value = max(0, min(METER_MAX, value))
+        self.label.setText(title)
+        self.value.setText(text)
+        self.scale.set_ticks(ticks)
+        self._update_fill()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt's casing
+        super().resizeEvent(event)
+        self._update_fill()
+
+    def _update_fill(self) -> None:
+        # The scale uses the complete bar width, so the fill must too. A fixed
+        # pixel-per-unit width misplaces every reading in a resizable window.
+        width = self.bar.contentsRect().width()
+        self.fill.setFixedWidth(max(1, round(width * self._value / METER_MAX)))
 
 
 class ControlTile(QPushButton):
@@ -3936,8 +4011,8 @@ class MainWindow(QMainWindow):
         meters = QFrame()
         meters.setObjectName("meter")
         meter_layout = QVBoxLayout(meters)
-        self.s_meter = Meter("S Meter")
-        self.swr_meter = Meter("SWR / TX Meter", "#eeae63")
+        self.s_meter = Meter("S Meter", S_METER_TICKS)
+        self.swr_meter = Meter("SWR / AUD / ALC", LEVEL_METER_TICKS, "#eeae63")
         meter_layout.addWidget(self.s_meter)
         meter_layout.addWidget(self.swr_meter)
         top.addWidget(meters, 2)
@@ -4829,9 +4904,19 @@ class MainWindow(QMainWindow):
             self.mode_selector.blockSignals(True)
             self.mode_selector.setCurrentIndex(mode_index)
             self.mode_selector.blockSignals(False)
-        self.s_meter.set_value(state.s_meter)
+        if state.primary_meter_is_power:
+            self.s_meter.set_value(
+                state.primary_meter, "Power (PO)", f"PO {state.primary_meter}", LEVEL_METER_TICKS,
+            )
+        else:
+            self.s_meter.set_value(
+                state.primary_meter, "S Meter", s_meter_label(state.primary_meter), S_METER_TICKS,
+            )
         # Firmware only supplies a meaningful second meter while transmitting.
-        self.swr_meter.set_value(state.swr if state.ptt else 0)
+        self.swr_meter.set_value(
+            tx_meter_value(state), secondary_meter_name(state.secondary_meter_kind),
+            str(tx_meter_value(state)), LEVEL_METER_TICKS,
+        )
         if state.connected:
             self.connect_button.setText("Disconnect")
         elif state.listening:
@@ -5153,6 +5238,34 @@ def self_test() -> None:
     assert encode_frame(Command.STATUS).hex() == "a5a5a5a5030bf937"
     assert encode_frame(Command.PTT, b"\x00").hex() == "a5a5a5a504070089cb"
     assert encode_frame(Command.PTT, b"\x01").hex() == "a5a5a5a504070199ea"
+    # Status PTT can lag the local CAT key command. Preserve the selected TX
+    # meter from that status frame until the local request is released.
+    tx_client = RadioClient(RadioSignals())
+    tx_client.state.ptt_requested = True
+    tx_status = bytearray(24)
+    tx_status[1] = Mode.NFM.value
+    tx_status[2] = Mode.NFM.value
+    tx_status[22] = 0x80 | 34
+    tx_status[23] = 0x40 | 23
+    tx_client._handle_status(bytes(tx_status))
+    assert not tx_client.state.ptt
+    assert tx_client.state.primary_meter == 34
+    assert tx_client.state.primary_meter_is_power
+    assert tx_client.state.secondary_meter == 23
+    assert tx_client.state.secondary_meter_kind == 1
+    assert secondary_meter_name(tx_client.state.secondary_meter_kind) == "ALC"
+    assert secondary_meter_name(0) == "SWR"
+    assert secondary_meter_name(2) == "AUD"
+    assert secondary_meter_name(3) == "TX Meter"
+    assert s_meter_label(0) == "S0"
+    assert s_meter_label(12) == "S6"
+    assert s_meter_label(23) == "S9+20 dB"
+    assert s_meter_label(33) == "S9+60 dB"
+    assert tx_meter_value(tx_client.state) == 23
+    tx_client.state.ptt_requested = False
+    assert tx_meter_value(tx_client.state) == 0
+    tx_client.state.ptt = True
+    assert tx_meter_value(tx_client.state) == 23
     captured_audio = bytes.fromhex("a5a5a5a56721002c00") + bytes(192)
     assert captured_audio.startswith(b"\xa5\xa5\xa5\xa5\x67\x21\x00")
     assert len(captured_audio[9:]) == 192

@@ -385,6 +385,12 @@ Q900 CAT frames use:
 A5 A5 A5 A5 | length | command | payload | CRC-16/CCITT-FALSE (big-endian)
 ```
 
+The status reply (`0x0B`) carries two native 0--34 meter values. Byte 22 is an
+S meter when bit 7 is clear and a transmit-power (PO) meter when it is set.
+Byte 23 uses bits 7--6 to select SWR (`00`), ALC (`01`), or AUD (`10`); its
+low six bits hold the meter value. The UI renders these native scales rather
+than treating the second value as SWR unconditionally.
+
 Network RX/TX audio uses UDP port `8000`. The radio-to-PC packets are Q900
 framed: a nine-byte header whose fifth byte is the stream type (`0x67` audio,
 `0x68` I/Q) and whose bytes 5..8 are the radio's device ID word, followed by a
@@ -809,5 +815,4 @@ rate, and a datagram lost there is a millisecond of audio missing with nothing t
 resend it. Schedule debt after a late wake is repaid rather than discarded, since
 discarding it lowers the long-run send rate below the radio's consume rate and
 walks the ring down into the duplication region with nothing able to observe it.
-
 
