@@ -189,10 +189,12 @@ It is independent of the Q900 CAT operating-mode selector. When enabled, the
 app requests the alternate stream and only activates SDR after it observes a
 Q900 UDP packet with type `0x68`.
 
-The SDR mode selector currently provides host-side `USB`, `LSB`, `AM` and `NFM`
+The SDR mode selector provides host-side `USB`, `LSB`, `AM`, `NFM` and `WFM`
 demodulation. I/Q packets are decoded as 48 kHz interleaved signed PCM16LE
 complex frames and processed on a worker thread before being sent through the
-normal selected speaker or rigctl virtual-microphone output.
+normal selected speaker or rigctl virtual-microphone output. Host `WFM` is
+5 kHz-deviation voice FM for a 25 kHz amateur-radio channel; it is independent
+of the Q900 CAT `WFM` mode.
 
 `USB` and `LSB` use a phasing detector built on the same Hilbert transformer as
 the transmit encoder: with `H` the Hilbert transform, `I - H{Q}` keeps only
@@ -215,10 +217,19 @@ regardless of the CAT `0x67` TX-source menu; an earlier attempt to select the
 source with the extended command `F2 29 02 04` was removed after firmware
 analysis showed that command is inert — the dispatcher ignores any command
 above `0x67`). The host encoder performs a true single-sideband Hilbert
-transform for USB/LSB, AGC plus 750 µs pre-emphasis for NFM, and bakes in the
-radio's I/Q mirror by default (the `Swap I/Q` / `Invert Q` calibration toggles
-stack on top). The tuned carrier sits at +12 kHz. Use low power and an external
-receiver or dummy load while validating the I/Q orientation and carrier offset.
+transform for USB/LSB and mode-specific FM conditioning. NFM retains its
+existing AGC and 750 µs pre-emphasis. WFM applies a 300 Hz voice high-pass,
+75 µs pre-emphasis, a 3 kHz low-pass, and a hard 5 kHz peak-deviation limit;
+receive uses matching 75 µs de-emphasis plus channel and audio filtering. The
+encoder bakes in the radio's I/Q mirror by default (the `Swap I/Q` / `Invert Q`
+calibration toggles stack on top).
+
+The tuned carrier normally sits at +12 kHz. That leaves limited upper-Nyquist
+guard for a 25 kHz channel in the 48 kHz complex stream, although the significant
+voice-FM energy is narrower (about 16 kHz by Carson's rule at 3 kHz audio). A
+0 Hz TX offset provides the most margin. Use low power and an external receiver
+or dummy load to validate I/Q orientation, carrier offset, 5 kHz deviation and
+occupied bandwidth before transmitting on air.
 
 ### GUI PTT
 
@@ -390,6 +401,8 @@ S meter when bit 7 is clear and a transmit-power (PO) meter when it is set.
 Byte 23 uses bits 7--6 to select SWR (`00`), ALC (`01`), or AUD (`10`); its
 low six bits hold the meter value. The UI renders these native scales rather
 than treating the second value as SWR unconditionally.
+For SWR, the Q900 table is displayed as `1.0 + value / 10 : 1`; ALC and AUD
+remain on the radio's native 0--34 level scale.
 
 Network RX/TX audio uses UDP port `8000`. The radio-to-PC packets are Q900
 framed: a nine-byte header whose fifth byte is the stream type (`0x67` audio,
@@ -815,4 +828,3 @@ rate, and a datagram lost there is a millisecond of audio missing with nothing t
 resend it. Schedule debt after a late wake is repaid rather than discarded, since
 discarding it lowers the long-run send rate below the radio's consume rate and
 walks the ring down into the duplication region with nothing able to observe it.
-

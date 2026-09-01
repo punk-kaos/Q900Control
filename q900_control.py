@@ -73,6 +73,9 @@ S_METER_TICKS = ((0, "S0"), (2, "S1"), (6, "S3"), (10, "S5"),
                  (14, "S7"), (18, "S9"), (23, "+20"), (28, "+40"),
                  (33, "+60 dB"))
 LEVEL_METER_TICKS = tuple((value, str(value)) for value in range(0, 33, 4))
+SWR_METER_TICKS = ((0, "1.0:1"), (5, "1.5:1"), (10, "2.0:1"),
+                   (15, "2.5:1"), (20, "3.0:1"), (25, "3.5:1"),
+                   (30, "4.0:1"), (34, "4.4:1"))
 # Measuring the radio's media clock needs an uninterrupted run of packets.
 # Within a run the rate is packets divided by the elapsed time between its first
 # and last arrival, so arrival jitter only enters through the two endpoints and
@@ -305,6 +308,12 @@ def s_meter_label(value: int) -> str:
     if value <= 18:
         return f"S{value // 2}"
     return f"S9+{(value - 18) * 4} dB"
+
+
+def swr_label(value: int) -> str:
+    """Format the Q900's SWR table as the radio's displayed ratio."""
+    value = max(0, min(METER_MAX, value))
+    return f"{1 + value / 10:.1f}:1"
 
 
 class RadioSignals(QObject):
@@ -567,13 +576,14 @@ class UsbAudioMonitor:
 
 
 class SDRReceiver:
-    """Worker-based 48 kHz complex I/Q USB/LSB receive demodulator."""
+    """Worker-based 48 kHz complex I/Q receive demodulator."""
 
     SAMPLE_RATE = 48_000
     BLOCK_FRAMES = 960
     OUTPUT_PREROLL_BLOCKS = 13
     SSB_OUTPUT_GAIN = 40.0
     NFM_OUTPUT_GAIN = 3.0
+    WFM_OUTPUT_GAIN = 1.5
     AM_OUTPUT_GAIN = 24.0
 
     def __init__(self, output: Callable[[np.ndarray], None]) -> None:
@@ -651,6 +661,10 @@ class SDRReceiver:
         previous = 1 + 0j
         fm_dc = 0.0
         fm_deemphasis = 0.0
+        wfm_channel_taps = self._lowpass_taps(10_000, 129)
+        wfm_channel_history = np.zeros(len(wfm_channel_taps) - 1, dtype=np.complex64)
+        wfm_audio_taps = self._lowpass_taps(3_000, 129)
+        wfm_audio_history = np.zeros(len(wfm_audio_taps) - 1, dtype=np.float64)
         am_history = np.zeros(64, dtype=np.complex64)
         am_taps = self._lowpass_taps(4_500, 65)
         ssb_previous_input = 0.0
@@ -677,22 +691,32 @@ class SDRReceiver:
             signal -= dc
             count = len(signal)
             index = np.arange(count) + phase
-            if self.mode == "NFM":
+            if self.mode in ("NFM", "WFM"):
                 shift = np.exp(-1j * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
                 baseband = signal * shift
+                if self.mode == "WFM":
+                    channel_input = np.concatenate((wfm_channel_history, baseband))
+                    wfm_channel_history = channel_input[-(len(wfm_channel_taps) - 1):]
+                    baseband = np.convolve(channel_input, wfm_channel_taps, mode="valid")
                 discriminator = np.angle(baseband * np.conj(np.concatenate(([previous], baseband[:-1]))))
                 previous = baseband[-1]
-                # Remove residual carrier offset, then apply a 300 us
-                # de-emphasis filter for intelligible narrow-FM audio.
+                # Remove residual carrier offset before mode-specific de-emphasis.
                 fm_dc = 0.995 * fm_dc + 0.005 * float(np.mean(discriminator))
                 discriminator -= fm_dc
-                alpha = 1 - np.exp(-1 / (self.SAMPLE_RATE * 300e-6))
+                deemphasis_us = 75 if self.mode == "WFM" else 300
+                alpha = 1 - np.exp(-1 / (self.SAMPLE_RATE * deemphasis_us * 1e-6))
                 audio = np.empty_like(discriminator)
                 for sample_index, sample in enumerate(discriminator):
                     fm_deemphasis += alpha * (sample - fm_deemphasis)
                     audio[sample_index] = fm_deemphasis
-                audio = np.convolve(audio, np.ones(7, dtype=np.float32) / 7, mode="same")
-                gain = self.NFM_OUTPUT_GAIN
+                if self.mode == "WFM":
+                    audio_input = np.concatenate((wfm_audio_history, audio))
+                    wfm_audio_history = audio_input[-(len(wfm_audio_taps) - 1):]
+                    audio = np.convolve(audio_input, wfm_audio_taps, mode="valid")
+                    gain = self.WFM_OUTPUT_GAIN
+                else:
+                    audio = np.convolve(audio, np.ones(7, dtype=np.float32) / 7, mode="same")
+                    gain = self.NFM_OUTPUT_GAIN
             elif self.mode == "AM":
                 shift = np.exp(-1j * 2 * np.pi * self.offset_hz * index / self.SAMPLE_RATE)
                 baseband = signal * shift
@@ -708,7 +732,7 @@ class SDRReceiver:
                 # than waiting seconds for a slow DC follower to settle.
                 audio = envelope - np.mean(envelope)
                 gain = self.AM_OUTPUT_GAIN
-            else:
+            elif self.mode in ("USB", "LSB"):
                 # USB and LSB share the same suppressed-carrier frequency, so
                 # both translate the selected carrier to zero. They differ only
                 # in which side of zero carries the wanted audio. Taking
@@ -745,6 +769,8 @@ class SDRReceiver:
                     highpassed[sample_index] = filtered
                 audio = highpassed
                 gain = self.SSB_OUTPUT_GAIN
+            else:
+                raise ValueError(f"unsupported SDR receive mode: {self.mode}")
             phase += count
             # Keep SDR audio gain fixed. The previous block AGC could clamp
             # weak USB/LSB speech after a stronger packet and sound as if the
@@ -2133,8 +2159,23 @@ def udp_audio_sender(
 
 IQ_SAMPLE_RATE = 48_000
 IQ_TX_LEVEL = 0.8
-IQ_FM_DEVIATION = 2_500
-IQ_PRE_EMPHASIS_ALPHA = 1.0 - float(np.exp(-1.0 / (48_000 * 750e-6)))
+IQ_NFM_DEVIATION = 2_500
+IQ_NFM_PRE_EMPHASIS_ALPHA = 1.0 - float(np.exp(-1.0 / (IQ_SAMPLE_RATE * 750e-6)))
+IQ_WFM_DEVIATION = 5_000
+IQ_WFM_PEAK = 0.9
+IQ_WFM_PRE_EMPHASIS_DECAY = float(np.exp(-1.0 / (IQ_SAMPLE_RATE * 75e-6)))
+IQ_WFM_HIGHPASS_ALPHA = 1.0 - float(np.exp(-2 * np.pi * 300 / IQ_SAMPLE_RATE))
+
+
+def fir_lowpass_taps(cutoff_hz: float, count: int) -> np.ndarray:
+    """Return unity-gain windowed-sinc taps for streaming audio filters."""
+    index = np.arange(count, dtype=np.float64) - (count - 1) / 2
+    taps = 2 * cutoff_hz / IQ_SAMPLE_RATE * np.sinc(2 * cutoff_hz * index / IQ_SAMPLE_RATE)
+    taps *= np.hamming(count)
+    return taps / np.sum(taps)
+
+
+IQ_WFM_AUDIO_TAPS = fir_lowpass_taps(3_000, 129)
 _HILBERT_LEN = 127
 _HILBERT_DELAY = (_HILBERT_LEN - 1) // 2
 _hilbert_index = np.arange(_HILBERT_LEN, dtype=np.float32) - _HILBERT_DELAY
@@ -2147,13 +2188,18 @@ _HILBERT_TAPS *= np.blackman(_HILBERT_LEN).astype(np.float32)
 class IqEncoderState:
     """Streaming DSP state for encode_iq_block()."""
 
-    __slots__ = ("phase", "level", "ssb_dc", "pre_prev", "hilbert_state", "sample_count")
+    __slots__ = (
+        "phase", "level", "ssb_dc", "fm_dc", "pre_prev", "fm_filter_state",
+        "hilbert_state", "sample_count",
+    )
 
     def __init__(self) -> None:
         self.phase = 0.0
         self.level = 0.0
         self.ssb_dc = 0.0
+        self.fm_dc = 0.0
         self.pre_prev = 0.0
+        self.fm_filter_state = np.zeros(len(IQ_WFM_AUDIO_TAPS) - 1, dtype=np.float64)
         self.hilbert_state = np.zeros(_HILBERT_LEN - 1, dtype=np.float32)
         self.sample_count = 0
 
@@ -2188,16 +2234,39 @@ def encode_iq_block(state: IqEncoderState, audio: np.ndarray, mode: str, offset_
     elif mode == "AM":
         state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
         baseband = 0.55 + np.clip(audio - state.ssb_dc, -0.45, 0.45).astype(np.complex64)
-    else:  # NFM
+    elif mode == "NFM":
         state.level = 0.95 * state.level + 0.05 * float(np.max(np.abs(audio)))
         fm_gain = float(np.clip(0.9 / max(state.level, 1e-4), 3.0, 20.0))
         fm_audio = np.clip(audio * fm_gain, -0.9, 0.9)
         previous = np.concatenate((np.array([state.pre_prev]), fm_audio[:-1]))
-        emphasized = np.clip(fm_audio + IQ_PRE_EMPHASIS_ALPHA * (fm_audio - previous), -0.9, 0.9)
+        emphasized = np.clip(fm_audio + IQ_NFM_PRE_EMPHASIS_ALPHA * (fm_audio - previous), -0.9, 0.9)
         state.pre_prev = float(fm_audio[-1])
-        state.phase += np.cumsum(emphasized * (2 * np.pi * IQ_FM_DEVIATION / IQ_SAMPLE_RATE))
+        state.phase += np.cumsum(emphasized * (2 * np.pi * IQ_NFM_DEVIATION / IQ_SAMPLE_RATE))
         baseband = np.exp(1j * state.phase)
         state.phase = float(state.phase[-1] % (2 * np.pi))
+    elif mode == "WFM":
+        highpassed = np.empty_like(audio, dtype=np.float64)
+        for sample_index, sample in enumerate(audio):
+            state.fm_dc += IQ_WFM_HIGHPASS_ALPHA * (float(sample) - state.fm_dc)
+            highpassed[sample_index] = sample - state.fm_dc
+        state.level = 0.95 * state.level + 0.05 * float(np.max(np.abs(highpassed)))
+        fm_gain = float(np.clip(IQ_WFM_PEAK / max(state.level, 1e-4), 1.0, 20.0))
+        fm_audio = np.clip(highpassed * fm_gain, -IQ_WFM_PEAK, IQ_WFM_PEAK)
+        previous = np.concatenate((np.array([state.pre_prev]), fm_audio[:-1]))
+        emphasized = (
+            fm_audio - IQ_WFM_PRE_EMPHASIS_DECAY * previous
+        ) / (1.0 - IQ_WFM_PRE_EMPHASIS_DECAY)
+        state.pre_prev = float(fm_audio[-1])
+        filter_input = np.concatenate((state.fm_filter_state, emphasized))
+        state.fm_filter_state = filter_input[-(len(IQ_WFM_AUDIO_TAPS) - 1):]
+        filtered = np.convolve(filter_input, IQ_WFM_AUDIO_TAPS, mode="valid")
+        modulation = np.clip(filtered, -IQ_WFM_PEAK, IQ_WFM_PEAK)
+        phase_scale = 2 * np.pi * IQ_WFM_DEVIATION / (IQ_WFM_PEAK * IQ_SAMPLE_RATE)
+        state.phase += np.cumsum(modulation * phase_scale)
+        baseband = np.exp(1j * state.phase)
+        state.phase = float(state.phase[-1] % (2 * np.pi))
+    else:
+        raise ValueError(f"unsupported SDR mode: {mode}")
     index = np.arange(state.sample_count, state.sample_count + count)
     state.sample_count += count
     carrier = np.exp(1j * 2 * np.pi * offset_hz * index / IQ_SAMPLE_RATE)
@@ -3580,6 +3649,8 @@ class SpectrumWaterfall(QWidget):
         x = self._frequency_to_x(frequency, width)
         if self._sdr_mode == "NFM":
             low_hz, high_hz = -2_500, 2_500
+        elif self._sdr_mode == "WFM":
+            low_hz, high_hz = -12_500, 12_500
         elif self._sdr_mode == "AM":
             low_hz, high_hz = -4_000, 4_000
         elif self._sdr_mode == "LSB":
@@ -3977,7 +4048,8 @@ class MainWindow(QMainWindow):
         self.sdr_button = QPushButton("SDR Off")
         self.sdr_button.clicked.connect(self.toggle_sdr)
         self.sdr_mode_selector = QComboBox()
-        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM", "AM"))
+        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM", "WFM", "AM"))
+        self.sdr_mode_selector.setToolTip("Host SDR mode; WFM is 5 kHz-deviation voice FM for 25 kHz channels")
         self.sdr_mode_selector.setVisible(False)
         self.sdr_mode_selector.currentTextChanged.connect(self.set_sdr_mode)
         self.sdr_offset = QSpinBox()
@@ -4012,7 +4084,7 @@ class MainWindow(QMainWindow):
         meters.setObjectName("meter")
         meter_layout = QVBoxLayout(meters)
         self.s_meter = Meter("S Meter", S_METER_TICKS)
-        self.swr_meter = Meter("SWR / AUD / ALC", LEVEL_METER_TICKS, "#eeae63")
+        self.swr_meter = Meter("SWR / AUD / ALC", SWR_METER_TICKS, "#eeae63")
         meter_layout.addWidget(self.s_meter)
         meter_layout.addWidget(self.swr_meter)
         top.addWidget(meters, 2)
@@ -4594,6 +4666,8 @@ class MainWindow(QMainWindow):
     def set_sdr_mode(self, mode: str) -> None:
         self.sdr_receiver.mode = mode
         self.spectrum.set_sdr(self._sdr_active, self.sdr_receiver.offset_hz, mode)
+        if mode == "WFM" and abs(self._sdr_tx_offset_hz) >= 12_000:
+            self.status.setText("WFM selected: the 12 kHz TX offset has limited Nyquist guard; verify it off-air.")
 
     def set_sdr_offset(self, offset_hz: int) -> None:
         self.sdr_receiver.offset_hz = offset_hz
@@ -4607,6 +4681,8 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("SDR TX Calibration")
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel("Use low power and an external receiver. Change one setting per test."))
+        if self.sdr_receiver.mode == "WFM":
+            layout.addWidget(QLabel("For WFM, 0 Hz gives the most margin inside the 48 kHz I/Q stream."))
         offset = QComboBox()
         for value in (12_000, 0, -12_000):
             offset.addItem(f"{value:+d} Hz", value)
@@ -4913,9 +4989,12 @@ class MainWindow(QMainWindow):
                 state.primary_meter, "S Meter", s_meter_label(state.primary_meter), S_METER_TICKS,
             )
         # Firmware only supplies a meaningful second meter while transmitting.
+        secondary_value = tx_meter_value(state)
+        secondary_name = secondary_meter_name(state.secondary_meter_kind)
+        secondary_text = swr_label(secondary_value) if state.secondary_meter_kind == 0 else str(secondary_value)
+        secondary_ticks = SWR_METER_TICKS if state.secondary_meter_kind == 0 else LEVEL_METER_TICKS
         self.swr_meter.set_value(
-            tx_meter_value(state), secondary_meter_name(state.secondary_meter_kind),
-            str(tx_meter_value(state)), LEVEL_METER_TICKS,
+            secondary_value, secondary_name, secondary_text, secondary_ticks,
         )
         if state.connected:
             self.connect_button.setText("Disconnect")
@@ -5261,6 +5340,9 @@ def self_test() -> None:
     assert s_meter_label(12) == "S6"
     assert s_meter_label(23) == "S9+20 dB"
     assert s_meter_label(33) == "S9+60 dB"
+    assert swr_label(0) == "1.0:1"
+    assert swr_label(5) == "1.5:1"
+    assert swr_label(34) == "4.4:1"
     assert tx_meter_value(tx_client.state) == 23
     tx_client.state.ptt_requested = False
     assert tx_meter_value(tx_client.state) == 0
@@ -5627,16 +5709,49 @@ def self_test() -> None:
         assert np.max(deviation_hz) >= 2000, (peak, np.max(deviation_hz))
         assert np.max(np.abs(np.diff(fm_phase))) < 0.6
 
+    # WFM is 5 kHz-deviation voice FM for a 25 kHz channel. Its stateful
+    # conditioning must reach useful deviation without crossing the limit or
+    # introducing phase discontinuities at network packet boundaries.
+    for peak in (0.05, 0.1, 0.3, 0.9):
+        fm_tone = peak * np.sin(2 * np.pi * 1000 * time_axis)
+        wfm_iq = encode_stream(fm_tone, "WFM", 0)
+        wfm_phase = np.unwrap(np.angle(np.conj(wfm_iq)))
+        deviation_hz = np.abs(np.diff(wfm_phase)) * rate / (2 * np.pi)
+        settled = deviation_hz[int(0.15 * rate):]
+        assert np.max(settled) >= 4_500, (peak, np.max(settled))
+        assert np.max(settled) <= 5_005, (peak, np.max(settled))
+        assert np.max(np.abs(np.diff(wfm_phase))) < 0.7
+
+    # Representative maximum-frequency voice modulation must remain inside the
+    # selected 25 kHz channel. This is an occupied-power check, not a regulatory
+    # emission-mask certification; final validation still requires RF hardware.
+    edge_tone = 0.3 * np.sin(2 * np.pi * 3_000 * time_axis)
+    wfm_iq = encode_stream(edge_tone, "WFM", 0)
+    settled_iq = np.conj(wfm_iq[int(0.15 * rate):])
+    wfm_spectrum = np.fft.fftshift(np.fft.fft(settled_iq * np.hanning(len(settled_iq))))
+    wfm_frequencies = np.fft.fftshift(np.fft.fftfreq(len(settled_iq), 1 / rate))
+    power = np.abs(wfm_spectrum) ** 2
+    outside_channel = np.abs(wfm_frequencies) > 12_500
+    assert np.sum(power[outside_channel]) / np.sum(power) < 0.01
+
+    try:
+        encode_stream(tone, "INVALID", 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown SDR transmit modes must fail explicitly")
+
     # Full loopback through the actual receive demodulator, simulating the
     # radio's mirror (it conjugates what we transmit).
     loopback = 0.3 * np.sin(2 * np.pi * 500 * time_axis)
-    for receive_mode, tx_mode in (("NFM", "NFM"), ("USB", "USB"), ("AM", "AM")):
+    for receive_mode, tx_mode in (("NFM", "NFM"), ("WFM", "WFM"), ("USB", "USB"), ("AM", "AM")):
         outputs: list[np.ndarray] = []
         receiver = SDRReceiver(outputs.append)
         receiver.mode = receive_mode
         receiver.offset_hz = 12_000
         receiver.SSB_OUTPUT_GAIN = 3.0
         receiver.NFM_OUTPUT_GAIN = 3.0
+        receiver.WFM_OUTPUT_GAIN = 1.5
         receiver.AM_OUTPUT_GAIN = 3.0
         receiver.start()
         try:
