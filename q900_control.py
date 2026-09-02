@@ -67,6 +67,8 @@ SPECTRUM_BINS = 512
 # repaint. Coalesce them: the GUI process shares its GIL with the microphone
 # callback, so paint cost is transmit audio quality.
 SPECTRUM_MAX_REPAINT_HZ = 15
+WATERFALL_RADIO = "radio"
+WATERFALL_AUDIO = "audio"
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
 METER_MAX = 34
 S_METER_TICKS = ((0, "S0"), (2, "S1"), (6, "S3"), (10, "S5"),
@@ -160,9 +162,8 @@ class Mode(IntEnum):
     PKT = 8
 
 
-# Q900 CAT mode values. The Q900 user manual includes FT8/data/custom-digital
-# operation; DIGI and PKT are valid CAT selections (7 and 8), not merely
-# status values.
+# Q900 firmware 3.7.6 labels CAT value 7 (DIGI) as SDR and value 8 (PKT) as
+# FT8. Keep the generic enum names for rigctl compatibility.
 SELECTABLE_MODES = tuple(Mode)
 
 
@@ -319,11 +320,23 @@ def swr_label(value: int) -> str:
 class RadioSignals(QObject):
     state_changed = pyqtSignal(object)
     spectrum_received = pyqtSignal(bytes)
+    audio_waterfall_received = pyqtSignal(bytes, int, bool)
     connection_error = pyqtSignal(str)
     audio_state_changed = pyqtSignal(str)
     rigctl_clients_changed = pyqtSignal(int)
     rigctl_ptt_requested = pyqtSignal(bool)
     sdr_stream_changed = pyqtSignal(bool)
+
+
+def audio_spectrum_db(samples: np.ndarray, iq: bool) -> np.ndarray:
+    """Return one FFT row from 4096 real samples or interleaved I/Q words."""
+    window = np.hanning(AudioWaterfall.FFT_SIZE).astype(np.float32)
+    if iq:
+        signal = samples[0::2] + 1j * samples[1::2]
+        bins = np.fft.fftshift(np.fft.fft(signal * window))
+    else:
+        bins = np.fft.rfft(samples * window)
+    return 20 * np.log10(np.maximum(np.abs(bins), 1e-12))
 
 
 class AudioSink:
@@ -433,6 +446,105 @@ def open_audio_sinks(
     return sinks, problems
 
 
+class AudioWaterfall:
+    """Build display-ready audio or I/Q spectrum rows away from audio callbacks."""
+
+    FFT_SIZE = 4096
+    DYNAMIC_RANGE_DB = 80.0
+
+    def __init__(self, output: Callable[[bytes, int, bool], None]) -> None:
+        self._output = output
+        self._queue: queue.Queue[tuple[int, np.ndarray, int, bool] | None] = queue.Queue(maxsize=32)
+        self._enabled = False
+        self._iq = False
+        self._generation = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="q900-waterfall", daemon=True)
+        self._thread.start()
+
+    def configure(self, enabled: bool, iq: bool) -> None:
+        """Select the input type. Old rows must not cross a source transition."""
+        if (enabled, iq) == (self._enabled, self._iq):
+            return
+        self._enabled = enabled
+        self._iq = iq
+        self._generation += 1
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def feed_audio(self, samples: np.ndarray, sample_rate: int) -> None:
+        if self._enabled and not self._iq:
+            self._feed(samples, sample_rate, False)
+
+    def feed_iq(self, words: np.ndarray, sample_rate: int) -> None:
+        if self._enabled and self._iq:
+            self._feed(words, sample_rate, True)
+
+    def _feed(self, samples: np.ndarray, sample_rate: int, iq: bool) -> None:
+        try:
+            self._queue.put_nowait((self._generation, samples.copy(), sample_rate, iq))
+        except queue.Full:
+            # A stale picture is preferable to delaying receive or PortAudio.
+            pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self._thread.join(timeout=0.5)
+
+    def _run(self) -> None:
+        set_interactive_qos()
+        generation = -1
+        sample_rate = 0
+        iq = False
+        blocks: deque[np.ndarray] = deque()
+        frame_count = 0
+        ceiling: float | None = None
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                continue
+            item_generation, block, item_rate, item_iq = item
+            if item_generation != self._generation:
+                continue
+            if (item_generation, item_rate, item_iq) != (generation, sample_rate, iq):
+                generation, sample_rate, iq = item_generation, item_rate, item_iq
+                blocks.clear()
+                frame_count = 0
+                ceiling = None
+            blocks.append(block)
+            frame_count += len(block) // 2 if iq else len(block)
+            while frame_count >= self.FFT_SIZE:
+                needed = self.FFT_SIZE * 2 if iq else self.FFT_SIZE
+                parts: list[np.ndarray] = []
+                remaining = needed
+                while remaining:
+                    part = blocks.popleft()
+                    if len(part) <= remaining:
+                        parts.append(part)
+                        remaining -= len(part)
+                    else:
+                        parts.append(part[:remaining])
+                        blocks.appendleft(part[remaining:])
+                        remaining = 0
+                frame_count -= self.FFT_SIZE
+                samples = np.concatenate(parts).astype(np.float32, copy=False)
+                db = audio_spectrum_db(samples, iq)
+                peak = float(np.max(db))
+                ceiling = peak if ceiling is None else max(peak, ceiling * 0.98 + peak * 0.02)
+                row = np.clip((db - (ceiling - self.DYNAMIC_RANGE_DB)) * 255 / self.DYNAMIC_RANGE_DB, 0, 255)
+                self._output(row.astype(np.uint8).tobytes(), sample_rate, iq)
+
+
 class UsbAudioMonitor:
     """Route Q900 USB receive audio to a local speaker device only.
 
@@ -441,8 +553,9 @@ class UsbAudioMonitor:
     transmit-audio path.
     """
 
-    def __init__(self, signals: RadioSignals) -> None:
+    def __init__(self, signals: RadioSignals, waterfall: AudioWaterfall | None = None) -> None:
         self.signals = signals
+        self._waterfall = waterfall
         self._input_stream: sd.InputStream | None = None
         self._output_stream: sd.OutputStream | None = None
         self._audio_queue: deque[np.ndarray] = deque()
@@ -514,6 +627,8 @@ class UsbAudioMonitor:
         def input_callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
             # Only channel 1 is receive audio. Channel 2 may carry auxiliary data.
             mono = indata[:, 0].copy()
+            if self._waterfall:
+                self._waterfall.feed_audio(mono, sample_rate)
             with self._queue_lock:
                 while self._audio_queue and self._queued_frames + frames > max_queued_frames:
                     self._queued_frames -= len(self._audio_queue.popleft())
@@ -795,8 +910,9 @@ class NetworkAudioMonitor:
     SAMPLE_RATE = 48_000
     BLOCK_SIZE = 960
 
-    def __init__(self, signals: RadioSignals) -> None:
+    def __init__(self, signals: RadioSignals, waterfall: AudioWaterfall | None = None) -> None:
         self.signals = signals
+        self._waterfall = waterfall
         self._socket: socket.socket | None = None
         # One sink per output device. Receive audio is copied to every sink, so
         # the same stream can play to a virtual device and the speakers at once.
@@ -890,8 +1006,11 @@ class NetworkAudioMonitor:
                     if len(payload) % 2:
                         continue
                     handler = self._iq_handler
+                    words = np.frombuffer(payload, dtype="<i2")
+                    if self._waterfall:
+                        self._waterfall.feed_iq(words, self.SAMPLE_RATE)
                     if handler:
-                        handler(np.frombuffer(payload, dtype="<i2"))
+                        handler(words)
                     with self._stats_lock:
                         self._packet_count += 1
                         self._last_packet_size = len(payload)
@@ -915,6 +1034,8 @@ class NetworkAudioMonitor:
                 else:
                     mono = samples
                     audio_format += " mono"
+                if self._waterfall:
+                    self._waterfall.feed_audio(mono, self.SAMPLE_RATE)
                 self.enqueue_audio(mono)
                 with self._stats_lock:
                     first_packet = self._packet_count == 0
@@ -3469,7 +3590,7 @@ class ControlTile(QPushButton):
         self.value.setText(value)
 
 
-def waterfall_argb(rows: np.ndarray, width: int) -> np.ndarray:
+def waterfall_argb(rows: np.ndarray, width: int, normalise: bool = True) -> np.ndarray:
     """Map stacked 8-bit spectrum rows to one ARGB scanline per row.
 
     Each row is normalised against its own minimum and maximum, exactly as the
@@ -3485,7 +3606,9 @@ def waterfall_argb(rows: np.ndarray, width: int) -> np.ndarray:
     minimum = full.min(axis=1, keepdims=True)
     spread = np.maximum(1, full.max(axis=1, keepdims=True) - minimum)
     # Build the ARGB words in uint32: the opaque alpha byte does not fit int32.
-    intensity = ((full[:, index] - minimum) * 255 // spread).astype(np.uint32)
+    intensity = (
+        (full[:, index] - minimum) * 255 // spread if normalise else full[:, index]
+    ).astype(np.uint32)
     return (
         np.uint32(0xFF000000)
         | (intensity << 16)
@@ -3569,8 +3692,12 @@ class SpectrumWaterfall(QWidget):
         super().__init__()
         self.setMinimumHeight(360)
         self.setMouseTracking(True)
+        self._source = WATERFALL_RADIO
         self._bins = bytes(SPECTRUM_BINS)
-        self._rows: list[bytes] = []
+        self._histories: dict[str, list[bytes]] = {
+            WATERFALL_RADIO: [], "audio": [], "iq": []
+        }
+        self._audio_sample_rate = 48_000
         self._display_center_hz = 440_400_000
         self._tuned_hz = 440_400_000
         self._mode = Mode.NFM
@@ -3599,17 +3726,44 @@ class SpectrumWaterfall(QWidget):
         self._span_hz = SPAN_HZ[state.span_index]
         self._schedule_update()
 
-    def add_bins(self, bins: bytes) -> None:
-        self._bins = bins
-        self._rows.insert(0, bins)
-        self._rows = self._rows[:140]
+    def set_source(self, source: str) -> None:
+        self._source = source
+        history = self._histories[self._active_history()]
+        if history:
+            self._bins = history[0]
+        self._schedule_update()
+
+    def add_radio_bins(self, bins: bytes) -> None:
+        self._add_bins(WATERFALL_RADIO, bins)
+
+    def add_audio_bins(self, bins: bytes, sample_rate: int, iq: bool) -> None:
+        self._audio_sample_rate = sample_rate
+        self._add_bins("iq" if iq else "audio", bins)
+
+    def _add_bins(self, source: str, bins: bytes) -> None:
+        history = self._histories[source]
+        history.insert(0, bins)
+        del history[140:]
+        if source == self._active_history():
+            self._bins = bins
         self._schedule_update()
 
     def set_sdr(self, active: bool, offset_hz: int, mode: str) -> None:
         self._sdr_active = active
         self._sdr_offset_hz = offset_hz
         self._sdr_mode = mode
+        history = self._histories[self._active_history()]
+        if history:
+            self._bins = history[0]
         self._schedule_update()
+
+    def _active_history(self) -> str:
+        if self._source == WATERFALL_RADIO:
+            return WATERFALL_RADIO
+        return "iq" if self._sdr_active else "audio"
+
+    def _is_radio(self) -> bool:
+        return self._source == WATERFALL_RADIO
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)
@@ -3618,8 +3772,9 @@ class SpectrumWaterfall(QWidget):
         spectrum_height = int(height * 0.43)
         self._draw_spectrum(painter, width, spectrum_height)
         self._draw_waterfall(painter, width, spectrum_height, height - spectrum_height)
-        self._draw_tuned_cursor(painter, width, height)
-        if self._sdr_active:
+        if self._is_radio():
+            self._draw_tuned_cursor(painter, width, height)
+        if self._sdr_active and (self._is_radio() or self._active_history() == "iq"):
             self._draw_sdr_cursor(painter, width, height)
 
     def _draw_tuned_cursor(self, painter: QPainter, width: int, height: int) -> None:
@@ -3645,20 +3800,29 @@ class SpectrumWaterfall(QWidget):
 
     def _draw_sdr_cursor(self, painter: QPainter, width: int, height: int) -> None:
         """Show the host-selected I/Q signal relative to the CAT frequency."""
-        frequency = self._tuned_hz + self._sdr_offset_hz
-        x = self._frequency_to_x(frequency, width)
+        iq_display = self._active_history() == "iq"
+        if iq_display:
+            x = width / 2 + self._sdr_offset_hz * width / self._audio_sample_rate
+        else:
+            frequency = self._tuned_hz + self._sdr_offset_hz
+            x = self._frequency_to_x(frequency, width)
         if self._sdr_mode == "NFM":
             low_hz, high_hz = -2_500, 2_500
         elif self._sdr_mode == "WFM":
-            low_hz, high_hz = -12_500, 12_500
+            # Carson bandwidth for 5 kHz deviation and 3 kHz voice audio.
+            low_hz, high_hz = -8_000, 8_000
         elif self._sdr_mode == "AM":
             low_hz, high_hz = -4_000, 4_000
         elif self._sdr_mode == "LSB":
             low_hz, high_hz = -2_800, -300
         else:
             low_hz, high_hz = 300, 2_800
-        left = self._frequency_to_x(frequency + low_hz, width)
-        right = self._frequency_to_x(frequency + high_hz, width)
+        if iq_display:
+            left = width / 2 + (self._sdr_offset_hz + low_hz) * width / self._audio_sample_rate
+            right = width / 2 + (self._sdr_offset_hz + high_hz) * width / self._audio_sample_rate
+        else:
+            left = self._frequency_to_x(frequency + low_hz, width)
+            right = self._frequency_to_x(frequency + high_hz, width)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(238, 174, 99, 62))
         painter.drawRect(QRectF(min(left, right), 0, max(2, abs(right - left)), height))
@@ -3712,17 +3876,28 @@ class SpectrumWaterfall(QWidget):
         for first, second in zip(points, points[1:]):
             painter.drawLine(first, second)
         painter.setPen(QColor("#9aaab5"))
-        painter.drawText(8, 18, f"{self._display_center_hz - self._span_hz // 2:,} Hz")
-        painter.drawText(max(8, width - 180), 18, f"{self._display_center_hz + self._span_hz // 2:,} Hz")
+        if self._is_radio():
+            left_label = f"{self._display_center_hz - self._span_hz // 2:,} Hz"
+            right_label = f"{self._display_center_hz + self._span_hz // 2:,} Hz"
+        elif self._active_history() == "iq":
+            left_label = f"IQ {-self._audio_sample_rate // 2:,} Hz"
+            right_label = f"IQ +{self._audio_sample_rate // 2:,} Hz"
+        else:
+            left_label = "Audio 0 Hz"
+            right_label = f"{self._audio_sample_rate // 2:,} Hz"
+        painter.drawText(8, 18, left_label)
+        painter.drawText(max(8, width - 180), 18, right_label)
 
     def _draw_waterfall(self, painter: QPainter, width: int, top: int, height: int) -> None:
         painter.fillRect(0, top, width, height, QColor("#02050c"))
-        if not self._rows or width < 1:
+        history = self._histories[self._active_history()]
+        if not history or width < 1:
             painter.setPen(QColor("#63727d"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Waiting for spectrum frames")
+            label = "Waiting for radio spectrum frames" if self._is_radio() else "Waiting for receive audio"
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, label)
             return
-        row_height = max(1, height // min(len(self._rows), 100))
-        rows = [row for row in self._rows[: max(1, height // row_height)] if len(row) >= 2]
+        row_height = max(1, height // min(len(history), 100))
+        rows = [row for row in history[: max(1, height // row_height)] if len(row) >= 2]
         if not rows:
             return
         bin_count = len(rows[0])
@@ -3732,7 +3907,7 @@ class SpectrumWaterfall(QWidget):
         # for 20-70 ms per repaint, which starved the microphone callback in this
         # same process and put broadband clicks on the transmitted audio.
         stacked = np.frombuffer(b"".join(rows), dtype=np.uint8).reshape(len(rows), bin_count)
-        scanlines = waterfall_argb(stacked, width)
+        scanlines = waterfall_argb(stacked, width, normalise=self._is_radio())
         image = QImage(
             # tobytes() hands Qt an owned copy, so no backing buffer has to
             # outlive this call.
@@ -3745,13 +3920,13 @@ class SpectrumWaterfall(QWidget):
         painter.drawImage(QRectF(0, top, width, len(rows) * row_height), image)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if event.button() == Qt.MouseButton.LeftButton:
+        if self._is_radio() and event.button() == Qt.MouseButton.LeftButton:
             self._drag_start = event.position().toPoint()
             self._drag_center = self._display_center_hz
             self._dragged = False
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if not self._drag_start:
+        if not self._is_radio() or not self._drag_start:
             return
         dx = event.position().x() - self._drag_start.x()
         self._dragged = self._dragged or abs(dx) >= 4
@@ -3764,7 +3939,7 @@ class SpectrumWaterfall(QWidget):
             self._last_drag_send = time.monotonic()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self._drag_start and event.button() == Qt.MouseButton.LeftButton:
+        if self._is_radio() and self._drag_start and event.button() == Qt.MouseButton.LeftButton:
             if self._dragged:
                 self.tune_requested.emit(self._tuned_hz)
             else:
@@ -3787,8 +3962,9 @@ class MainWindow(QMainWindow):
         self.resize(1600, 920)
         self.signals = RadioSignals()
         self.client = RadioClient(self.signals)
-        self.audio = UsbAudioMonitor(self.signals)
-        self.network_audio = NetworkAudioMonitor(self.signals)
+        self.audio_waterfall = AudioWaterfall(self.signals.audio_waterfall_received.emit)
+        self.audio = UsbAudioMonitor(self.signals, self.audio_waterfall)
+        self.network_audio = NetworkAudioMonitor(self.signals, self.audio_waterfall)
         self.sdr_receiver = SDRReceiver(self.network_audio.enqueue_audio)
         self.tx_audio = TransmitAudioRouter(self.signals)
         self.rigctl = RigctlServer(self.client, self.signals)
@@ -3810,6 +3986,7 @@ class MainWindow(QMainWindow):
         self._sdr_switch_pending = False
         self._sdr_restore_pending = False
         self._sdr_restore_attempts = 0
+        self._sdr_previous_mode: tuple[bool, Mode] | None = None
         self._sdr_tx_offset_hz = 12_000
         self._sdr_tx_swap_iq = False
         self._sdr_tx_invert_q = False
@@ -3854,7 +4031,8 @@ class MainWindow(QMainWindow):
         layout.addLayout(self._top_panel())
         layout.addWidget(self._control_bank())
         self.spectrum = SpectrumWaterfall()
-        self.signals.spectrum_received.connect(self.spectrum.add_bins)
+        self.signals.spectrum_received.connect(self.spectrum.add_radio_bins)
+        self.signals.audio_waterfall_received.connect(self.spectrum.add_audio_bins)
         self.spectrum.tune_requested.connect(self.tune)
         layout.addWidget(self.spectrum, 1)
         layout.addLayout(self._audio_panel())
@@ -4066,6 +4244,12 @@ class MainWindow(QMainWindow):
         header.addWidget(self.sdr_mode_selector)
         header.addWidget(self.sdr_offset)
         header.addWidget(self.sdr_tx_calibrate)
+        self.waterfall_source = QComboBox()
+        self.waterfall_source.addItem("Waterfall: Radio", WATERFALL_RADIO)
+        self.waterfall_source.addItem("Waterfall: Audio", WATERFALL_AUDIO)
+        self.waterfall_source.setToolTip("Radio uses CAT spectrum; Audio follows RX audio or SDR I/Q")
+        self.waterfall_source.currentIndexChanged.connect(self.set_waterfall_source)
+        header.addWidget(self.waterfall_source)
         self.vfo_badge = QLabel("A")
         self.vfo_badge.setStyleSheet("background: #477fd5; border-radius: 15px; padding: 8px; font-weight: bold")
         header.addWidget(self.vfo_badge)
@@ -4632,6 +4816,11 @@ class MainWindow(QMainWindow):
             self._network_audio_timer.stop()
             self._clear_network_audio_status()
 
+    def set_waterfall_source(self, index: int = 0) -> None:
+        source = str(self.waterfall_source.currentData())
+        self.spectrum.set_source(source)
+        self.audio_waterfall.configure(source == WATERFALL_AUDIO, self._sdr_active)
+
     def toggle_sdr(self) -> None:
         if self._sdr_active:
             self.exit_sdr()
@@ -4652,6 +4841,12 @@ class MainWindow(QMainWindow):
             self.status.setText("Start network receive audio before entering SDR mode.")
             return
         try:
+            active_vfo_b = self.client.state.active_vfo_b
+            previous_mode = self.client.state.vfo_b_mode if active_vfo_b else self.client.state.vfo_a_mode
+            self._sdr_previous_mode = (active_vfo_b, previous_mode)
+            # Q900 CAT mode 7 (DIGI) is the radio's SDR packet mode; mode 8
+            # (PKT) is FT8. Select SDR before requesting the I/Q stream.
+            self.client.set_mode(Mode.DIGI)
             # 0 selects the known normal stream; 1 requests the alternate IQ
             # stream. We only enable SDR after observing a 0x68 packet.
             self.client.set_stream_format(0)
@@ -4661,6 +4856,7 @@ class MainWindow(QMainWindow):
             self._sdr_switch_timer.start(2000)
             self.poll_sdr_stream()
         except (ConnectionError, OSError) as error:
+            self.restore_sdr_radio_mode()
             self.show_error(f"SDR: {error}")
 
     def set_sdr_mode(self, mode: str) -> None:
@@ -4735,6 +4931,9 @@ class MainWindow(QMainWindow):
         self.sdr_offset.setVisible(True)
         self.sdr_tx_calibrate.setVisible(True)
         self.spectrum.set_sdr(True, self.sdr_receiver.offset_hz, self.sdr_receiver.mode)
+        self.audio_waterfall.configure(
+            str(self.waterfall_source.currentData()) == WATERFALL_AUDIO, True
+        )
         self.status.setText("SDR RX active: 48 kHz network IQ at +12 kHz. Network PTT sends SDR I/Q TX.")
 
     def sdr_switch_timeout(self) -> None:
@@ -4746,6 +4945,7 @@ class MainWindow(QMainWindow):
             self.client.set_stream_format(0)
         except (ConnectionError, OSError):
             pass
+        self.restore_sdr_radio_mode()
         self.status.setText("SDR IQ stream was not detected; restored normal audio.")
 
     def exit_sdr(self) -> None:
@@ -4765,8 +4965,35 @@ class MainWindow(QMainWindow):
         self.sdr_offset.setVisible(False)
         self.sdr_tx_calibrate.setVisible(False)
         self.spectrum.set_sdr(False, 0, self.sdr_receiver.mode)
+        self.audio_waterfall.configure(
+            str(self.waterfall_source.currentData()) == WATERFALL_AUDIO, False
+        )
+        try:
+            # Leave the radio's alternate I/Q stream immediately; the retry
+            # below only verifies that normal 0x67 audio has resumed.
+            self.client.set_stream_format(0)
+        except (ConnectionError, OSError):
+            pass
+        self.restore_sdr_radio_mode()
         self.status.setText("SDR mode stopped; restoring normal network audio.")
         self.retry_normal_audio()
+
+    def restore_sdr_radio_mode(self) -> None:
+        """Restore the VFO mode that SDR temporarily replaced with PKT."""
+        previous = self._sdr_previous_mode
+        self._sdr_previous_mode = None
+        if previous is None or not self.client.state.connected:
+            return
+        previous_vfo_b, previous_mode = previous
+        active_vfo_b = self.client.state.active_vfo_b
+        try:
+            if active_vfo_b != previous_vfo_b:
+                self.client.select_vfo(previous_vfo_b)
+            self.client.set_mode(previous_mode)
+            if active_vfo_b != previous_vfo_b:
+                self.client.select_vfo(active_vfo_b)
+        except (ConnectionError, OSError):
+            pass
 
     def retry_normal_audio(self) -> None:
         if not self._sdr_restore_pending:
@@ -5062,6 +5289,7 @@ class MainWindow(QMainWindow):
         self._sdr_restore_pending = False
         self.audio.stop()
         self.network_audio.stop()
+        self.audio_waterfall.stop()
         self.client.disconnect()
         event.accept()
 
@@ -5317,6 +5545,18 @@ def self_test() -> None:
     assert encode_frame(Command.STATUS).hex() == "a5a5a5a5030bf937"
     assert encode_frame(Command.PTT, b"\x00").hex() == "a5a5a5a504070089cb"
     assert encode_frame(Command.PTT, b"\x01").hex() == "a5a5a5a504070199ea"
+    # Q900 CAT mode 7 is SDR; mode 8 is FT8. Preserve the inactive VFO while
+    # selecting SDR so host SDR entry cannot accidentally select FT8.
+    mode_client = RadioClient(RadioSignals())
+    sent_modes: list[bytes] = []
+    mode_client.send = sent_modes.append  # type: ignore[method-assign]
+    mode_client.state.vfo_a_mode = Mode.USB
+    mode_client.state.vfo_b_mode = Mode.NFM
+    mode_client.set_mode(Mode.DIGI)
+    assert sent_modes == [encode_frame(Command.SET_MODES, bytes((7, Mode.NFM)))]
+    mode_client.state.active_vfo_b = True
+    mode_client.set_mode(Mode.DIGI)
+    assert sent_modes[-1] == encode_frame(Command.SET_MODES, bytes((7, 7)))
     # Status PTT can lag the local CAT key command. Preserve the selected TX
     # meter from that status frame until the local request is released.
     tx_client = RadioClient(RadioSignals())
@@ -5634,6 +5874,21 @@ def self_test() -> None:
     assert list(produced[0]) == waterfall_argb_reference(patterns[0], 640)
     assert list(produced[1]) == waterfall_argb_reference(patterns[3], 640)
     assert produced.dtype == np.uint32
+    # Audio/IQ rows have already been normalised by the worker, so they must not
+    # be stretched again per row like the radio's raw bins.
+    fixed = waterfall_argb(np.array([[0, 255]], dtype=np.uint8), 2, normalise=False)
+    assert list(fixed[0]) == [0xFF0050BE, 0xFFFFFF28]
+    fft_samples = np.arange(AudioWaterfall.FFT_SIZE) / SDRReceiver.SAMPLE_RATE
+    audio_tone = np.sin(2 * np.pi * 1_000 * fft_samples).astype(np.float32)
+    audio_peak = int(np.argmax(audio_spectrum_db(audio_tone, False)))
+    assert audio_peak == round(1_000 * AudioWaterfall.FFT_SIZE / SDRReceiver.SAMPLE_RATE)
+    iq_tone = np.exp(1j * 2 * np.pi * 5_000 * fft_samples).astype(np.complex64)
+    iq_words = np.empty(AudioWaterfall.FFT_SIZE * 2, dtype=np.float32)
+    iq_words[0::2], iq_words[1::2] = iq_tone.real, iq_tone.imag
+    iq_peak = int(np.argmax(audio_spectrum_db(iq_words, True)))
+    assert iq_peak == AudioWaterfall.FFT_SIZE // 2 + round(
+        5_000 * AudioWaterfall.FFT_SIZE / SDRReceiver.SAMPLE_RATE
+    )
     iq_tx = np.empty(48 * 2, dtype="<i2")
     iq_tx[0::2] = 100
     iq_tx[1::2] = -100

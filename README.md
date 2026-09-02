@@ -175,10 +175,14 @@ mapping has not been confirmed: `REF`, `DISP`, `RIT`, and `XIT`.
 
 `LTIME` maps to Q900 CAT `0x32`; its radio-side unit is not yet confirmed.
 
-The spectrum is polled at roughly 8 Hz while receiving and not at all while
-transmitting: the display shows the receive passband, so it is not meaningful on
-air, and the request costs radio DSP time and a host repaint that competes with
-the microphone callback.
+The `Waterfall` selector chooses `Radio` or `Audio`. `Radio` is the CAT spectrum,
+polled at roughly 8 Hz while receiving and not at all while transmitting: the
+display shows the receive passband, so it is not meaningful on air, and the
+request costs radio DSP time and a host repaint that competes with the microphone
+callback. `Audio` is a host-generated receive spectrogram. It shows demodulated
+audio from 0 Hz to Nyquist in normal receive mode, and automatically shows the
+centered 48 kHz I/Q baseband while SDR is enabled. Audio and I/Q waterfall views
+are display-only; tune by clicking or dragging only in `Radio` mode.
 
 ## Audio And PTT
 
@@ -186,8 +190,12 @@ the microphone callback.
 
 The `SDR Off` button beside the radio mode selector enables network I/Q receive.
 It is independent of the Q900 CAT operating-mode selector. When enabled, the
-app requests the alternate stream and only activates SDR after it observes a
-Q900 UDP packet with type `0x68`.
+app temporarily selects CAT mode `DIGI` (value `7`), which firmware 3.7.6
+labels `SDR`; CAT `PKT` (value `8`) is the separate FT8 mode. It then requests
+the alternate stream. SDR activates only after it
+observes a Q900 UDP packet with type `0x68`; leaving SDR restores the prior VFO
+mode and immediately requests normal stream format `0`, confirming the return
+of `0x67` audio before declaring the transition complete.
 
 The SDR mode selector provides host-side `USB`, `LSB`, `AM`, `NFM` and `WFM`
 demodulation. I/Q packets are decoded as 48 kHz interleaved signed PCM16LE
