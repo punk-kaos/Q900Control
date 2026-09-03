@@ -224,8 +224,9 @@ I/Q directly (the firmware reads the host stream into its digital-I/Q path
 regardless of the CAT `0x67` TX-source menu; an earlier attempt to select the
 source with the extended command `F2 29 02 04` was removed after firmware
 analysis showed that command is inert — the dispatcher ignores any command
-above `0x67`). The host encoder performs a true single-sideband Hilbert
-transform for USB/LSB and mode-specific FM conditioning. NFM retains its
+above `0x67`). For USB/LSB, the host encoder uses SDRangel's 1024-point FFT
+overlap-add design to band-limit audio to 300–2800 Hz and remove the unwanted
+frequency half in one operation. NFM retains its
 existing AGC and 750 µs pre-emphasis. WFM applies a 300 Hz voice high-pass,
 75 µs pre-emphasis, a 3 kHz low-pass, and a hard 5 kHz peak-deviation limit;
 receive uses matching 75 µs de-emphasis plus channel and audio filtering. The
@@ -239,6 +240,9 @@ voice-FM energy is narrower (about 16 kHz by Carson's rule at 3 kHz audio). A
 or dummy load to validate I/Q orientation, carrier offset, 5 kHz deviation and
 occupied bandwidth before transmitting on air.
 
+The SDRangel-derived SSB filter is GPLv3 code. See `THIRD_PARTY_NOTICES.md` for
+its provenance and license links.
+
 ### GUI PTT
 
 Use `Hold To Talk` with the selected physical microphone.
@@ -247,15 +251,13 @@ Use `Hold To Talk` with the selected physical microphone.
   device.
 - Network transport sends raw Q900 UDP audio to the radio on UDP/8000, where
   the radio performs the modulation.
-- SDR network transport sends 192-byte I/Q packets every 1 ms into the
-  radio's digital-I/Q TX path.
+- SDR network transport sends complex I/Q into the radio's digital-I/Q TX path.
+  It defaults to 368 frames (1472 bytes) every 7.67 ms.
 
-Network TX uses 48 kHz, stereo, signed 16-bit little-endian PCM. A mono
-microphone source is duplicated into interleaved left/right samples. Each
-datagram is one native media frame: 48 stereo frames, 96 signed 16-bit words,
-192 bytes, sent every 1 ms. That is the same quantum the radio uses for its own
-RX audio payload. The sender runs in a separate process and uses macOS absolute
-Mach timing to hold the 1 ms cadence.
+Network TX uses 48 kHz interleaved signed 16-bit little-endian words. Normal
+audio duplicates mono into left/right samples; SDR uses those words as I/Q.
+Datagram size is configurable, and its send period scales with its frame count.
+The sender runs in a separate process and uses macOS absolute Mach timing.
 
 Transmit audio is emitted at the radio's own measured clock, and the host stream
 is rate-converted to it. Three clocks are involved: the host produces audio on
@@ -416,7 +418,8 @@ Network RX/TX audio uses UDP port `8000`. The radio-to-PC packets are Q900
 framed: a nine-byte header whose fifth byte is the stream type (`0x67` audio,
 `0x68` I/Q) and whose bytes 5..8 are the radio's device ID word, followed by a
 192-byte payload. PC-to-radio payloads are raw stereo PCM16LE without an
-application header, using the same 192-byte payload size and 1 ms cadence.
+application header. Transmit datagrams can be larger because the firmware
+stages as many as 2560 bytes.
 
 The radio will only accept a datagram whose **source port is also 8000** and
 whose source address matches its configured `REMOTE_IP`: the firmware calls
@@ -666,6 +669,12 @@ queue) and `ring` (the depth estimate in ms). A healthy transmission sits in the
 `Q900_TX_FRAMES` sets how many stereo frames go in a datagram, clamped to
 48..640, which is 1 to 13.3 ms at 48 kHz.
 
+SDR I/Q uses the same ring but has its own `Q900_IQ_TX_FRAMES` setting. It
+defaults to **368 complex frames, 1472 bytes, about 130 packets per second**:
+the largest payload that fits one Ethernet MTU. The SDR sender drains and
+primes the persistent radio ring before steady transmission and uses bounded
+catch-up and schedule-debt repayment after a late wake.
+
 The default is **640 frames, 2560 bytes, 75 packets a second**. It was chosen on
 the air: recording a second radio while transmitting a tone, going from 48 frames
 to 192 narrowed the skirt around the carrier by 8 to 9 dB and halved the
@@ -726,13 +735,21 @@ cancels it.
 
 ### Transmitting A Known Tone
 
-`Q900_TX_TONE` synthesises a sine inside the sender instead of reading the
-microphone. Everything downstream is identical -- the same DC blocker, quantiser,
-resampler, pacing and socket -- so anything a recording shows that is not present
-in an exact sine belongs to this application or the radio.
+`Q900_TX_TONE` synthesises a sine inside either network sender instead of reading
+the microphone. Everything downstream is identical -- quantisation, resampling,
+modulation where applicable, pacing and the socket -- so anything a recording
+shows that is not present in an exact sine belongs to this application or the radio.
 
 ```bash
 Q900_TX_TONE=1500 python3 q900_control.py
+```
+
+For SDR I/Q, record and analyze the exact complex payloads that successfully
+left the socket:
+
+```bash
+Q900_TX_TONE=1500 Q900_TX_RECORD=/tmp/q900 python3 q900_control.py
+python3 q900_control.py --analyze-iq-tx /tmp/q900
 ```
 
 This exists because a tone driven in through a virtual audio device cannot serve

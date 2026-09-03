@@ -1544,11 +1544,10 @@ _RESAMPLE_HISTORY = RESAMPLE_TAPS // 2
 # covers interpreter spawn and module import, not audio latency.
 NETWORK_TX_READY_TIMEOUT = 3.0
 
-# The sender writes every transmitted payload to <prefix>.tx.raw (48 kHz stereo
-# S16LE) and one 8-byte little-endian nanosecond send timestamp per packet to
-# <prefix>.tx.time. Analyse with `--analyze-tx <prefix>`. This distinguishes a
-# host-side defect from a radio-side or network-side one: if the recording is
-# clean, nothing above the socket is responsible.
+# The senders record successful socket payloads and monotonic send timestamps.
+# Normal audio uses <prefix>.tx.raw/.tx.time and `--analyze-tx`; SDR I/Q uses
+# <prefix>.iq.tx.raw/.iq.tx.time and `--analyze-iq-tx`. This distinguishes a
+# host-side defect from a radio-side or network-side one.
 TX_RECORD_PREFIX = os.environ.get("Q900_TX_RECORD") or None
 
 # Set Q900_TX_TONE to a frequency in Hz to transmit a synthesised sine instead of
@@ -6015,9 +6014,9 @@ def self_test() -> None:
     wanted_power = np.abs(usb_spectrum[wanted_bin])
     image_power = np.abs(usb_spectrum[image_bin])
     assert image_power < wanted_power * 10 ** (-40 / 20), (image_power, wanted_power)
-    # The voice FIR and Hilbert transformer each contribute half their length
-    # as streaming delay.
-    tx_test_delay = (SSB_FILTER_LEN - 1) // 2 + HILBERT_DELAY
+    # The FFT filter first accumulates one hop, then its centered impulse
+    # response contributes half a hop of group delay.
+    tx_test_delay = SSB_STREAM_DELAY
     reference = tone[: len(usb_baseband) - tx_test_delay]
     measured = usb_baseband.real[tx_test_delay:]
     correlation = np.corrcoef(measured, reference)[0, 1]
@@ -7046,6 +7045,13 @@ def main() -> None:
             return
         analyze_tx_recording(sys.argv[index + 1])
         return
+    if "--analyze-iq-tx" in sys.argv:
+        index = sys.argv.index("--analyze-iq-tx")
+        if index + 1 >= len(sys.argv):
+            print("usage: q900_control.py --analyze-iq-tx <prefix>")
+            return
+        analyze_iq_tx_recording(sys.argv[index + 1])
+        return
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     app.setFont(QFont("Arial", 10))
@@ -7060,39 +7066,59 @@ def main() -> None:
 
 SSB_LOW_HZ = 300.0
 SSB_HIGH_HZ = 2800.0
-SSB_FILTER_LEN = 511
-HILBERT_LEN = 511
-HILBERT_DELAY = (HILBERT_LEN - 1) // 2
-IQ_PACKET_FRAMES = 48
+SSB_FFT_SIZE = 1024
+SSB_FFT_HOP = SSB_FFT_SIZE // 2
+SSB_FILTER_DELAY = SSB_FFT_HOP // 2
+SSB_STREAM_DELAY = SSB_FFT_HOP + SSB_FILTER_DELAY
+# Discarding half of a real signal's spectrum halves its amplitude. Restore it,
+# then retain SDRangel's 1 dB allowance for filter overshoot.
+SSB_ANALYTIC_SCALE = 2.0 * 0.891235351562
+IQ_PACKET_FRAMES = min(
+    NETWORK_TX_MAX_DATAGRAM_BYTES // 4,
+    max(48, int(os.environ.get("Q900_IQ_TX_FRAMES") or 368)),
+)
+IQ_PACKET_BYTES = IQ_PACKET_FRAMES * 4
+IQ_PACKET_WORDS = IQ_PACKET_FRAMES * 2
+IQ_PERIOD = IQ_PACKET_FRAMES / IQ_SAMPLE_RATE
+IQ_BURST_GAP = IQ_PERIOD / 4
+IQ_PRIME_PACKETS = round(
+    RADIO_RING_TARGET_WORDS
+    / (IQ_PACKET_WORDS - IQ_BURST_GAP * RADIO_CONSUME_WORDS_PER_S)
+)
+IQ_SETTLED_WORDS = IQ_PRIME_PACKETS * IQ_PACKET_WORDS - int(
+    IQ_PRIME_PACKETS * IQ_BURST_GAP * RADIO_CONSUME_WORDS_PER_S
+)
+IQ_MAX_DEBT_PACKETS = max(
+    1, (IQ_SETTLED_WORDS - RADIO_RING_SHALLOW_WORDS) // IQ_PACKET_WORDS
+)
 IQ_PREROLL_FRAMES = 9_600
 IQ_HIGH_WATER_FRAMES = 19_200
 
 
-def _fir_bandpass_taps(low_hz: float, high_hz: float, count: int) -> np.ndarray:
-    """Windowed-sinc voice bandpass, normalized at 1 kHz."""
-    index = np.arange(count, dtype=np.float64) - (count - 1) / 2
+def _ssb_fft_filter() -> np.ndarray:
+    """Build SDRangel's windowed-sinc response for overlap-add SSB filtering.
+
+    Adapted from SDRangel's GPLv3 fftfilt::create_filter()/runSSB(), originally
+    derived from fldigi's W1HKJ overlap-add filter. SDRangel processes 512 real
+    samples in a 1024-point FFT, applies this response to only the selected
+    frequency half, rejects DC, then overlap-adds the inverse transform.
+    """
+    index = np.arange(SSB_FFT_HOP, dtype=np.float64) - SSB_FILTER_DELAY
     taps = (
-        2 * high_hz / IQ_SAMPLE_RATE
-        * np.sinc(2 * high_hz * index / IQ_SAMPLE_RATE)
-        - 2 * low_hz / IQ_SAMPLE_RATE
-        * np.sinc(2 * low_hz * index / IQ_SAMPLE_RATE)
+        2 * SSB_HIGH_HZ / IQ_SAMPLE_RATE
+        * np.sinc(2 * SSB_HIGH_HZ * index / IQ_SAMPLE_RATE)
+        - 2 * SSB_LOW_HZ / IQ_SAMPLE_RATE
+        * np.sinc(2 * SSB_LOW_HZ * index / IQ_SAMPLE_RATE)
     )
-    taps *= np.blackman(count)
-    omega = 2 * np.pi * 1000.0 / IQ_SAMPLE_RATE
-    gain = abs(np.sum(taps * np.exp(-1j * omega * np.arange(count))))
-    if gain:
-        taps /= gain
-    return taps.astype(np.float32)
+    taps *= np.blackman(SSB_FFT_HOP)
+    response = np.fft.fft(taps, SSB_FFT_SIZE)
+    peak = float(np.max(np.abs(response)))
+    if peak:
+        response /= peak
+    return response
 
 
-SSB_FILTER_TAPS = _fir_bandpass_taps(SSB_LOW_HZ, SSB_HIGH_HZ, SSB_FILTER_LEN)
-
-_hilbert_index = np.arange(HILBERT_LEN, dtype=np.float64) - HILBERT_DELAY
-HILBERT_TAPS = np.zeros(HILBERT_LEN, dtype=np.float64)
-_hilbert_odd = (np.abs(_hilbert_index) % 2) == 1
-HILBERT_TAPS[_hilbert_odd] = 2.0 / (np.pi * _hilbert_index[_hilbert_odd])
-HILBERT_TAPS *= np.blackman(HILBERT_LEN)
-HILBERT_TAPS = HILBERT_TAPS.astype(np.float32)
+SSB_FFT_FILTER = _ssb_fft_filter()
 
 
 class IqEncoderState:
@@ -7100,7 +7126,7 @@ class IqEncoderState:
 
     __slots__ = (
         "phase", "level", "ssb_dc", "fm_dc", "pre_prev", "fm_filter_state",
-        "ssb_filter_state", "hilbert_state", "ssb_gain", "sample_count",
+        "ssb_input", "ssb_output", "ssb_overlap", "ssb_mode", "sample_count",
     )
 
     def __init__(self) -> None:
@@ -7110,33 +7136,58 @@ class IqEncoderState:
         self.fm_dc = 0.0
         self.pre_prev = 0.0
         self.fm_filter_state = np.zeros(len( IQ_WFM_AUDIO_TAPS) - 1, dtype=np.float64)
-        self.ssb_filter_state = np.zeros(SSB_FILTER_LEN - 1, dtype=np.float32)
-        self.hilbert_state = np.zeros(HILBERT_LEN - 1, dtype=np.float32)
-        self.ssb_gain = 1.0
+        self.ssb_input = np.empty(0, dtype=np.float32)
+        # SDRangel emits an initially empty filter buffer while it accumulates
+        # its first FFT hop. Model that latency explicitly so arbitrary caller
+        # block sizes still receive exactly as many samples as they provide.
+        self.ssb_output: deque[np.ndarray] = deque(
+            (np.zeros(SSB_FFT_HOP, dtype=np.complex64),)
+        )
+        self.ssb_overlap = np.zeros(SSB_FFT_HOP, dtype=np.complex128)
+        self.ssb_mode: str | None = None
         self.sample_count = 0
 
 
-def _filter_ssb_audio(state: IqEncoderState, audio: np.ndarray) -> np.ndarray:
-    """Band-limit speech and apply a clean peak limiter instead of hard clipping."""
-    # A slow DC estimate remains useful ahead of the explicit high-pass edge;
-    # it keeps very large interface offsets from wasting FIR headroom.
-    state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
-    source = np.asarray(audio - state.ssb_dc, dtype=np.float32)
-    combined = np.concatenate((state.ssb_filter_state, source))
-    filtered = np.convolve(combined, SSB_FILTER_TAPS, mode="valid").astype(np.float32)
-    state.ssb_filter_state = combined[-(SSB_FILTER_LEN - 1):]
+def _encode_ssb_fft(state: IqEncoderState, audio: np.ndarray, mode: str) -> np.ndarray:
+    """Generate continuous SSB with SDRangel's FFT overlap-add method."""
+    if state.ssb_mode is None:
+        state.ssb_mode = mode
+    elif state.ssb_mode != mode:
+        raise ValueError("cannot change SSB mode without resetting encoder state")
 
-    # Never boost quiet audio here.  Only reduce gain when a peak would exceed
-    # 90% full scale; recover slowly so a single consonant does not pump speech.
-    peak = float(np.max(np.abs(filtered))) if len(filtered) else 0.0
-    target = min(1.0, 0.90 / max(peak, 1e-9))
-    if target < state.ssb_gain:
-        state.ssb_gain = target
-    else:
-        # encode_iq_block is normally called once per 1 ms I/Q packet.  This is
-        # roughly a 200 ms release and is intentionally much slower than attack.
-        state.ssb_gain += 0.005 * (target - state.ssb_gain)
-    return np.clip(filtered * state.ssb_gain, -0.98, 0.98)
+    source = np.asarray(audio, dtype=np.float32)
+    state.ssb_input = np.concatenate((state.ssb_input, source))
+    while len(state.ssb_input) >= SSB_FFT_HOP:
+        block = np.zeros(SSB_FFT_SIZE, dtype=np.complex128)
+        block[:SSB_FFT_HOP] = state.ssb_input[:SSB_FFT_HOP]
+        state.ssb_input = state.ssb_input[SSB_FFT_HOP:]
+        spectrum = np.fft.fft(block)
+        spectrum[0] = 0
+        spectrum[SSB_FFT_HOP] = 0
+        if mode == "USB":
+            spectrum[1:SSB_FFT_HOP] *= SSB_FFT_FILTER[1:SSB_FFT_HOP]
+            spectrum[SSB_FFT_HOP + 1:] = 0
+        else:
+            spectrum[1:SSB_FFT_HOP] = 0
+            spectrum[SSB_FFT_HOP + 1:] *= SSB_FFT_FILTER[SSB_FFT_HOP + 1:]
+        filtered = np.fft.ifft(spectrum)
+        output = filtered[:SSB_FFT_HOP] + state.ssb_overlap
+        state.ssb_overlap = filtered[SSB_FFT_HOP:]
+        state.ssb_output.append((output * SSB_ANALYTIC_SCALE).astype(np.complex64))
+
+    count = len(source)
+    parts: list[np.ndarray] = []
+    remaining = count
+    while remaining:
+        block = state.ssb_output[0]
+        take = min(remaining, len(block))
+        parts.append(block[:take])
+        if take == len(block):
+            state.ssb_output.popleft()
+        else:
+            state.ssb_output[0] = block[take:]
+        remaining -= take
+    return np.concatenate(parts)
 
 
 def encode_iq_block(
@@ -7145,12 +7196,7 @@ def encode_iq_block(
     """Encode 48 kHz mono audio into corrected complex I/Q samples."""
     count = len(audio)
     if mode in ("USB", "LSB"):
-        ssb_audio = _filter_ssb_audio(state, audio)
-        combined = np.concatenate((state.hilbert_state, ssb_audio))
-        quadrature = np.convolve(combined, HILBERT_TAPS, mode="valid")
-        in_phase = combined[HILBERT_DELAY : HILBERT_DELAY + count]
-        state.hilbert_state = combined[-(HILBERT_LEN - 1):]
-        baseband = in_phase + 1j * (quadrature if mode == "USB" else -quadrature)
+        baseband = _encode_ssb_fft(state, audio, mode)
     elif mode == "AM":
         state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
         baseband = 0.55 + np.clip(audio - state.ssb_dc, -0.45, 0.45).astype(np.complex64)
@@ -7214,9 +7260,9 @@ def _resolve_input_device(device_name):  # type: ignore[no-untyped-def]
 
 
 def _iq_radio_timing(radio_packet_rate: float) -> tuple[float, float]:
-    """Return (48-frame packet period, host/input frames per radio/output frame)."""
+    """Return (I/Q packet period, host/input frames per radio/output frame)."""
     if radio_packet_rate <= 0.0:
-        return IQ_PACKET_FRAMES / IQ_SAMPLE_RATE, 1.0
+        return IQ_PERIOD, 1.0
     radio_frames_per_second = (
         radio_packet_rate * 48.0 * (1.0 + TX_RATE_PPM * 1e-6)
     )
@@ -7242,8 +7288,13 @@ def udp_iq_sender(
     level,
     ready,
     failure,
+    trimmed,
+    send_errors,
+    dropped,
+    ring_depth,
 ) -> None:
-    """Capture, rate-match, modulate and pace SDR I/Q entirely in one process."""
+    """Capture, modulate and pace SDR I/Q while managing the radio TX ring."""
+    sys.setswitchinterval(0.001)
     incoming: deque[bytes] = deque()
     pending = bytearray()
     stream = None
@@ -7261,18 +7312,37 @@ def udp_iq_sender(
         stereo[:, 0] = words
         stereo[:, 1] = words
         incoming.append(stereo.tobytes())
+        held = sum(len(chunk) for chunk in incoming)
+        while held > IQ_HIGH_WATER_FRAMES * 4 and incoming:
+            held -= len(incoming.popleft())
+            dropped.value += 1
 
     try:
-        stream = sd.InputStream(
-            device=_resolve_input_device(device_name),
-            samplerate= IQ_SAMPLE_RATE,
-            blocksize= TransmitAudioRouter.BLOCK_SIZE,
-            channels=1,
-            dtype="float32",
-            latency="low",
-            callback=callback,
-        )
-        stream.start()
+        if TX_TONE_HZ > 0.0:
+            def generate() -> None:
+                index = 0
+                step = TransmitAudioRouter.BLOCK_SIZE
+                deadline = time.monotonic()
+                while not stop.is_set():
+                    axis = (index + np.arange(step)) / IQ_SAMPLE_RATE
+                    index += step
+                    block = (0.9 * np.sin(2 * np.pi * TX_TONE_HZ * axis)).astype(np.float32)
+                    callback(block.reshape(-1, 1), step, None, _NoStatus())
+                    deadline += step / IQ_SAMPLE_RATE
+                    time.sleep(max(0.0, deadline - time.monotonic()))
+
+            threading.Thread(target=generate, name="q900-iq-tx-tone", daemon=True).start()
+        else:
+            stream = sd.InputStream(
+                device=_resolve_input_device(device_name),
+                samplerate=IQ_SAMPLE_RATE,
+                blocksize=TransmitAudioRouter.BLOCK_SIZE,
+                channels=1,
+                dtype="float32",
+                latency="low",
+                callback=callback,
+            )
+            stream.start()
     except Exception as error:  # noqa: BLE001 - communicate host audio failures
         failure.value = f"microphone: {error}".encode()[:255]
         ready.set()
@@ -7282,10 +7352,16 @@ def udp_iq_sender(
         while incoming:
             pending.extend(incoming.popleft())
         if len(pending) // 4 > IQ_HIGH_WATER_FRAMES:
-            # Keep recent speech if the host outruns the radio badly.  Preserve
-            # enough filter history for the shared sinc rate converter.
             excess_frames = len(pending) // 4 - IQ_HIGH_WATER_FRAMES
-            del pending[: excess_frames * 4]
+            trim_frames = max(IQ_PACKET_FRAMES, excess_frames)
+            trim_frames = min(
+                len(pending) // 4 - _RESAMPLE_HISTORY,
+                ((trim_frames + IQ_PACKET_FRAMES - 1) // IQ_PACKET_FRAMES)
+                * IQ_PACKET_FRAMES,
+            )
+            if trim_frames > 0:
+                del pending[: trim_frames * 4]
+                trimmed.value += trim_frames // IQ_PACKET_FRAMES
 
     deadline_preroll = time.monotonic() + NETWORK_TX_READY_TIMEOUT
     while len(pending) // 4 < IQ_PREROLL_FRAMES and not stop.is_set():
@@ -7329,8 +7405,16 @@ def udp_iq_sender(
             ticks_per_second = 1_000_000_000 * info.denom / info.numer
         except (AttributeError, OSError):
             mach_time = mach_wait = None
+    period_ticks = int(period * ticks_per_second)
+    burst_gap_ticks = int(IQ_BURST_GAP * ticks_per_second)
 
-    def next_payload() -> bytes:
+    def pause(seconds: float) -> None:
+        if mach_time and mach_wait:
+            mach_wait(mach_time() + int(seconds * ticks_per_second))
+        else:
+            time.sleep(seconds)
+
+    def next_payload() -> bytes | None:
         nonlocal ratio_trim, ratio_smooth, resample_phase
         refill()
         ratio, ratio_trim, ratio_smooth =  resample_ratio(
@@ -7345,42 +7429,196 @@ def udp_iq_sender(
         )
         if converted is None:
             underruns.value += 1
-            audio = np.zeros(IQ_PACKET_FRAMES, dtype=np.float32)
-        else:
-            payload, resample_phase = converted
-            frames = np.frombuffer(payload, dtype="<i2").reshape(-1, 2)
-            audio = frames[:, 0].astype(np.float32) / 32768.0
+            return None
+        payload, resample_phase = converted
+        frames = np.frombuffer(payload, dtype="<i2").reshape(-1, 2)
+        audio = frames[:, 0].astype(np.float32) / 32768.0
         iq = encode_iq_block(state, audio, mode, offset_hz)
-        return  pack_iq_words(iq, swap_iq, invert_q)
+        return pack_iq_words(iq, swap_iq, invert_q)
+
+    record_stream = record_times = None
+    if TX_RECORD_PREFIX:
+        try:
+            record_stream = open(f"{TX_RECORD_PREFIX}.iq.tx.raw", "wb")
+            record_times = open(f"{TX_RECORD_PREFIX}.iq.tx.time", "wb")
+        except OSError:
+            if record_stream is not None:
+                record_stream.close()
+            record_stream = record_times = None
+
+    last_send = [0]
+    ring_words = [0]
+
+    def send(payload: bytes) -> bool:
+        if mach_time and mach_wait:
+            now = mach_time()
+            if last_send[0]:
+                earliest = last_send[0] + burst_gap_ticks
+                if now < earliest:
+                    mach_wait(earliest)
+                    now = mach_time()
+            last_send[0] = now
+        try:
+            udp_socket.sendto(payload, target)
+        except OSError:
+            send_errors.value += 1
+            return False
+        packets.value += 1
+        ring_words[0] = min(ring_words[0] + IQ_PACKET_WORDS, RADIO_RING_WORDS - 1)
+        ring_depth.value = ring_words[0]
+        if record_stream is not None:
+            record_stream.write(payload)
+            record_times.write(time.monotonic_ns().to_bytes(8, "little"))
+        return True
+
+    def send_scheduled() -> bool:
+        payload = next_payload()
+        return payload is not None and send(payload)
 
     try:
+        # The firmware never resets this ring. Drain any previous transmission,
+        # then prime the correction-free middle before starting steady pacing.
+        drain_until = time.monotonic() + NETWORK_TX_RING_DRAIN
+        while time.monotonic() < drain_until and not stop.is_set():
+            pause(0.002)
+        refill()
+        startup_frames = target_frames + IQ_PRIME_PACKETS * IQ_PACKET_FRAMES
+        if len(pending) // 4 > startup_frames:
+            del pending[: (len(pending) // 4 - startup_frames) * 4]
+        for _ in range(IQ_PRIME_PACKETS):
+            if stop.is_set():
+                return
+            send_scheduled()
+            ring_words[0] = max(
+                0, ring_words[0] - int(IQ_BURST_GAP * RADIO_CONSUME_WORDS_PER_S)
+            )
+            ring_depth.value = ring_words[0]
+
         deadline = mach_time() if mach_time else time.monotonic()
+        debt_packets = 0
         while not stop.is_set():
-            try:
-                udp_socket.sendto(next_payload(), target)
-            except OSError:
-                pass
-            packets.value += 1
+            ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+            ring_depth.value = ring_words[0]
+            if not send_scheduled():
+                debt_packets = min(debt_packets + 1, IQ_MAX_DEBT_PACKETS)
+            if debt_packets and send_scheduled():
+                debt_packets -= 1
             if mach_time and mach_wait:
-                deadline += int(period * ticks_per_second)
+                deadline += period_ticks
                 mach_wait(deadline)
                 lateness = (mach_time() - deadline) / ticks_per_second
                 late_ms.value = max(late_ms.value, lateness * 1000.0)
                 if lateness > period:
-                    deadline = mach_time()
+                    behind = int(lateness / period)
+                    burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
+                    for _ in range(burst):
+                        ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+                        send_scheduled()
+                    deadline += burst * period_ticks
+                    if (mach_time() - deadline) / ticks_per_second > period:
+                        now = mach_time()
+                        shortfall = max(int((now - deadline) / ticks_per_second / period), 0)
+                        ring_words[0] = max(0, ring_words[0] - shortfall * IQ_PACKET_WORDS)
+                        debt_packets = min(
+                            debt_packets + shortfall, IQ_MAX_DEBT_PACKETS
+                        )
+                        deadline = now
             else:
                 deadline += period
-                remaining = deadline - time.monotonic()
-                if remaining < 0:
-                    late_ms.value = max(late_ms.value, -remaining * 1000.0)
-                    deadline = time.monotonic()
+                lateness = time.monotonic() - deadline
+                if lateness > 0:
+                    late_ms.value = max(late_ms.value, lateness * 1000.0)
+                    behind = int(lateness / period)
+                    burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
+                    for _ in range(burst):
+                        ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+                        send_scheduled()
+                    deadline += burst * period
+                    if time.monotonic() - deadline > period:
+                        now = time.monotonic()
+                        shortfall = max(int((now - deadline) / period), 0)
+                        ring_words[0] = max(0, ring_words[0] - shortfall * IQ_PACKET_WORDS)
+                        debt_packets = min(
+                            debt_packets + shortfall, IQ_MAX_DEBT_PACKETS
+                        )
+                        deadline = now
                 else:
-                    time.sleep(remaining)
+                    time.sleep(-lateness)
     finally:
         try:
-            stream.stop(); stream.close()
+            if stream is not None:
+                stream.stop()
+                stream.close()
         except Exception:  # noqa: BLE001 - teardown must not hide the real failure
             pass
+        if record_stream is not None:
+            record_stream.close()
+            record_times.close()
+
+
+def analyze_iq_tx_recording(prefix: str) -> None:
+    """Measure tone purity and packet timing in a recorded SDR I/Q stream."""
+    try:
+        with open(f"{prefix}.iq.tx.raw", "rb") as handle:
+            raw = handle.read()
+        with open(f"{prefix}.iq.tx.time", "rb") as handle:
+            timing = handle.read()
+    except OSError as error:
+        print(f"cannot read SDR TX recording: {error}")
+        return
+    if len(timing) % 8 or not timing:
+        print("invalid SDR TX timestamp file")
+        return
+    stamps = np.frombuffer(timing, dtype="<u8")
+    if len(raw) % (len(stamps) * 4):
+        print("SDR TX payload size is not constant or is not complex S16LE")
+        return
+    packet_frames = len(raw) // len(stamps) // 4
+    words = np.frombuffer(raw, dtype="<i2").reshape(-1, 2).astype(np.float64)
+    signal = (words[:, 0] + 1j * words[:, 1]) / 32767.0
+    magnitude = np.abs(signal)
+    if not len(signal) or float(np.max(magnitude)) == 0.0:
+        print("SDR TX recording contains no signal")
+        return
+    active = np.flatnonzero(magnitude > float(np.max(magnitude)) * 0.25)
+    start = int(active[0]) + packet_frames * 2
+    stop = int(active[-1]) + 1
+    if stop - start < 1024:
+        print("SDR TX recording has no sufficiently long steady tone")
+        return
+    steady = signal[start:stop]
+    spectrum = np.fft.fft(steady * np.hanning(len(steady)))
+    frequencies = np.fft.fftfreq(len(steady), 1 / IQ_SAMPLE_RATE)
+    peak_index = int(np.argmax(np.abs(spectrum)))
+    tone_hz = float(frequencies[peak_index])
+    products = steady[1:] * np.conj(steady[:-1])
+    unit = products / np.maximum(np.abs(products), 1e-15)
+    phase_step = float(np.angle(np.mean(unit)))
+    residual = np.angle(products * np.exp(-1j * phase_step))
+    global_edges = np.arange(
+        ((start + packet_frames - 1) // packet_frames) * packet_frames,
+        stop,
+        packet_frames,
+    )
+    edge_indexes = global_edges - start - 1
+    edge_indexes = edge_indexes[(edge_indexes >= 0) & (edge_indexes < len(residual))]
+    edge_residual = residual[edge_indexes]
+    gaps_ms = np.diff(stamps.astype(np.float64)) / 1e6
+    print(
+        f"SDR TX: {len(stamps)} packets, {packet_frames} frames/packet, "
+        f"{len(signal) / IQ_SAMPLE_RATE:.2f} s"
+    )
+    print(
+        f"tone {tone_hz:+.3f} Hz, phase residual rms "
+        f"{np.sqrt(np.mean(residual**2)):.6f} rad, max {np.max(np.abs(residual)):.6f} rad"
+    )
+    if len(edge_residual):
+        print(f"packet-boundary phase residual max {np.max(np.abs(edge_residual)):.6f} rad")
+    if len(gaps_ms):
+        print(
+            f"send gaps: median {np.median(gaps_ms):.3f} ms, "
+            f"p99 {np.percentile(gaps_ms, 99):.3f} ms, max {np.max(gaps_ms):.3f} ms"
+        )
 
 
 def start_iq_udp(
@@ -7407,12 +7645,15 @@ def start_iq_udp(
     self._udp_level = self._mp.Value("d", 0.0, lock=False)
     self._udp_failure = self._mp.Array("c", 256, lock=False)
     self._udp_ready = self._mp.Event()
-    self._udp_trimmed = None
-    self._udp_send_errors = None
-    self._udp_dropped = None
+    self._udp_trimmed = self._mp.Value("L", 0, lock=False)
+    self._udp_send_errors = self._mp.Value("L", 0, lock=False)
+    self._udp_dropped = self._mp.Value("L", 0, lock=False)
     self._udp_repeats = None
-    self._udp_ring = None
+    self._udp_ring = self._mp.Value("l", 0, lock=False)
     self._input_stream = None
+    self._udp_ceiling = round(IQ_TX_LEVEL * 32767)
+    self._udp_compressor = 0
+    self._udp_digital = True
 
     try:
         device_name = sd.query_devices(microphone)["name"]
@@ -7441,6 +7682,10 @@ def start_iq_udp(
             self._udp_level,
             self._udp_ready,
             self._udp_failure,
+            self._udp_trimmed,
+            self._udp_send_errors,
+            self._udp_dropped,
+            self._udp_ring,
         ),
         name="q900-iq-tx",
         daemon=True,
@@ -7449,7 +7694,7 @@ def start_iq_udp(
 
     state = (
         f"SDR TX: microphone -> Q900 UDP {target[0]}:{target[1]} "
-        f"({mode} I/Q, {offset_hz:+d} Hz, clock-matched"
+        f"({mode} I/Q, {offset_hz:+d} Hz, {IQ_PACKET_FRAMES} frames, clock-matched"
         + (f" {radio_rate:.2f} pkt/s" if radio_rate else " nominal 48 kHz")
         + ")"
     )
@@ -7499,16 +7744,80 @@ def _raw_iq_self_test() -> None:
 
 
 def _sdr_tx_self_test() -> None:
-    def response(taps: np.ndarray, hz: float) -> float:
-        omega = 2 * np.pi * hz / IQ_SAMPLE_RATE
-        return float(abs(np.sum(taps * np.exp(-1j * omega * np.arange(len(taps))))))
+    frequencies = np.fft.fftfreq(SSB_FFT_SIZE, 1 / IQ_SAMPLE_RATE)
 
-    assert 20 * np.log10(max(response(SSB_FILTER_TAPS, 100.0), 1e-12)) < -40.0
-    assert abs(20 * np.log10(response(SSB_FILTER_TAPS, 1000.0))) < 0.2
-    assert 20 * np.log10(max(response(SSB_FILTER_TAPS, 4000.0), 1e-12)) < -60.0
-    h300 = response(HILBERT_TAPS, 300.0)
-    rejection = 20 * np.log10((1.0 + h300) / max(abs(1.0 - h300), 1e-12))
-    assert rejection > 60.0, rejection
+    def filter_db(frequency: float) -> float:
+        index = int(np.argmin(np.abs(frequencies - frequency)))
+        return 20 * np.log10(max(abs(SSB_FFT_FILTER[index]), 1e-15))
+
+    assert filter_db(100) < -40.0
+    assert abs(filter_db(1_000)) < 0.2
+    assert abs(filter_db(2_600)) < 0.2
+    assert filter_db(3_200) < -60.0
+    assert 48 <= IQ_PACKET_FRAMES <= NETWORK_TX_MAX_DATAGRAM_BYTES // 4
+    assert IQ_PACKET_BYTES == IQ_PACKET_FRAMES * 4
+    assert RADIO_RING_SHALLOW_WORDS < IQ_SETTLED_WORDS < RADIO_RING_DEEP_WORDS
+    assert IQ_PRIME_PACKETS * IQ_BURST_GAP < NETWORK_TX_RING_DRAIN
+    assert IQ_MAX_DEBT_PACKETS * IQ_PACKET_WORDS <= (
+        IQ_SETTLED_WORDS - RADIO_RING_SHALLOW_WORDS
+    )
+    test_period, test_ratio = _iq_radio_timing(999.5)
+    test_radio_rate = 999.5 * 48 * (1 + TX_RATE_PPM * 1e-6)
+    assert abs(test_period - IQ_PACKET_FRAMES / test_radio_rate) < 1e-12
+    assert abs(test_ratio - IQ_SAMPLE_RATE / test_radio_rate) < 1e-12
+
+    # Once primed, one send per slot exactly replaces what the radio consumes.
+    ring = IQ_SETTLED_WORDS
+    for _ in range(10_000):
+        ring = max(0, ring - IQ_PACKET_WORDS)
+        ring = min(ring + IQ_PACKET_WORDS, RADIO_RING_WORDS - 1)
+        assert RADIO_RING_SHALLOW_WORDS < ring < RADIO_RING_DEEP_WORDS
+
+    def encode_chunks(audio: np.ndarray, mode: str, chunks: Sequence[int]) -> np.ndarray:
+        state = IqEncoderState()
+        output: list[np.ndarray] = []
+        offset = 0
+        chunk_index = 0
+        while offset < len(audio):
+            count = min(chunks[chunk_index % len(chunks)], len(audio) - offset)
+            output.append(encode_iq_block(state, audio[offset : offset + count], mode, 0))
+            offset += count
+            chunk_index += 1
+        return np.concatenate(output)
+
+    duration = 0.5
+    sample_count = round(IQ_SAMPLE_RATE * duration)
+    time_axis = np.arange(sample_count) / IQ_SAMPLE_RATE
+    tone = (0.3 * np.sin(2 * np.pi * 1_000 * time_axis)).astype(np.float32)
+    packetized = encode_chunks(tone, "USB", (IQ_PACKET_FRAMES,))
+    irregular = encode_chunks(tone, "USB", (17, 83, 5, 211))
+    assert np.allclose(packetized, irregular, atol=1e-7)
+    assert len(pack_iq_words(packetized[:IQ_PACKET_FRAMES], False, False)) == IQ_PACKET_BYTES
+
+    # After startup, a coherent tone must remain continuous through every 1 ms
+    # packet boundary. The old limiter changed gain at these boundaries.
+    baseband = np.conj(packetized)
+    expected = tone[: len(tone) - SSB_STREAM_DELAY]
+    measured = baseband.real[SSB_STREAM_DELAY:]
+    assert np.corrcoef(measured, expected)[0, 1] > 0.999
+    settled = baseband[SSB_STREAM_DELAY + SSB_FFT_HOP:]
+    steps = np.abs(np.diff(settled))
+    packet_steps = steps[IQ_PACKET_FRAMES - 1::IQ_PACKET_FRAMES]
+    assert float(np.max(packet_steps)) <= float(np.max(steps)) * 1.01
+
+    # Sweep the speech passband and verify that the opposite sideband stays
+    # suppressed for both USB and LSB, not only at the old 1 kHz test point.
+    for mode, wanted_sign in (("USB", 1), ("LSB", -1)):
+        for frequency in (350, 600, 1_000, 1_800, 2_600):
+            source = (0.25 * np.sin(2 * np.pi * frequency * time_axis)).astype(np.float32)
+            encoded = np.conj(encode_chunks(source, mode, (48,)))[4096:]
+            spectrum = np.fft.fft(encoded * np.hanning(len(encoded)))
+            tone_frequencies = np.fft.fftfreq(len(encoded), 1 / IQ_SAMPLE_RATE)
+            wanted = abs(spectrum[np.argmin(abs(tone_frequencies - wanted_sign * frequency))])
+            image = abs(spectrum[np.argmin(abs(tone_frequencies + wanted_sign * frequency))])
+            rejection_db = 20 * np.log10(max(image, 1e-15) / max(wanted, 1e-15))
+            assert rejection_db < -70.0, (mode, frequency, rejection_db)
+
     frames = np.arange(12_000, dtype=np.int16)
     stereo = np.column_stack((frames, frames)).astype("<i2")
     converted = resample_stereo(bytearray(stereo.tobytes()), 48, 1.000493, 0.0)
