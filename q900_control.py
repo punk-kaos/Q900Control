@@ -159,7 +159,15 @@ def _show_raw_iq_state(window) -> None:
 
 
 def _set_sdr_mode(self, mode: str) -> None:
+    # The normal worker reads self.mode while processing queued blocks.  Stop and
+    # flush it before changing the mode so a queued USB/AM/FM block can never see
+    # RAW IQ and fall into the worker's unsupported-mode branch (or vice versa).
+    restart = self._sdr_active and mode != self.sdr_receiver.mode
+    if restart:
+        self.sdr_receiver.stop()
     _original_set_sdr_mode(self, mode)
+    if restart:
+        self.sdr_receiver.start()
     raw = mode == RAW_IQ_MODE
     self.sdr_offset.setEnabled(not raw)
     self.sdr_tx_calibrate.setEnabled(not raw)
