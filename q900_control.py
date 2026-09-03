@@ -70,6 +70,7 @@ SPECTRUM_MAX_REPAINT_HZ = 15
 WATERFALL_RADIO = "radio"
 WATERFALL_AUDIO = "audio"
 RAW_IQ_MODE = "RAW IQ"
+AUDIO_WATERFALL_SPAN_HZ = 8_000
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
 METER_MAX = 34
 S_METER_TICKS = ((0, "S0"), (2, "S1"), (6, "S3"), (10, "S5"),
@@ -329,14 +330,26 @@ class RadioSignals(QObject):
     sdr_stream_changed = pyqtSignal(bool)
 
 
-def audio_spectrum_db(samples: np.ndarray, iq: bool) -> np.ndarray:
+def audio_spectrum_db(
+    samples: np.ndarray, iq: bool, sample_rate: int = 48_000
+) -> np.ndarray:
     """Return one FFT row from 4096 real samples or interleaved I/Q words."""
     window = np.hanning(AudioWaterfall.FFT_SIZE).astype(np.float32)
     if iq:
         signal = samples[0::2] + 1j * samples[1::2]
-        bins = np.fft.fftshift(np.fft.fft(signal * window))
     else:
-        bins = np.fft.rfft(samples * window)
+        signal = samples
+    # Keep the full centered Nyquist span for complex I/Q. Real audio is cropped
+    # below to a centered 8 kHz span, retaining its mirrored positive/negative
+    # frequency components and filling the normal-audio display usefully.
+    bins = np.fft.fftshift(np.fft.fft(signal * window))
+    if not iq:
+        center = AudioWaterfall.FFT_SIZE // 2
+        half_span = min(
+            center,
+            round(AUDIO_WATERFALL_SPAN_HZ * AudioWaterfall.FFT_SIZE / (2 * sample_rate)),
+        )
+        bins = bins[center - half_span : center + half_span + 1]
     return 20 * np.log10(np.maximum(np.abs(bins), 1e-12))
 
 
@@ -550,7 +563,7 @@ class AudioWaterfall:
                         remaining = 0
                 frame_count -= self.FFT_SIZE
                 samples = np.concatenate(parts).astype(np.float32, copy=False)
-                db = audio_spectrum_db(samples, iq)
+                db = audio_spectrum_db(samples, iq, sample_rate)
                 peak = float(np.max(db))
                 ceiling = peak if ceiling is None else max(peak, ceiling * 0.98 + peak * 0.02)
                 row = np.clip((db - (ceiling - self.DYNAMIC_RANGE_DB)) * 255 / self.DYNAMIC_RANGE_DB, 0, 255)
@@ -3911,8 +3924,9 @@ class SpectrumWaterfall(QWidget):
             left_label = f"IQ {-self._audio_sample_rate // 2:,} Hz"
             right_label = f"IQ +{self._audio_sample_rate // 2:,} Hz"
         else:
-            left_label = "Audio 0 Hz"
-            right_label = f"{self._audio_sample_rate // 2:,} Hz"
+            audio_edge_hz = min(AUDIO_WATERFALL_SPAN_HZ // 2, self._audio_sample_rate // 2)
+            left_label = f"Audio {-audio_edge_hz:,} Hz"
+            right_label = f"Audio +{audio_edge_hz:,} Hz"
         painter.drawText(8, 18, left_label)
         painter.drawText(max(8, width - 180), 18, right_label)
 
@@ -5949,7 +5963,10 @@ def self_test() -> None:
     fft_samples = np.arange(AudioWaterfall.FFT_SIZE) / SDRReceiver.SAMPLE_RATE
     audio_tone = np.sin(2 * np.pi * 1_000 * fft_samples).astype(np.float32)
     audio_peak = int(np.argmax(audio_spectrum_db(audio_tone, False)))
-    assert audio_peak == round(1_000 * AudioWaterfall.FFT_SIZE / SDRReceiver.SAMPLE_RATE)
+    audio_center = len(audio_spectrum_db(audio_tone, False)) // 2
+    assert abs(audio_peak - audio_center) == round(
+        1_000 * AudioWaterfall.FFT_SIZE / SDRReceiver.SAMPLE_RATE
+    )
     iq_tone = np.exp(1j * 2 * np.pi * 5_000 * fft_samples).astype(np.complex64)
     iq_words = np.empty(AudioWaterfall.FFT_SIZE * 2, dtype=np.float32)
     iq_words[0::2], iq_words[1::2] = iq_tone.real, iq_tone.imag

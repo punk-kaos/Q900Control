@@ -180,7 +180,7 @@ polled at roughly 8 Hz while receiving and not at all while transmitting: the
 display shows the receive passband, so it is not meaningful on air, and the
 request costs radio DSP time and a host repaint that competes with the microphone
 callback. `Audio` is a host-generated receive spectrogram. It shows demodulated
-audio from 0 Hz to Nyquist in normal receive mode, and automatically shows the
+audio across a centered 8 kHz span in normal receive mode, and automatically shows the
 centered 48 kHz I/Q baseband while SDR is enabled. Audio and I/Q waterfall views
 are display-only; tune by clicking or dragging only in `Radio` mode.
 
