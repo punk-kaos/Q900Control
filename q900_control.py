@@ -15,6 +15,7 @@ import threading
 import numpy as np
 
 import q900_control_core as core
+import q900_sdr_tx as sdr_tx
 
 
 RAW_IQ_MODE = "RAW IQ"
@@ -233,6 +234,11 @@ core.MainWindow.configure_sdr_tx = _configure_sdr_tx
 core.MainWindow.poll_sdr_stream = _poll_sdr_stream
 core.SpectrumWaterfall._draw_sdr_cursor = _draw_sdr_cursor
 
+# Install the corrected SDR transmit path after the receive/UI patches.  It only
+# replaces I/Q TX DSP/capture; RAW IQ receive and the normal network audio sender
+# remain independent.
+sdr_tx.install(core)
+
 
 def _raw_iq_self_test() -> None:
     # The raw receiver must preserve ordering and scale even when the normal SDR
@@ -292,6 +298,7 @@ def _entrypoint() -> None:
     if "--self-test" in core.sys.argv:
         core.self_test()
         _raw_iq_self_test()
+        sdr_tx.self_test()
         return
     core.main()
 
