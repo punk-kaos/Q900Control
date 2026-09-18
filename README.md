@@ -267,18 +267,37 @@ Voice encode/decode uses the OpenDMR shared library. Build
 export Q900_OPENDMR_LIB=/path/to/libopendmr.dylib
 ```
 
-DMR transmit is currently **direct/simplex mode**. Open **SDR TX Cal** while DMR
-is selected to set Radio ID, TG/target ID, color code, direct slot and group/private
-call, along with the usual IQ offset/swap/invert calibration. The same values can
-also be supplied before startup as `Q900_DMR_ID`, `Q900_DMR_TG`, `Q900_DMR_CC`,
-`Q900_DMR_SLOT` and `Q900_DMR_PRIVATE=1`.
+DMR transmit is currently **simplex only**. By default it uses the standard
+MS-sourced voice/data sync used by normal handheld simplex operation (and by the
+handheld capture used to validate Q900 RX). Open **SDR TX Cal** while DMR is
+selected to set Radio ID, TG/target ID, color code and group/private call, along
+with the usual IQ offset/swap/invert calibration. TDMA-direct TS1/TS2 sync remains
+available as an advanced option, but is not the default. The same values can also
+be supplied before startup as `Q900_DMR_ID`, `Q900_DMR_TG`, `Q900_DMR_CC`,
+`Q900_DMR_PRIVATE=1`; set `Q900_DMR_TDMA_DIRECT=1` and `Q900_DMR_SLOT=1|2`
+only for the explicit TDMA-direct form.
 
-The transmitter builds the DMR waveform at exact nominal 48 kHz / 4800 symbols/s,
-then rate-converts the finished complex I/Q to the Q900 media clock measured from
-RX packets. This is deliberate: converting microphone audio first would make the
-RF symbol rate inherit the Q900 codec crystal error. A voice call sends link-control
-header, six-burst voice superframes with AMBE+2, embedded signaling, and a
-terminator-with-LC before CAT PTT is released.
+The transmitter keys with the same repeated 0x5F settling pattern used by MMDVM
+(default 200 ms, adjustable with `Q900_DMR_TX_PREAMBLE_MS`), sends a voice LC
+header, then six-burst voice superframes with AMBE+2 and embedded signaling, and
+finally sends a terminator-with-LC before CAT PTT is released. Microphone audio is
+continuously filtered/decimated from 48 kHz to the OpenDMR 8 kHz encoder input.
+
+The DMR waveform is built at exact nominal 48 kHz / 4800 symbols/s and only then
+rate-converted as complex I/Q to the measured Q900 media clock. This preserves the
+DMR symbol rate even when the Q900 codec crystal is off-frequency. DMR I/Q uses
+the same 0.8 host drive level as the other SDR transmit modes.
+
+For the first air tests, set `Q900_TX_RECORD=/tmp/dmrtx`. After the transmission:
+
+```bash
+python3 q900_control.py --analyze-iq-tx /tmp/dmrtx
+```
+
+For a DMR recording the analyzer decodes the exact host-to-Q900 I/Q stream and
+reports sync quality, source, destination/TG, color code, AMBE count and sender
+timing. This separates an air-interface/framing problem from anything introduced
+inside the radio after UDP ingress.
 
 Repeater uplink transmit is intentionally not enabled yet. It needs RF-slot timing
 alignment to the repeater plus calibration of the Q900 network/ring/RF latency;
