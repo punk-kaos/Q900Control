@@ -5717,6 +5717,26 @@ class MainWindow(QMainWindow):
         self.vfo_badge.setStyleSheet("background: #477fd5; border-radius: 15px; padding: 8px; font-weight: bold")
         header.addWidget(self.vfo_badge)
         frequency_layout.addLayout(header)
+
+        # DMR has enough live state that squeezing it into the generic UDP
+        # status line makes the whole window fight for width. Give it a stable,
+        # wrapping home directly under the SDR mode controls instead.
+        self.dmr_status_frame = QFrame()
+        self.dmr_status_frame.setObjectName("dmrStatus")
+        dmr_status_layout = QVBoxLayout(self.dmr_status_frame)
+        dmr_status_layout.setContentsMargins(8, 4, 8, 4)
+        dmr_status_layout.setSpacing(2)
+        self.dmr_status_primary = QLabel("DMR RX: searching")
+        self.dmr_status_primary.setWordWrap(True)
+        self.dmr_status_primary.setStyleSheet("font-weight: bold;")
+        self.dmr_status_detail = QLabel("")
+        self.dmr_status_detail.setWordWrap(True)
+        self.dmr_status_detail.setStyleSheet("color: #9aa4b2;")
+        dmr_status_layout.addWidget(self.dmr_status_primary)
+        dmr_status_layout.addWidget(self.dmr_status_detail)
+        self.dmr_status_frame.setVisible(False)
+        frequency_layout.addWidget(self.dmr_status_frame)
+
         self.frequency = QLineEdit("440.400")
         self.frequency.setObjectName("frequency")
         self.frequency.setPlaceholderText("Frequency in MHz")
@@ -6322,7 +6342,32 @@ class MainWindow(QMainWindow):
         self.network_audio_status.setText("")
         self.network_audio_status.set_detail("")
 
+    def _update_dmr_status_panel(self) -> None:
+        visible = self._sdr_active and self.sdr_receiver.mode == "DMR"
+        self.dmr_status_frame.setVisible(visible)
+        if not visible:
+            return
+        ds = self.sdr_receiver.dmr_status
+        sync = ds.sync or "searching"
+        polarity = "+" if ds.sync_polarity > 0 else "-" if ds.sync_polarity < 0 else "?"
+        self.dmr_status_primary.setText(
+            f"DMR RX  |  Input {ds.input_dbfs:.1f} dBFS  |  "
+            f"Acquire {ds.acquisition_quality:.3f}  |  Sync {sync}  |  "
+            f"Quality {ds.sync_quality:.3f}  |  Polarity {polarity}"
+        )
+        destination = "--"
+        if ds.destination is not None:
+            destination = f"{'TG' if ds.group else 'ID'} {ds.destination}"
+        self.dmr_status_detail.setText(
+            f"CC {ds.color_code if ds.color_code is not None else '--'}  |  "
+            f"TS {ds.slot if ds.slot is not None else '--'}  |  "
+            f"{destination}  |  SRC {ds.source if ds.source is not None else '--'}  |  "
+            f"Corrected {ds.corrected}  |  AMBE {ds.ambe_frames}  |  "
+            f"Vocoder errors {ds.vocoder_errors}"
+        )
+
     def update_network_audio_status(self) -> None:
+        self._update_dmr_status_panel()
         if self.network_audio.running:
             summary = self.network_audio.summary
             detail = self.network_audio.status
@@ -6331,13 +6376,6 @@ class MainWindow(QMainWindow):
                 # loud that the audio is remote so the two are never confused.
                 summary = f"KIWI {self.kiwi.label()} | {summary}"
                 detail = f"{self.kiwi.detail()}  {detail}".strip()
-            if self._sdr_active and self.sdr_receiver.mode == "DMR":
-                ds = self.sdr_receiver.dmr_status
-                summary = f"{ds.summary()} | {summary}"
-                detail = (f"DMR input={ds.input_dbfs:.1f}dBFS acquire={ds.acquisition_quality:.3f} "
-                          f"sync={ds.sync or 'search'} quality={ds.sync_quality:.3f} "
-                          f"polarity={ds.sync_polarity:+d} corrected={ds.corrected} "
-                          f"AMBE={ds.ambe_frames} vocoder-errors={ds.vocoder_errors}  {detail}").strip()
             self.network_audio_status.setText(summary)
             self.network_audio_status.set_detail(detail)
         else:
@@ -6406,6 +6444,7 @@ class MainWindow(QMainWindow):
             target = f"TG {cfg.destination_id}" if cfg.group else f"ID {cfg.destination_id}"
             self.status.setText(f"SDR DMR: RX auto-detect; simplex TX ID {cfg.source_id or 'unset'} -> "
                                 f"{target if cfg.destination_id else 'target unset'}, CC{cfg.color_code}, TS{cfg.slot}.")
+        self._update_dmr_status_panel()
         if raw:
             with self.network_audio._sink_lock:
                 stereo = any(sink.output_channels >= 2 for sink in self.network_audio._sinks)
@@ -6511,6 +6550,7 @@ class MainWindow(QMainWindow):
         self.sdr_tx_calibrate.setVisible(True)
         self.sdr_offset.setEnabled(self.sdr_receiver.mode != RAW_IQ_MODE)
         self.sdr_tx_calibrate.setEnabled(self.sdr_receiver.mode != RAW_IQ_MODE)
+        self._update_dmr_status_panel()
         self.spectrum.set_sdr(True, self.sdr_receiver.offset_hz, self.sdr_receiver.mode)
         self.audio_waterfall.configure(
             str(self.waterfall_source.currentData()) == WATERFALL_AUDIO, True
@@ -6553,6 +6593,7 @@ class MainWindow(QMainWindow):
         self.sdr_mode_selector.setVisible(False)
         self.sdr_offset.setVisible(False)
         self.sdr_tx_calibrate.setVisible(False)
+        self.dmr_status_frame.setVisible(False)
         self.spectrum.set_sdr(False, 0, self.sdr_receiver.mode)
         self.audio_waterfall.configure(
             str(self.waterfall_source.currentData()) == WATERFALL_AUDIO, False
