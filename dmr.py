@@ -200,6 +200,27 @@ class DmrConfig:
  def voice_sync(self):return SYNC_WORDS[f"DIRECT{self.slot}_VOICE"] if self.tdma_direct else SYNC_WORDS["MS_VOICE"]
  def tx_label(self):return f"TDMA-direct TS{self.slot}" if self.tdma_direct else "MS simplex"
 
+def ambe_params_bits(params):
+ p=[int(x) for x in params]
+ if len(p)!=9:raise ValueError("AMBE parameter vector must contain 9 values")
+ o=np.zeros(49,dtype=np.uint8)
+ # DMR AMBE+2 does not serialize b[0]..b[8] consecutively. This is the
+ # established OP25/OpenDMR encode_49bit() layout used before Golay/FEC.
+ o[0:4]=[(p[0]>>x)&1 for x in (6,5,4,3)]
+ o[4:8]=[(p[1]>>x)&1 for x in (4,3,2,1)]
+ o[8:12]=[(p[2]>>x)&1 for x in (4,3,2,1)]
+ o[12:20]=[(p[3]>>x)&1 for x in (8,7,6,5,4,3,2,1)]
+ o[20:24]=[(p[4]>>x)&1 for x in (6,5,4,3)]
+ o[24:28]=[(p[5]>>x)&1 for x in (4,3,2,1)]
+ o[28:31]=[(p[6]>>x)&1 for x in (3,2,1)]
+ o[31:34]=[(p[7]>>x)&1 for x in (3,2,1)]
+ o[34]=(p[8]>>2)&1;o[35]=p[1]&1;o[36]=p[2]&1
+ o[37:40]=[(p[0]>>x)&1 for x in (2,1,0)];o[40]=p[3]&1
+ o[41:44]=[(p[4]>>x)&1 for x in (2,1,0)]
+ o[44]=p[5]&1;o[45]=p[6]&1;o[46]=p[7]&1
+ o[47]=(p[8]>>1)&1;o[48]=p[8]&1
+ return o
+
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
   paths=[os.getenv("Q900_OPENDMR_LIB"),str(Path(__file__).with_name("libopendmr.dylib")),str(Path(__file__).with_name("libopendmr.so")),"/usr/local/lib/libopendmr.dylib","/usr/local/lib/libopendmr.so"];self.lib=None
@@ -213,15 +234,45 @@ class OpenDmrCodec:
   L.opendmr_encode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_uint8));L.opendmr_encode.restype=ctypes.c_bool
   if hasattr(L,"opendmr_encoder_reset"):L.opendmr_encoder_reset.argtypes=(ctypes.c_void_p,)
   if hasattr(L,"opendmr_decoder_reset"):L.opendmr_decoder_reset.argtypes=(ctypes.c_void_p,)
+  self._encode_params=getattr(L,"_ZN10MBEEncoder17encode_dmr_paramsEPKsPi",None)
+  self._encode_ota=getattr(L,"_ZN10MBEEncoder10encode_dmrEPKhPh",None)
+  if self._encode_params is not None:
+   self._encode_params.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));self._encode_params.restype=None
+  if self._encode_ota is not None:
+   self._encode_ota.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_uint8));self._encode_ota.restype=None
   self.decoder=L.opendmr_decoder_create() if dec else None;self.encoder=L.opendmr_encoder_create() if enc else None
+  if enc and (self._encode_params is None or self._encode_ota is None):
+   if self.encoder:L.opendmr_encoder_destroy(self.encoder);self.encoder=None
+   raise RuntimeError("OpenDMR TX compatibility symbols unavailable; rebuild MW0MWZ/OpenDMR without hidden C++ symbols")
+ def _encoder_impl(self):
+  if not self.encoder:raise RuntimeError("OpenDMR encoder is not open")
+  # opendmr_encoder's first field is its MBEEncoder*. Read it each time because
+  # opendmr_encoder_reset() destroys/recreates that object and changes the pointer.
+  wrapper=ctypes.cast(ctypes.c_void_p(self.encoder),ctypes.POINTER(ctypes.c_void_p))
+  impl=wrapper[0]
+  if not impl:raise RuntimeError("OpenDMR internal encoder is unavailable")
+  return impl
  def decode(self,frame):
   inp=(ctypes.c_uint8*9).from_buffer_copy(frame);out=(ctypes.c_int16*160)();err=ctypes.c_int()
   if not self.lib.opendmr_decode(self.decoder,inp,out,ctypes.byref(err)):raise RuntimeError("OpenDMR decode failed")
   return np.ctypeslib.as_array(out).copy(),err.value
  def encode(self,pcm):
-  inp=(ctypes.c_int16*160).from_buffer_copy(np.asarray(pcm,dtype=np.int16).tobytes());out=(ctypes.c_uint8*9)()
-  if not self.lib.opendmr_encode(self.encoder,inp,out):raise RuntimeError("OpenDMR encode failed")
-  return bytes(out)
+  # MW0MWZ/OpenDMR 1.0's public opendmr_encode() reconstructs the 49 AMBE
+  # parameter bits in simple b[0]..b[8] order. DMR's AMBE 3600x2450 layout is
+  # not sequential, and that public path also omits the established >>1 on the
+  # Golay(23,12) B codeword. Use the library's older OP25-derived encoder path
+  # instead: obtain b[0..8], apply its encode_49bit() permutation here, then let
+  # MBEEncoder::encode_dmr() perform the proven Golay/whitening/OTA interleave.
+  words=np.ascontiguousarray(pcm,dtype=np.int16).reshape(-1)
+  if len(words)!=160:raise ValueError("OpenDMR encode needs exactly 160 PCM samples")
+  inp=(ctypes.c_int16*160).from_buffer_copy(words.tobytes());params=(ctypes.c_int*9)()
+  impl=self._encoder_impl();self._encode_params(impl,inp,params)
+  packed=bits_bytes(ambe_params_bits(params))
+  raw=(ctypes.c_uint8*len(packed)).from_buffer_copy(packed);ota=(ctypes.c_uint8*9)()
+  self._encode_ota(impl,raw,ota)
+  # DmrVoiceTransmitter keeps AMBE frames in canonical A(24)+B(23)+C(25)
+  # order and performs the final on-air placement when building each burst.
+  return _ota_to_can(bytes_bits(bytes(ota)))
  def close(self):
   if self.decoder:self.lib.opendmr_decoder_destroy(self.decoder);self.decoder=None
   if self.encoder:self.lib.opendmr_encoder_destroy(self.encoder);self.encoder=None
@@ -394,6 +445,11 @@ class DmrAirReceiver:
   self._emit()
 
 def self_test():
+ # Independent vector for MW0MWZ/OpenDMR encoder/mbeenc.cpp encode_49bit().
+ # The old public encoder incorrectly serialized these fields consecutively
+ # (which would produce ab26d56d569a80 for this vector).
+ params=(0x55,0x12,0x0D,0x155,0x5A,0x15,0xA,0x6,0x5)
+ assert bits_bytes(ambe_params_bits(params)).hex()=="a96aabaaeda880"
  for v in (0,1,0x5A,0xFF):
   c=golay_encode(v);assert golay_decode(c)==(v,0);n=c.copy();n[[0,7,19]]^=1;assert golay_decode(n)==(v,3)
  p=bytes(range(12));c=bptc_encode(p);assert bptc_decode(c)[0]==p
