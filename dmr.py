@@ -198,7 +198,10 @@ class OpenDmrCodec:
    try:self.lib=ctypes.CDLL(p);break
    except OSError:pass
   if self.lib is None:raise RuntimeError("OpenDMR library not found; set Q900_OPENDMR_LIB")
-  L=self.lib;L.opendmr_decoder_create.restype=ctypes.c_void_p;L.opendmr_encoder_create.restype=ctypes.c_void_p;L.opendmr_decode.restype=ctypes.c_bool;L.opendmr_encode.restype=ctypes.c_bool
+  L=self.lib;L.opendmr_decoder_create.restype=ctypes.c_void_p;L.opendmr_encoder_create.restype=ctypes.c_void_p
+  L.opendmr_decoder_destroy.argtypes=(ctypes.c_void_p,);L.opendmr_encoder_destroy.argtypes=(ctypes.c_void_p,)
+  L.opendmr_decode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));L.opendmr_decode.restype=ctypes.c_bool
+  L.opendmr_encode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_uint8));L.opendmr_encode.restype=ctypes.c_bool
   self.decoder=L.opendmr_decoder_create() if dec else None;self.encoder=L.opendmr_encoder_create() if enc else None
  def decode(self,frame):
   inp=(ctypes.c_uint8*9).from_buffer_copy(frame);out=(ctypes.c_int16*160)();err=ctypes.c_int()
@@ -287,8 +290,9 @@ class DmrAirReceiver:
   if name.endswith("DATA"):self._data(bits,name,sl,qu)
   else:
    self._voice(bits,name,sl,qu,0)
-   if sl:
-    for i in range(1,6):self.tracked.append((st+i*2880,ce,sc,i,sl))
+   # Voice B..F have embedded signalling instead of a 48-bit sync. Track
+   # them from voice-A timing for both direct and repeater/base-station sync.
+   for i in range(1,6):self.tracked.append((st+i*2880,ce,sc,i,sl))
   self.done.append(st)
  def _emit(self):
   if self.status_output:self.status_output(self.status)
