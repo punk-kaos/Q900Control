@@ -1141,7 +1141,6 @@ class NetworkAudioMonitor:
                         pass
 
         def receive_packets(arrival_log, iq_raw_log, iq_time_log, capture) -> None:  # type: ignore[no-untyped-def]
-        def receive_packets(arrival_log) -> None:  # type: ignore[no-untyped-def]
             while not self._stop.is_set() and self._socket:
                 try:
                     packet, peer = self._socket.recvfrom(65_535)
