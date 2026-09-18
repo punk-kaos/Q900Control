@@ -71,6 +71,10 @@ s = s.replace(": d_gain_adjust(1.0f)", ": d_gain_adjust(0.0f)")
 mbe.write_text(s)
 
 s = api.read_text()
+if s.count('static const char *version_string = "1.0.0";') != 1:
+    raise SystemExit("OpenDMR version string no longer matches pinned source")
+s = s.replace('static const char *version_string = "1.0.0";',
+              'static const char *version_string = "1.0.0-q900fix1";')
 pairs = [
     ("enc->enc->set_gain_adjust(1.0f);", "enc->enc->set_gain_adjust(0.0f);"),
     ("enc->enc->set_gain_adjust(powf(10.0f, enc->gain_db / 20.0f));",
