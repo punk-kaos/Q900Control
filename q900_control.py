@@ -5007,6 +5007,10 @@ class MainWindow(QMainWindow):
         self._kiwi_host = ""
         self._kiwi_port = KIWI_DEFAULT_PORT
         self._kiwi_prev_waterfall: int | None = None
+        # Last (freq, mode, span) the Kiwi was told about. Status frames arrive
+        # at ~2 Hz from every source -- GUI, rigctl CAT, front panel -- so the
+        # Kiwi follows from update_state, but only on actual change.
+        self._kiwi_last_follow: tuple[int, Mode, int] | None = None
         self.tx_audio = TransmitAudioRouter(self.signals)
         self.rigctl = RigctlServer(self.client, self.signals)
         self._ptt_source: str | None = None
@@ -6212,6 +6216,7 @@ class MainWindow(QMainWindow):
             self._kiwi_active = True
             self._kiwi_host = host
             self._kiwi_port = port
+            self._kiwi_last_follow = (freq_hz, mode, state.span_index)
             self.kiwi_host.setText(f"{host}:{port}")
             self.kiwi_button.setText("Stop Kiwi")
             self._kiwi_timer.start()
@@ -6238,6 +6243,7 @@ class MainWindow(QMainWindow):
         self.kiwi_waterfall.stop()
         self.network_audio.set_kiwi_mute(False)
         self._kiwi_active = False
+        self._kiwi_last_follow = None
         self.kiwi_button.setText("Kiwi RX")
         previous, self._kiwi_prev_waterfall = self._kiwi_prev_waterfall, None
         if previous is not None and previous != self.waterfall_source.currentIndex():
@@ -6257,11 +6263,21 @@ class MainWindow(QMainWindow):
             self.exit_kiwi(f"Kiwi RX failed: {error}")
 
     def _kiwi_follow_radio(self) -> None:
-        """Retune the Kiwi to the Q900's active VFO frequency, mode and span."""
+        """Retune the Kiwi to the Q900's active VFO frequency, mode and span.
+
+        Called from update_state, so CAT changes (rigctl, front panel) are
+        followed exactly like GUI ones -- but only when something actually
+        changed, since status frames arrive at ~2 Hz.
+        """
         if not self._kiwi_active:
             return
         state = self.client.state
         freq_hz = state.vfo_b_hz if state.active_vfo_b else state.vfo_a_hz
+        mode = state.vfo_b_mode if state.active_vfo_b else state.vfo_a_mode
+        key = (freq_hz, mode, state.span_index)
+        if key == self._kiwi_last_follow:
+            return
+        self._kiwi_last_follow = key
         if not kiwi_freq_in_range(freq_hz):
             self.status.setText(
                 "Q900 left the Kiwi's 0-30 MHz range; "
@@ -6269,7 +6285,6 @@ class MainWindow(QMainWindow):
             )
             return
         self.kiwi_waterfall.retune(freq_hz, kiwi_zoom_for_span(SPAN_HZ[state.span_index]))
-        mode = state.vfo_b_mode if state.active_vfo_b else state.vfo_a_mode
         kiwi_mode = kiwi_mode_for_q900(mode)
         if kiwi_mode is None:
             # DIGI/PKT have no remote analogue: hold frequency and mode.
@@ -6603,6 +6618,10 @@ class MainWindow(QMainWindow):
         # there is nothing to follow and no transmit path to keep alive.
         if self._kiwi_active and not state.connected:
             self.exit_kiwi("Radio disconnected; Kiwi RX stopped.")
+        # Follow from state, not from individual controls: GUI tuning, rigctl
+        # CAT and the front panel all land here. Change-gated inside, so the
+        # ~2 Hz status tick does not spam the Kiwi.
+        self._kiwi_follow_radio()
         # Keep UDP/8000 bound while the TCP listener waits for a radio. Some
         # firmware starts media before the first status frame reaches the UI.
         if not state.connected and not state.listening and self.network_audio.running:

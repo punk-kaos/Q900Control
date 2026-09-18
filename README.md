@@ -450,7 +450,9 @@ comes from the server's zoom echo, so a server that clamps the zoom still
 labels correctly. Tuning stays with the Q900 entry and VFO controls, which
 the Kiwi follows.
 
-The Kiwi follows the Q900's active VFO frequency and CAT mode. Q900
+The Kiwi follows the Q900's active VFO frequency and CAT mode however they
+change -- app tuning, rigctl CAT, or the front panel -- since it follows the
+reported radio state rather than individual controls. Q900
 `NFM`/`WFM` (2.5/5 kHz deviation) map to Kiwi `nnfm`/`nbfm` respectively;
 `CWR`/`CWL` both map to `cw`; `DIGI`/`PKT` hold the Kiwi's current mode.
 The Kiwi covers 0–30 MHz, so starting or following outside that range says
