@@ -250,6 +250,40 @@ than about the tuned carrier, so they detune instead of swapping sidebands and
 are deliberately not exposed; use the offset control to retune and the mode
 selector to choose a sideband.
 
+### DMR In SDR Mode
+
+Selecting `DMR` keeps the Q900 in the same raw 48 kHz network-I/Q mode and runs
+the DMR air interface in Q900Control. Receive supports base-station, mobile and
+direct-mode sync, 4800-symbol/s 4FSK demodulation, Golay/QR/BPTC error correction,
+full link-control headers, AMBE frame extraction, color code, source ID and
+destination/TG reporting. If OpenDMR is available, the extracted AMBE+2 frames are
+decoded to speaker/virtual audio; without it, DMR framing and metadata still work.
+
+Voice encode/decode uses the OpenDMR shared library. Build
+`MW0MWZ/OpenDMR` and either place `libopendmr.dylib` / `libopendmr.so` beside
+`q900_control.py`, install it in `/usr/local/lib`, or set:
+
+```bash
+export Q900_OPENDMR_LIB=/path/to/libopendmr.dylib
+```
+
+DMR transmit is currently **direct/simplex mode**. Open **SDR TX Cal** while DMR
+is selected to set Radio ID, TG/target ID, color code, direct slot and group/private
+call, along with the usual IQ offset/swap/invert calibration. The same values can
+also be supplied before startup as `Q900_DMR_ID`, `Q900_DMR_TG`, `Q900_DMR_CC`,
+`Q900_DMR_SLOT` and `Q900_DMR_PRIVATE=1`.
+
+The transmitter builds the DMR waveform at exact nominal 48 kHz / 4800 symbols/s,
+then rate-converts the finished complex I/Q to the Q900 media clock measured from
+RX packets. This is deliberate: converting microphone audio first would make the
+RF symbol rate inherit the Q900 codec crystal error. A voice call sends link-control
+header, six-burst voice superframes with AMBE+2, embedded signaling, and a
+terminator-with-LC before CAT PTT is released.
+
+Repeater uplink transmit is intentionally not enabled yet. It needs RF-slot timing
+alignment to the repeater plus calibration of the Q900 network/ring/RF latency;
+receive of repeater/base-station DMR does not have that restriction.
+
 SDR mode also supports experimental network I/Q transmit: 48 kHz interleaved
 complex S16LE on UDP/8000. The Q900's network upconverter consumes these as raw
 I/Q directly (the firmware reads the host stream into its digital-I/Q path
