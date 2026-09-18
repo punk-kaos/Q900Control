@@ -8,6 +8,7 @@ on:
       - "dmr.py"
       - "q900_control.py"
       - ".github/workflows/dmr-selftest.yml"
+      - "tools/build_opendmr_fixed.sh"
 
 jobs:
   dmr:
@@ -21,19 +22,19 @@ jobs:
       - run: python -m pip install numpy PyQt6 pyserial sounddevice websocket-client
       - run: python -m py_compile dmr.py q900_control.py
       - run: python dmr.py
-      - name: Build OpenDMR and smoke-test real TX ABI
+      - name: Build fixed OpenDMR and smoke-test real TX ABI
         run: |
-          git clone --depth=1 https://github.com/MW0MWZ/OpenDMR.git /tmp/OpenDMR
-          make -C /tmp/OpenDMR -j2 libopendmr.so
-          Q900_OPENDMR_LIB=/tmp/OpenDMR/libopendmr.so python - <<'PY'
+          bash tools/build_opendmr_fixed.sh
+          python - <<'PY'
           import numpy as np
           import dmr
           codec = dmr.OpenDmrCodec(enc=True, dec=True)
+          assert "q900fix" in str(codec.lib._name), codec.lib._name
           frame = codec.encode(np.zeros(160, dtype=np.int16))
           assert len(frame) == 9
           pcm, errors = codec.decode(frame)
           assert len(pcm) == 160
-          print("OpenDMR native TX bridge:", frame.hex(), "decode errors", errors)
+          print("OpenDMR fixed TX bridge:", codec.lib._name, frame.hex(), "decode errors", errors)
           codec.close()
           PY
       - run: QT_QPA_PLATFORM=offscreen python q900_control.py --self-test
