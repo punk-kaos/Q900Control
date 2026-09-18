@@ -281,19 +281,36 @@ class DmrAirReceiver:
  def _find(self):
   if len(self.samples)<1560:return
   candidates=[];best_seen=0.0
+  window=24;ones=np.ones(window,dtype=np.float64)
   for phase in range(10):
    sy=self.samples[phase::10]
+   if len(sy)<window:continue
+   # Rank sync candidates by *normalized* correlation. Raw dot product is
+   # dominated by the very large discriminator transient when a TDMA handheld
+   # keys on/off, which can prevent a nearly perfect real sync from ever being
+   # examined. Normalizing by local energy makes the score about shape instead
+   # of amplitude.
+   sumy=np.convolve(sy,ones,mode="valid")
+   sumy2=np.convolve(sy*sy,ones,mode="valid")
+   local_energy=np.maximum(sumy2-(sumy*sumy/window),1e-12)
    for name,word in {**VOICE_SYNCS,**DATA_SYNCS}.items():
-    x=dibit_levels(sync_bits(word));xc=x-x.mean();co=np.correlate(sy,xc,mode="valid")
-    if not len(co):continue
-    for pos in np.argpartition(np.abs(co),-min(3,len(co)))[-3:]:
-     y=sy[pos:pos+24];sc=float(np.dot(y-y.mean(),xc)/np.dot(xc,xc))
+    x=dibit_levels(sync_bits(word));xc=x-x.mean()
+    numerator=np.correlate(sy,xc,mode="valid")
+    corr=numerator/np.sqrt(local_energy*np.dot(xc,xc))
+    if not len(corr):continue
+    for pos in np.argpartition(np.abs(corr),-min(4,len(corr)))[-4:]:
+     corr_quality=float(abs(corr[pos]))
+     best_seen=max(best_seen,corr_quality)
+     if corr_quality<.70:continue
+     y=sy[pos:pos+window];sc=float(np.dot(y-y.mean(),xc)/np.dot(xc,xc))
      if abs(sc)<80:continue
-     ce=float(y.mean()-sc*x.mean());res=y-(ce+sc*x);qu=max(0.,1.-float(np.sqrt(np.mean(res*res)))/(abs(sc)*2))
-     best_seen=max(best_seen,qu)
+     ce=float(y.mean()-sc*x.mean());res=y-(ce+sc*x)
+     qu=max(0.,1.-float(np.sqrt(np.mean(res*res)))/(abs(sc)*2))
      st=self.base+phase+(int(pos)-54)*10
-     if qu>=.72 and st>=self.base and not self._used(st):
-      candidates.append((qu,name,st,ce,sc))
+     if qu>=.65 and st>=self.base and not self._used(st):
+      # Sort primarily by normalized sync shape, then by the fitted-level
+      # residual quality used by the slicer.
+      candidates.append((corr_quality,qu,name,st,ce,sc))
   self.status.acquisition_quality=max(self.status.acquisition_quality*0.85,best_seen)
   if not candidates:return
 
@@ -301,8 +318,8 @@ class DmrAirReceiver:
   # true data sync correlate just as well with positive-polarity voice sync (and
   # vice versa). Resolve that ambiguity with the burst structure/FEC instead of
   # trusting correlation alone. Valid data candidates get first refusal.
-  candidates.sort(reverse=True,key=lambda c:c[0])
-  for qu,name,st,ce,sc in candidates:
+  candidates.sort(reverse=True,key=lambda c:(c[0],c[1]))
+  for corr_quality,qu,name,st,ce,sc in candidates:
    if not name.endswith("DATA"):continue
    sy=self._symbols(st)
    if sy is None:continue
@@ -322,7 +339,7 @@ class DmrAirReceiver:
    return
 
   # No structurally valid data burst: accept the strongest voice candidate.
-  qu,name,st,ce,sc=next((c for c in candidates if c[1].endswith("VOICE")),candidates[0])
+  corr_quality,qu,name,st,ce,sc=next((c for c in candidates if c[2].endswith("VOICE")),candidates[0])
   self.status.sync_polarity=1 if sc>=0 else -1;self.status.carrier_hz=ce;sy=self._symbols(st)
   if sy is None:return
   bits=levels_bits(sy,ce,sc);sl=self._slot(name)
@@ -355,6 +372,16 @@ def self_test():
  lc=LinkControl(1234567,91);burst=build_data_burst(full_lc_payload(lc,1),1,1,SYNC_WORDS["DIRECT1_DATA"]);r=parse_data_burst(burst);assert r["lc_valid"] and r["lc"]==lc
  a=(bytes(range(9)),bytes(range(9,18)),bytes(range(18,27)))
  for i in range(6):assert ota_to_ambe(build_voice_burst(a,lc,1,i,1))==a
+ # Regression for real TDMA captures: a high-energy key-up transient must
+ # not outrank a lower-amplitude but correctly shaped sync sequence.
+ ideal=dibit_levels(sync_bits(SYNC_WORDS["MS_VOICE"]))
+ noisy=np.zeros(140,dtype=np.float64);noisy[8:32]=12000*np.sign(np.sin(np.arange(24)*1.7))
+ noisy[80:104]=12000+650*ideal
+ xc=ideal-ideal.mean();raw=np.correlate(noisy,xc,mode="valid")
+ assert int(np.argmax(np.abs(raw)))!=80
+ sy=noisy;sumy=np.convolve(sy,np.ones(24),mode="valid");sumy2=np.convolve(sy*sy,np.ones(24),mode="valid")
+ energy=np.maximum(sumy2-sumy*sumy/24,1e-12);corr=np.correlate(sy,xc,mode="valid")/np.sqrt(energy*np.dot(xc,xc))
+ assert int(np.argmax(np.abs(corr)))==80 and abs(corr[80])>.999
  got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})));m=Dmr4FskModulator(12000,False);z=m.modulate(dmo_cycle_bits(burst))
  for i in range(0,len(z),173):rx.feed(z[i:i+173],12000)
  assert any(s.source==lc.source and s.destination==lc.destination for s in got),[s.summary() for s in got]
