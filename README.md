@@ -259,25 +259,36 @@ full link-control headers, AMBE frame extraction, color code, source ID and
 destination/TG reporting. If OpenDMR is available, the extracted AMBE+2 frames are
 decoded to speaker/virtual audio; without it, DMR framing and metadata still work.
 
-Voice encode/decode uses the OpenDMR shared library. Build
-`MW0MWZ/OpenDMR` and either place `libopendmr.dylib` / `libopendmr.so` beside
-`q900_control.py`, install it in `/usr/local/lib`, or set:
+Voice encode/decode uses the OpenDMR shared library. For DMR transmit,
+use the Q900Control fixed build:
 
 ```bash
-export Q900_OPENDMR_LIB=/path/to/libopendmr.dylib
+bash tools/build_opendmr_fixed.sh
 ```
 
-For transmit, Q900Control deliberately does **not** call OpenDMR 1.0's public
+The builder pins MW0MWZ/OpenDMR 1.0, restores two DMR encoder details that were
+lost when its encoder was simplified from OP25, and writes
+`libopendmr-q900fix.dylib` (macOS) or `libopendmr-q900fix.so` (Linux) beside
+`q900_control.py`. Q900Control prefers that file automatically. An explicit
+`Q900_OPENDMR_LIB=/path/to/library` still takes precedence.
+
+The first fixed detail is AMBE voiced/unvoiced analysis. OP25 groups the IMBE
+`v_uv_dsn` analysis vector in threes when evaluating DMR harmonics; OpenDMR 1.0
+indexes it directly by harmonic number. That preserves speech pitch and cadence
+but corrupts the harmonic voicing pattern, producing speech-shaped yet
+unintelligible audio. The fixed build restores the OP25 DMR indexing. It also
+restores the encoder's neutral gain-adjust default: OP25 uses an additive
+`0.0`, whereas OpenDMR 1.0 initializes that parameter to `1.0`.
+
+Separately, Q900Control does **not** use OpenDMR 1.0's public
 `opendmr_encode()` frame builder. That path serializes the nine AMBE parameters
 consecutively, but DMR AMBE 3600x2450 uses the non-sequential 49-bit layout in
-OpenDMR's own older OP25-derived `encode_49bit()`; the public path also differs
-from the established encoder on the Golay(23,12) B-codeword alignment. The result
-is a structurally valid DMR call whose LC/ID/TG decodes while speech is mostly
-garbage. Q900Control instead calls the already-linked `MBEEncoder` parameter
-encoder, applies that established 49-bit permutation, and feeds it through
-`MBEEncoder::encode_dmr()`. No patched OpenDMR library is required. Builds that
-hide those C++ symbols are rejected for DMR TX rather than silently using the
-known-bad public path.
+OpenDMR's older OP25-derived `encode_49bit()`; the public path also differs on
+the Golay(23,12) B-codeword alignment. Q900Control calls the linked
+`MBEEncoder` parameter encoder, applies that established 49-bit permutation,
+and feeds it through `MBEEncoder::encode_dmr()`. Builds that hide those C++
+symbols are rejected for DMR TX rather than silently using the known-bad public
+frame builder.
 
 DMR transmit is currently **simplex only**. By default it uses the standard
 MS-sourced voice/data sync used by normal handheld simplex operation (and by the
