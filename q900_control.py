@@ -9053,6 +9053,16 @@ IQ_PACKET_FRAMES = min(
 IQ_PACKET_BYTES = IQ_PACKET_FRAMES * 4
 IQ_PACKET_WORDS = IQ_PACKET_FRAMES * 2
 IQ_PERIOD = IQ_PACKET_FRAMES / IQ_SAMPLE_RATE
+# DMR cannot tolerate the firmware's single-sample ring corrections. Use a
+# smaller datagram so the pre-send ring depth moves in much smaller steps and
+# hold a deeper cushion than analog SDR. 192 frames = 4 ms at 48 kHz.
+DMR_IQ_PACKET_FRAMES = max(
+    48, min(NETWORK_TX_MAX_DATAGRAM_BYTES // 4,
+            int(os.environ.get("Q900_DMR_IQ_TX_FRAMES") or 192))
+)
+DMR_RING_TARGET_WORDS = int(os.environ.get("Q900_DMR_RING_TARGET_WORDS") or 3840)
+if not RADIO_RING_SHALLOW_WORDS < DMR_RING_TARGET_WORDS < RADIO_RING_DEEP_WORDS:
+    raise ValueError("Q900_DMR_RING_TARGET_WORDS must stay inside the firmware correction window")
 IQ_BURST_GAP = IQ_PERIOD / 4
 IQ_PRIME_PACKETS = round(
     RADIO_RING_TARGET_WORDS
@@ -9276,14 +9286,16 @@ def _resolve_input_device(device_name):  # type: ignore[no-untyped-def]
     return device_name
 
 
-def _iq_radio_timing(radio_packet_rate: float) -> tuple[float, float]:
+def _iq_radio_timing(
+    radio_packet_rate: float, packet_frames: int = IQ_PACKET_FRAMES
+) -> tuple[float, float]:
     """Return (I/Q packet period, host/input frames per radio/output frame)."""
     if radio_packet_rate <= 0.0:
         radio_packet_rate = 1000.0
     radio_frames_per_second = (
         radio_packet_rate * 48.0 * (1.0 + TX_RATE_PPM * 1e-6)
     )
-    return IQ_PACKET_FRAMES / radio_frames_per_second, IQ_SAMPLE_RATE / radio_frames_per_second
+    return packet_frames / radio_frames_per_second, IQ_SAMPLE_RATE / radio_frames_per_second
 
 
 def udp_iq_sender(
@@ -9323,6 +9335,8 @@ def udp_iq_sender(
     dmr_tx = None
     dmr_iq_pending = np.empty((0, 2), dtype=np.float32)
     dmr_resample_phase = 0.0
+    packet_frames = DMR_IQ_PACKET_FRAMES if mode == "DMR" else IQ_PACKET_FRAMES
+    packet_words = packet_frames * 2
 
     def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
         if status.input_overflow:
@@ -9379,20 +9393,20 @@ def udp_iq_sender(
             pending.extend(incoming.popleft())
         if len(pending) // 4 > IQ_HIGH_WATER_FRAMES:
             excess_frames = len(pending) // 4 - IQ_HIGH_WATER_FRAMES
-            trim_frames = max(IQ_PACKET_FRAMES, excess_frames)
+            trim_frames = max(packet_frames, excess_frames)
             trim_frames = min(
                 len(pending) // 4 - _RESAMPLE_HISTORY,
-                ((trim_frames + IQ_PACKET_FRAMES - 1) // IQ_PACKET_FRAMES)
-                * IQ_PACKET_FRAMES,
+                ((trim_frames + packet_frames - 1) // packet_frames)
+                * packet_frames,
             )
             if trim_frames > 0:
                 del pending[: trim_frames * 4]
                 if priming_started:
-                    trimmed.value += trim_frames // IQ_PACKET_FRAMES
+                    trimmed.value += trim_frames // packet_frames
                 else:
                     # Waiting for confirmed TX may build more pre-key capture
                     # than we need. Discarding it is not an on-air sample splice.
-                    startup_trimmed += trim_frames // IQ_PACKET_FRAMES
+                    startup_trimmed += trim_frames // packet_frames
 
     if mode == "DMR":
         try:
@@ -9427,7 +9441,14 @@ def udp_iq_sender(
 
     keyed_at_ns = time.monotonic_ns()
     state = IqEncoderState()
-    period, base_ratio = _iq_radio_timing(radio_packet_rate)
+    period, base_ratio = _iq_radio_timing(radio_packet_rate, packet_frames)
+    burst_gap = period / 4.0
+    ring_target_words = DMR_RING_TARGET_WORDS if mode == "DMR" else RADIO_RING_TARGET_WORDS
+    net_words_per_prime = packet_words - burst_gap * RADIO_CONSUME_WORDS_PER_S
+    prime_packets = max(1, round(ring_target_words / max(net_words_per_prime, 1.0)))
+    settled_words = prime_packets * packet_words - int(
+        prime_packets * burst_gap * RADIO_CONSUME_WORDS_PER_S
+    )
     ratio_trim = 0.0
     ratio_smooth = (0.0, 0.0)
     resample_phase = 0.0
@@ -9451,7 +9472,7 @@ def udp_iq_sender(
         except (AttributeError, OSError):
             mach_time = mach_wait = None
     period_ticks = int(period * ticks_per_second)
-    burst_gap_ticks = int(IQ_BURST_GAP * ticks_per_second)
+    burst_gap_ticks = int(burst_gap * ticks_per_second)
 
     def pause(seconds: float) -> None:
         if mach_time and mach_wait:
@@ -9477,7 +9498,7 @@ def udp_iq_sender(
             # conversion here is nominal-48k -> measured Q900 media clock.
             # Let the 200 ms DMR preamble provide burst-generation cushion.
             converted_iq = resample_float_frames(
-                dmr_iq_pending, IQ_PACKET_FRAMES, base_ratio, dmr_resample_phase)
+                dmr_iq_pending, packet_frames, base_ratio, dmr_resample_phase)
             if converted_iq is None:
                 underruns.value += 1
                 return None
@@ -9486,7 +9507,7 @@ def udp_iq_sender(
             return pack_iq_words(iq, swap_iq, invert_q)
         ratio, ratio_trim, ratio_smooth = resample_ratio(
             len(pending) // 4, target_frames, ratio_trim, base_ratio, ratio_smooth)
-        converted = resample_stereo(pending, IQ_PACKET_FRAMES, ratio, resample_phase)
+        converted = resample_stereo(pending, packet_frames, ratio, resample_phase)
         if converted is None:
             underruns.value += 1
             return None
@@ -9532,7 +9553,7 @@ def udp_iq_sender(
         packets.value += 1
         sent_words = np.frombuffer(payload, dtype="<i2").reshape(-1, 2).astype(np.float64)
         iq_level.value = float(np.max(np.hypot(sent_words[:, 0], sent_words[:, 1]))) / 32767.0
-        ring_words[0] = min(ring_words[0] + IQ_PACKET_WORDS, RADIO_RING_WORDS - 1)
+        ring_words[0] = min(ring_words[0] + packet_words, RADIO_RING_WORDS - 1)
         ring_depth.value = ring_words[0]
         if record_stream is not None:
             record_stream.write(payload)
@@ -9550,23 +9571,23 @@ def udp_iq_sender(
         while time.monotonic() < drain_until and not stop.is_set():
             pause(0.002)
         refill()
-        startup_frames = target_frames + IQ_PRIME_PACKETS * IQ_PACKET_FRAMES
+        startup_frames = target_frames + prime_packets * packet_frames
         if len(pending) // 4 > startup_frames:
             del pending[: (len(pending) // 4 - startup_frames) * 4]
         priming_started = True
-        for _ in range(IQ_PRIME_PACKETS):
+        for _ in range(prime_packets):
             if stop.is_set():
                 return
             send_scheduled()
             ring_words[0] = max(
-                0, ring_words[0] - int(IQ_BURST_GAP * RADIO_CONSUME_WORDS_PER_S)
+                0, ring_words[0] - int(burst_gap * RADIO_CONSUME_WORDS_PER_S)
             )
             ring_depth.value = ring_words[0]
 
         deadline = mach_time() if mach_time else time.monotonic()
         debt_packets = 0
         while not stop.is_set():
-            ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+            ring_words[0] = max(0, ring_words[0] - packet_words)
             ring_depth.value = ring_words[0]
             if not send_scheduled():
                 debt_packets = min(debt_packets + 1, IQ_MAX_DEBT_PACKETS)
@@ -9587,7 +9608,7 @@ def udp_iq_sender(
                     if (mach_time() - deadline) / ticks_per_second > period:
                         now = mach_time()
                         shortfall = max(int((now - deadline) / ticks_per_second / period), 0)
-                        ring_words[0] = max(0, ring_words[0] - shortfall * IQ_PACKET_WORDS)
+                        ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
                         debt_packets = min(
                             debt_packets + shortfall, IQ_MAX_DEBT_PACKETS
                         )
@@ -9624,7 +9645,7 @@ def udp_iq_sender(
                 dmr_iq_pending = np.concatenate((dmr_iq_pending, term_stereo), axis=0)
                 if len(dmr_iq_pending):
                     tail = np.repeat(
-                        dmr_iq_pending[-1:], IQ_PACKET_FRAMES + 2 * _RESAMPLE_HISTORY, axis=0
+                        dmr_iq_pending[-1:], packet_frames + 2 * _RESAMPLE_HISTORY, axis=0
                     )
                     dmr_iq_pending = np.concatenate((dmr_iq_pending, tail), axis=0)
                 finish_phase = dmr_resample_phase
@@ -9636,7 +9657,7 @@ def udp_iq_sender(
                 finish_deadline = time.monotonic() + 1.0
                 while time.monotonic() < finish_deadline:
                     converted_iq = resample_float_frames(
-                        dmr_iq_pending, IQ_PACKET_FRAMES, base_ratio, finish_phase
+                        dmr_iq_pending, packet_frames, base_ratio, finish_phase
                     )
                     if converted_iq is None:
                         break
@@ -9681,7 +9702,10 @@ def udp_iq_sender(
                 "dmr_source": (dmr_tx.c.source_id if dmr_tx is not None else None),
                 "dmr_destination": (dmr_tx.c.destination_id if dmr_tx is not None else None),
                 "dmr_color_code": (dmr_tx.c.color_code if dmr_tx is not None else None),
-                "frames_per_packet": IQ_PACKET_FRAMES,
+                "frames_per_packet": packet_frames,
+                "ring_target_words": ring_target_words,
+                "ring_settled_words": settled_words,
+                "prime_packets": prime_packets,
                 "radio_packet_rate": radio_packet_rate,
                 "send_period_s": period,
                 "base_resample_ratio": base_ratio,
@@ -9793,6 +9817,11 @@ def analyze_iq_tx_recording(prefix: str) -> None:
                 f"p99 {np.percentile(gaps_ms, 99):.3f} ms, max {np.max(gaps_ms):.3f} ms"
             )
         if metadata:
+            print(
+                f"  ring: target {metadata.get('ring_target_words')} words, "
+                f"settled {metadata.get('ring_settled_words')} words, "
+                f"prime {metadata.get('prime_packets')} packets"
+            )
             print(f"  sender counters: {metadata.get('counters', {})}")
         return
 
@@ -9959,7 +9988,8 @@ def start_iq_udp(
     )
     state = (
         f"SDR TX: {source} -> Q900 UDP {target[0]}:{target[1]} "
-        f"({mode} I/Q, {offset_hz:+d} Hz, {IQ_PACKET_FRAMES} frames, clock-matched"
+        f"({mode} I/Q, {offset_hz:+d} Hz, "
+        f"{DMR_IQ_PACKET_FRAMES if mode == 'DMR' else IQ_PACKET_FRAMES} frames, clock-matched"
         + (f" {radio_rate:.2f} pkt/s" if radio_rate else " nominal 48 kHz")
         + ")"
     )
@@ -9976,6 +10006,21 @@ def start_iq_udp(
 
 TransmitAudioRouter.start_iq_udp = start_iq_udp
 
+
+
+def _dmr_tx_continuity_self_test() -> None:
+    period, _ = _iq_radio_timing(1000.0, DMR_IQ_PACKET_FRAMES)
+    gap = period / 4.0
+    net = DMR_IQ_PACKET_FRAMES * 2 - gap * RADIO_CONSUME_WORDS_PER_S
+    prime = max(1, round(DMR_RING_TARGET_WORDS / max(net, 1.0)))
+    settled = prime * DMR_IQ_PACKET_FRAMES * 2 - int(
+        prime * gap * RADIO_CONSUME_WORDS_PER_S
+    )
+    pre_send = settled - DMR_IQ_PACKET_FRAMES * 2
+    # Firmware tests depth before appending each datagram. Keep enough room on
+    # both sides that a normal scheduler hiccup cannot trigger sample insertion.
+    assert pre_send - RADIO_RING_SHALLOW_WORDS >= int(0.018 * RADIO_CONSUME_WORDS_PER_S)
+    assert RADIO_RING_DEEP_WORDS - settled >= int(0.006 * RADIO_CONSUME_WORDS_PER_S)
 
 
 def _rx_continuity_self_test() -> None:
@@ -10652,6 +10697,7 @@ _protocol_self_test = self_test
 def self_test() -> None:
     _protocol_self_test()
     _raw_iq_self_test()
+    _dmr_tx_continuity_self_test()
     _rx_continuity_self_test()
     _sdr_ptt_self_test()
     _sdr_clock_self_test()
