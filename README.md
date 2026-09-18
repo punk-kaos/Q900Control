@@ -175,6 +175,13 @@ mapping has not been confirmed: `REF`, `DISP`, `RIT`, and `XIT`.
 
 `LTIME` maps to Q900 CAT `0x32`; its radio-side unit is not yet confirmed.
 
+The waterfall uses one shared black-blue-cyan-green-yellow-red map in every
+mode, so colors mean the same thing everywhere. Rows are scaled to stable
+references rather than stretched per row: the radio's undocumented CAT scale
+is fitted with slow floor/ceiling followers, audio rides its existing 80 dB
+ceiling-relative window, and Kiwi bytes pass through a fixed window matching
+the Kiwi's own sliders.
+
 The `Waterfall` selector chooses `Radio` or `Audio`. `Radio` is the CAT spectrum,
 polled at roughly 8 Hz while receiving and not at all while transmitting: the
 display shows the receive passband, so it is not meaningful on air, and the

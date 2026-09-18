@@ -1935,6 +1935,7 @@ class KiwiWaterfallMonitor:
         self._stats_lock = threading.Lock()
         self._max_freq_khz = 30_000.0
         self._zoom_actual = KIWI_MAX_ZOOM
+        self._start_counter: int | None = None
         self._center_hz = 0.0
         self._span_hz = 0.0
         self._frames = 0
@@ -1963,6 +1964,7 @@ class KiwiWaterfallMonitor:
             self._port = port
             self._max_freq_khz = 30_000.0
             self._zoom_actual = zoom
+            self._start_counter = None
             self._center_hz = float(freq_hz)
             self._span_hz = span_khz * 1000.0
             self._frames = 0
@@ -2128,20 +2130,20 @@ class KiwiWaterfallMonitor:
                 pass
         elif name == "zoom" and value is not None:
             try:
-                with self._stats_lock:
-                    self._zoom_actual = int(value)
+                zoom = int(value)
             except ValueError:
-                pass
+                return
+            with self._stats_lock:
+                self._zoom_actual = zoom
+                self._refresh_axis_locked()
         elif name == "start" and value is not None:
             try:
                 start = int(value)
             except ValueError:
                 return
             with self._stats_lock:
-                center, span = kiwi_waterfall_axis(
-                    self._max_freq_khz, self._zoom_actual, start
-                )
-                self._center_hz, self._span_hz = center, span
+                self._start_counter = start
+                self._refresh_axis_locked()
         elif name == "wf_setup":
             try:
                 self._send_setup(ws)
@@ -2153,6 +2155,20 @@ class KiwiWaterfallMonitor:
             error = _kiwi_server_error(name, value, host)
             if error is not None:
                 raise error
+
+    def _refresh_axis_locked(self) -> None:
+        """Recompute the render axis from the last zoom/start echo pair.
+
+        Caller must hold _stats_lock. Either echo can arrive alone (e.g. a
+        zoom clamp without a retune), so each recomputes from the last known
+        counterpart rather than only the paired message.
+        """
+        if self._start_counter is None:
+            return
+        center, span = kiwi_waterfall_axis(
+            self._max_freq_khz, self._zoom_actual, self._start_counter
+        )
+        self._center_hz, self._span_hz = center, span
 
     def _handle_waterfall(self, body: bytes) -> None:
         if len(body) < 12:
@@ -4505,31 +4521,67 @@ class ControlTile(QPushButton):
         self.value.setText(value)
 
 
-def waterfall_argb(rows: np.ndarray, width: int, normalise: bool = True) -> np.ndarray:
+def _waterfall_colormap_lut() -> np.ndarray:
+    """256-entry ARGB LUT transcribing the KiwiSDR waterfall colors.
+
+    Black to blue to cyan to green to yellow to red, exactly the stops the
+    Kiwi web UI uses (see jks-prv/kiwiclient's waterfall color index). One
+    shared map for every source is what makes colors mean the same thing in
+    Radio, Audio and Kiwi modes. Built once: fancy-indexing it per repaint is
+    far cheaper than computing stops per pixel, and paint cost here is
+    transmit audio quality (see below).
+    """
+    i = np.arange(256, dtype=np.float64)
+    red = np.zeros(256)
+    green = np.zeros(256)
+    blue = np.zeros(256)
+    blue[i < 32] = i[i < 32] * 255 / 31
+    peaked = (i >= 32) & (i < 72)
+    green[peaked] = (i[peaked] - 32) * 255 / 39
+    blue[peaked] = 255
+    cooling = (i >= 72) & (i < 96)
+    green[cooling] = 255
+    blue[cooling] = 255 - (i[cooling] - 72) * 255 / 23
+    warming = (i >= 96) & (i < 116)
+    red[warming] = (i[warming] - 96) * 255 / 19
+    green[warming] = 255
+    hot = (i >= 116) & (i < 184)
+    red[hot] = 255
+    green[hot] = 255 - (i[hot] - 116) * 255 / 67
+    hottest = i >= 184
+    red[hottest] = 255
+    blue[hottest] = (i[hottest] - 184) * 128 / 70
+    packed = (
+        np.uint32(0xFF000000)
+        | (np.clip(np.rint(red), 0, 255).astype(np.uint32) << 16)
+        | (np.clip(np.rint(green), 0, 255).astype(np.uint32) << 8)
+        | np.clip(np.rint(blue), 0, 255).astype(np.uint32)
+    )
+    return packed
+
+
+WATERFALL_LUT = _waterfall_colormap_lut()
+
+# Kiwi waterfall bytes read roughly as dBm + 255, so a fixed window maps them
+# the way the Kiwi's own min/max sliders do. Live captures put the HF noise
+# floor near 150-165 and strong signals near 200-220.
+KIWI_WF_FLOOR_BYTE = 140.0
+KIWI_WF_CEIL_BYTE = 215.0
+
+
+def waterfall_argb(rows: np.ndarray, width: int) -> np.ndarray:
     """Map stacked 8-bit spectrum rows to one ARGB scanline per row.
 
-    Each row is normalised against its own minimum and maximum, exactly as the
-    original per-pixel mapping did. Vectorising this is not cosmetic: a
+    Rows arrive already scaled to 0-255 by their producer (slow followers for
+    the radio's unknown CAT scale, a fixed dB window for audio and Kiwi), so
+    no per-row stretching happens here: stable levels are what make colors
+    comparable frame to frame. Vectorising this is not cosmetic: a
     QImage.setPixel() loop over the same pixels costs 20-70 ms per repaint,
     which is one to three microphone callback periods, and the GUI process
     shares its GIL with that callback. Paint cost is transmit audio quality.
     """
     index = np.arange(width) * (rows.shape[1] - 1) // max(1, width - 1)
-    full = rows.astype(np.int32)
-    # Normalise against the whole row, not the resampled pixels. These coincide
-    # once the widget is wider than the bin count but diverge when it is not.
-    minimum = full.min(axis=1, keepdims=True)
-    spread = np.maximum(1, full.max(axis=1, keepdims=True) - minimum)
-    # Build the ARGB words in uint32: the opaque alpha byte does not fit int32.
-    intensity = (
-        (full[:, index] - minimum) * 255 // spread if normalise else full[:, index]
-    ).astype(np.uint32)
-    return (
-        np.uint32(0xFF000000)
-        | (intensity << 16)
-        | ((80 + intensity * 175 // 255) << 8)
-        | (40 + (255 - intensity) * 150 // 255)
-    )
+    return WATERFALL_LUT[np.ascontiguousarray(rows[:, index], dtype=np.uint8)]
 
 
 def receive_outputs(
@@ -4633,6 +4685,12 @@ class SpectrumWaterfall(QWidget):
         self._tuned_hz = 440_400_000
         self._mode = Mode.NFM
         self._span_hz = SPAN_HZ[2]
+        # Radio CAT bins arrive on an undocumented scale, so they are fitted
+        # with slow floor/ceiling followers rather than stretched per row:
+        # instant attack, ~25 s release on top and ~6 s rise underneath at the
+        # ~8 Hz frame rate. Colors then mean the same thing frame to frame.
+        self._radio_floor = 0.0
+        self._radio_ceil = 255.0
         # Remote Kiwi waterfall axis, from the server's zoom/start echo.
         self._kiwi_center_hz = 0
         self._kiwi_span_hz = 0
@@ -4668,7 +4726,23 @@ class SpectrumWaterfall(QWidget):
         self._schedule_update()
 
     def add_radio_bins(self, bins: bytes) -> None:
-        self._add_bins(WATERFALL_RADIO, bins)
+        if bins:
+            row = np.frombuffer(bins, dtype=np.uint8).astype(np.float32)
+            peak = float(row.max())
+            trough = float(row.min())
+            if peak > self._radio_ceil:
+                self._radio_ceil = peak
+            else:
+                self._radio_ceil += (peak - self._radio_ceil) * 0.005
+            if trough < self._radio_floor:
+                self._radio_floor = trough
+            else:
+                self._radio_floor += (trough - self._radio_floor) * 0.02
+            spread = max(8.0, self._radio_ceil - self._radio_floor)
+            row = np.clip((row - self._radio_floor) * 255.0 / spread, 0, 255)
+            self._add_bins(WATERFALL_RADIO, row.astype(np.uint8).tobytes())
+        else:
+            self._add_bins(WATERFALL_RADIO, bins)
 
     def add_audio_bins(self, bins: bytes, sample_rate: int, iq: bool) -> None:
         self._audio_sample_rate = sample_rate
@@ -4684,7 +4758,18 @@ class SpectrumWaterfall(QWidget):
         """
         self._kiwi_center_hz = int(center_hz)
         self._kiwi_span_hz = int(span_hz)
-        self._add_bins(WATERFALL_KIWI, bins)
+        if bins:
+            row = np.frombuffer(bins, dtype=np.uint8).astype(np.float32)
+            row = np.clip(
+                (row - KIWI_WF_FLOOR_BYTE)
+                * 255.0
+                / (KIWI_WF_CEIL_BYTE - KIWI_WF_FLOOR_BYTE),
+                0,
+                255,
+            )
+            self._add_bins(WATERFALL_KIWI, row.astype(np.uint8).tobytes())
+        else:
+            self._add_bins(WATERFALL_KIWI, bins)
 
     def _add_bins(self, source: str, bins: bytes) -> None:
         history = self._histories[source]
@@ -4874,7 +4959,9 @@ class SpectrumWaterfall(QWidget):
             # Leave a small center gap so the tuned carrier remains visible.
             return ((-2_500, -150), (150, 2_500))
         if self._mode == Mode.WFM:
-            return ((-50_000, 50_000),)
+            # 5 kHz-deviation voice FM: same shape as the 2.5 kHz NFM marker
+            # at twice the width, not broadcast FM.
+            return ((-5_000, -150), (150, 5_000))
         return ((-1_500, 1_500),)
 
     def _draw_spectrum(self, painter: QPainter, width: int, height: int) -> None:
@@ -4940,7 +5027,7 @@ class SpectrumWaterfall(QWidget):
         # for 20-70 ms per repaint, which starved the microphone callback in this
         # same process and put broadband clicks on the transmitted audio.
         stacked = np.frombuffer(b"".join(rows), dtype=np.uint8).reshape(len(rows), bin_count)
-        scanlines = waterfall_argb(stacked, width, normalise=self._is_radio())
+        scanlines = waterfall_argb(stacked, width)
         image = QImage(
             # tobytes() hands Qt an owned copy, so no backing buffer has to
             # outlive this call.
@@ -7199,18 +7286,10 @@ def self_test() -> None:
     # exactly. That loop was replaced because it held the GIL for 20-70 ms per
     # repaint and starved the microphone callback in the same process.
     def waterfall_argb_reference(bins: bytes, width: int) -> list[int]:
-        minimum, maximum = min(bins), max(bins)
-        spread = max(1, maximum - minimum)
         out = []
         for x in range(width):
             index = int(x * (len(bins) - 1) / max(1, width - 1))
-            intensity = (bins[index] - minimum) * 255 // spread
-            out.append(
-                0xFF000000
-                | (intensity << 16)
-                | ((80 + intensity * 175 // 255) << 8)
-                | (40 + (255 - intensity) * 150 // 255)
-            )
+            out.append(int(WATERFALL_LUT[bins[index]]))
         return out
 
     patterns = [
@@ -7226,16 +7305,18 @@ def self_test() -> None:
                 np.frombuffer(pattern, dtype=np.uint8).reshape(1, -1), test_width
             )
             assert list(produced[0]) == expected, (test_width, len(pattern))
-    # Multiple rows are normalised independently, exactly as the row loop was.
+    # Rows map independently through the shared LUT: no per-row stretching.
     multi = np.frombuffer(patterns[0] + patterns[3], dtype=np.uint8).reshape(2, 512)
     produced = waterfall_argb(multi, 640)
     assert list(produced[0]) == waterfall_argb_reference(patterns[0], 640)
     assert list(produced[1]) == waterfall_argb_reference(patterns[3], 640)
     assert produced.dtype == np.uint32
-    # Audio/IQ rows have already been normalised by the worker, so they must not
-    # be stretched again per row like the radio's raw bins.
-    fixed = waterfall_argb(np.array([[0, 255]], dtype=np.uint8), 2, normalise=False)
-    assert list(fixed[0]) == [0xFF0050BE, 0xFFFFFF28]
+    # Spot-check the LUT stops: black floor, white-hot top.
+    assert WATERFALL_LUT[0] == 0xFF000000
+    assert WATERFALL_LUT[255] == 0xFFFF0082
+    assert WATERFALL_LUT[32] == 0xFF0000FF
+    fixed = waterfall_argb(np.array([[0, 255]], dtype=np.uint8), 2)
+    assert list(fixed[0]) == [WATERFALL_LUT[0], WATERFALL_LUT[255]]
     fft_samples = np.arange(AudioWaterfall.FFT_SIZE) / SDRReceiver.SAMPLE_RATE
     audio_tone = np.sin(2 * np.pi * 1_000 * fft_samples).astype(np.float32)
     audio_peak = int(np.argmax(audio_spectrum_db(audio_tone, False)))
@@ -9699,6 +9780,11 @@ def _kiwi_self_test() -> None:
     wf._dispatch_frame(None, b"MSG zoom=10 start=7862559", False)
     assert abs(wf._center_hz - 14_073_030) < 2_000
     assert abs(wf._span_hz - 29_296.875) < 1.0
+    # An unpaired zoom echo (e.g. a server-side clamp) still corrects the
+    # axis from the last known start counter.
+    wf._dispatch_frame(None, b"MSG zoom=11", False)
+    assert abs(wf._span_hz - 29_296.875 / 2) < 1.0
+    assert abs(wf._center_hz - (14_058_380 + 29_296.875 / 4)) < 2_000
     row = bytes(range(256)) * 4
     wf._dispatch_frame(
         None, b"W/F\x00" + struct.pack("<III", 1, 10, 7) + row, False
@@ -9733,9 +9819,35 @@ def _kiwi_self_test() -> None:
     assert view._active_history() == WATERFALL_KIWI
     assert view._is_kiwi()
     view.add_kiwi_bins(bytes(KIWI_WF_BINS), 14_073_030.0, 29_296.875)
-    assert view._bins == bytes(KIWI_WF_BINS)
     assert view._kiwi_to_x(14_073_030, 800) == 400
     assert abs(view._kiwi_to_x(14_087_678, 800) - 800) < 1
+    # Kiwi rows pass through a fixed window: the floor maps to 0, the
+    # ceiling to 255, so view._bins is the scaled row, not the raw bytes.
+    assert view._bins == bytes(KIWI_WF_BINS)
+    view.add_kiwi_bins(bytes((140,)) * KIWI_WF_BINS, 14_073_030.0, 29_296.875)
+    assert set(view._bins) == {0}
+    view.add_kiwi_bins(bytes((215,)) * KIWI_WF_BINS, 14_073_030.0, 29_296.875)
+    assert set(view._bins) == {255}
+    view.add_kiwi_bins(bytes((177,)) * KIWI_WF_BINS, 14_073_030.0, 29_296.875)
+    assert abs(view._bins[0] - 126) <= 1
+
+    # Radio rows are fitted with slow followers, not stretched per row: fast
+    # attack on a new extreme, then a steady level maps identically.
+    radio_view = SpectrumWaterfall.__new__(SpectrumWaterfall)
+    radio_view._source = WATERFALL_RADIO
+    radio_view._histories = {WATERFALL_RADIO: [], "audio": [], "iq": [], WATERFALL_KIWI: []}
+    radio_view._bins = bytes(SPECTRUM_BINS)
+    radio_view._radio_floor = 100.0
+    radio_view._radio_ceil = 150.0
+    radio_view._schedule_update = lambda: None  # type: ignore[method-assign]
+    radio_view.add_radio_bins(bytes(range(30, 160)) * 4)
+    assert radio_view._radio_floor == 30.0
+    assert radio_view._radio_ceil == 159.0
+    first_mapped = bytes(radio_view._bins)
+    radio_view.add_radio_bins(bytes(range(30, 160)) * 4)
+    assert bytes(radio_view._bins) == first_mapped
+    radio_view.add_radio_bins(bytes((200,)) * SPECTRUM_BINS)
+    assert radio_view._radio_ceil == 200.0
 
     # Muting suppresses Q900 playback accounting-wise: stats still run (they
     # are updated by the receive path regardless), but nothing may play.
