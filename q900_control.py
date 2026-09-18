@@ -458,11 +458,11 @@ class AudioSink:
             while self._queue and self._queued_frames + len(block) > self._max_queued_frames:
                 discarded = self._queue.popleft()
                 self._queued_frames -= len(discarded)
-                self.dropped_frames += len(discarded)
+                self.dropped_frames = getattr(self, "dropped_frames", 0) + len(discarded)
             self._queue.append(block)
             self._queued_frames += len(block)
             self.max_queued_frames_seen = max(
-                self.max_queued_frames_seen, self._queued_frames
+                getattr(self, "max_queued_frames_seen", 0), self._queued_frames
             )
 
     def enqueue(self, samples: np.ndarray) -> None:
@@ -516,7 +516,6 @@ class AudioSink:
             self._primed = False
 
 
-def open_audio_sinks(
 def open_audio_sinks(
     devices: Sequence[int],
     sample_rate: int,
@@ -873,7 +872,6 @@ class SDRReceiver:
                 # This used to throw away a complete 20 ms I/Q block silently.
                 self.queue_drops += 1
 
-    def _run(self) -> None:
     def _run(self) -> None:
         set_interactive_qos()
         phase = 0
@@ -9938,8 +9936,6 @@ def _sdr_clock_self_test() -> None:
             finally:
                 monitor.stop()
 
-
-def _sdr_tx_self_test() -> None:
 
 def _sdr_tx_self_test() -> None:
     frequencies = np.fft.fftfreq(SSB_FFT_SIZE, 1 / IQ_SAMPLE_RATE)
