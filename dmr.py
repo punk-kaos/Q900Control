@@ -276,7 +276,7 @@ class DmrAirReceiver:
   self.tracked=q
  def _find(self):
   if len(self.samples)<1560:return
-  best=None;best_seen=0.0
+  candidates=[];best_seen=0.0
   for phase in range(10):
    sy=self.samples[phase::10]
    for name,word in {**VOICE_SYNCS,**DATA_SYNCS}.items():
@@ -284,25 +284,46 @@ class DmrAirReceiver:
     if not len(co):continue
     for pos in np.argpartition(np.abs(co),-min(3,len(co)))[-3:]:
      y=sy[pos:pos+24];sc=float(np.dot(y-y.mean(),xc)/np.dot(xc,xc))
-     # Q900/raw-IQ frequency orientation and receiver mixing can invert the
-     # discriminator. A negative slope is still the same valid DMR sync; the
-     # slicer already handles it because normalization divides by that slope.
      if abs(sc)<80:continue
      ce=float(y.mean()-sc*x.mean());res=y-(ce+sc*x);qu=max(0.,1.-float(np.sqrt(np.mean(res*res)))/(abs(sc)*2))
      best_seen=max(best_seen,qu)
      st=self.base+phase+(int(pos)-54)*10
-     if qu>=.72 and st>=self.base and not self._used(st) and (best is None or qu>best[0]):best=(qu,name,st,ce,sc)
+     if qu>=.72 and st>=self.base and not self._used(st):
+      candidates.append((qu,name,st,ce,sc))
   self.status.acquisition_quality=max(self.status.acquisition_quality*0.85,best_seen)
-  if not best:return
-  qu,name,st,ce,sc=best;self.status.sync_polarity=1 if sc>=0 else -1;sy=self._symbols(st)
+  if not candidates:return
+
+  # Data and voice sync are complements, so an inverted discriminator makes a
+  # true data sync correlate just as well with positive-polarity voice sync (and
+  # vice versa). Resolve that ambiguity with the burst structure/FEC instead of
+  # trusting correlation alone. Valid data candidates get first refusal.
+  candidates.sort(reverse=True,key=lambda c:c[0])
+  for qu,name,st,ce,sc in candidates:
+   if not name.endswith("DATA"):continue
+   sy=self._symbols(st)
+   if sy is None:continue
+   bits=levels_bits(sy,ce,sc)
+   try:
+    parsed=parse_data_burst(bits)
+   except ValueError:
+    continue
+   dtype=parsed["data_type"]
+   # LC-bearing bursts have an independent RS check; require it during initial
+   # acquisition so complementary voice sync cannot win on a random FEC decode.
+   if dtype in (DT_VOICE_LC_HEADER,DT_TERMINATOR_WITH_LC) and not parsed.get("lc_valid",False):
+    continue
+   self.status.sync_polarity=1 if sc>=0 else -1
+   self._data(bits,name,self._slot(name),qu)
+   self.done.append(st)
+   return
+
+  # No structurally valid data burst: accept the strongest voice candidate.
+  qu,name,st,ce,sc=next((c for c in candidates if c[1].endswith("VOICE")),candidates[0])
+  self.status.sync_polarity=1 if sc>=0 else -1;sy=self._symbols(st)
   if sy is None:return
   bits=levels_bits(sy,ce,sc);sl=self._slot(name)
-  if name.endswith("DATA"):self._data(bits,name,sl,qu)
-  else:
-   self._voice(bits,name,sl,qu,0)
-   # Voice B..F have embedded signalling instead of a 48-bit sync. Track
-   # them from voice-A timing for both direct and repeater/base-station sync.
-   for i in range(1,6):self.tracked.append((st+i*2880,ce,sc,i,sl))
+  self._voice(bits,name,sl,qu,0)
+  for i in range(1,6):self.tracked.append((st+i*2880,ce,sc,i,sl))
   self.done.append(st)
  def _emit(self):
   if self.status_output:self.status_output(self.status)
