@@ -101,7 +101,7 @@ by up to one group, which for a 32 ms group in a 40 s window is an 800 ppm error
 length, so treat a short window with suspicion. Nothing is reported until five
 thousand packets have accumulated.
 
-### Arrival Pattern
+### Arrival Pattern And SDR I/Q Capture
 
 If the radio clock figure looks unstable, record the arrival pattern:
 
@@ -115,6 +115,28 @@ in groups from a host that is not reading the socket in time. The two need
 opposite fixes, and the timestamps tell them apart: a starved reader leaves an
 otherwise evenly paced stream interrupted by stalls, whereas a grouping radio
 produces almost no evenly paced intervals at all.
+
+While SDR I/Q is active the same recording also writes
+`/tmp/q900.iq.rx.raw`, `/tmp/q900.iq.rx.time` and
+`/tmp/q900.iq.rx.json`. Analyze those with:
+
+```bash
+python3 q900_control.py --analyze-iq-rx /tmp/q900
+```
+
+The I/Q analyzer checks the actual complex samples that arrived from the radio:
+packet geometry and timing, I/Q DC and gain balance, phase-step residuals and
+packet-boundary phase continuity. This separates a radio/network discontinuity
+that is already present in raw I/Q from a later demodulator or playback problem.
+
+Receive playback now rate-matches each output device continuously with the same
+polyphase fractional-delay technique used by network transmit. The radio and
+CoreAudio clocks are independent, so leaving both at nominal 48 kHz eventually
+forces a queued block to be dropped or an output callback to run dry. The
+receive-side servo spreads that clock difference across samples instead. True
+device underflows, starvation frames, emergency queue drops and SDR worker
+20 ms block drops are counted and shown in the network-audio tooltip rather
+than being silent.
 
 The Q900 is a grouping radio, and this is by design rather than a fault. Its DSP
 runs 32-sample blocks at 48 kHz, so 1500 blocks per second, each pushing 64
