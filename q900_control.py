@@ -5953,7 +5953,7 @@ class MainWindow(QMainWindow):
     def start_ptt(self) -> None:
         if self._sdr_active and self.sdr_receiver.mode == RAW_IQ_MODE:
             self.status.setText(
-                "RAW IQ is receive-only. Select USB, LSB, NFM, WFM, or AM before transmitting."
+                "RAW IQ is receive-only. Select USB, LSB, NFM, WFM, AM, or DMR before transmitting."
             )
             return
         if self._sdr_switch_pending or self._sdr_restore_pending:
@@ -6033,16 +6033,24 @@ class MainWindow(QMainWindow):
     def stop_ptt(self) -> None:
         if self._ptt_source != "gui":
             return
-        try:
-            # Release first so no microphone data continues after unkeying.
-            self.client.set_ptt(False)
-        except (ConnectionError, OSError, serial.SerialException):
-            pass
+        dmr_release = (
+            self._sdr_active and self.sdr_receiver.mode == "DMR"
+            and self.client.state.transport == "TCP"
+        )
         if self.client.state.transport == "TCP":
             # Read before stop(), which discards the counters.
             self._last_ptt_network_status = self.tx_audio.network_status
             self._last_ptt_network_summary = self.tx_audio.network_summary
-        self.tx_audio.stop()
+        if dmr_release:
+            # DMR needs its terminator-with-LC while RF is still keyed. The child
+            # drains that burst before stop() returns; then CAT can release RF.
+            self.tx_audio.stop()
+        try:
+            self.client.set_ptt(False)
+        except (ConnectionError, OSError, serial.SerialException):
+            pass
+        if not dmr_release:
+            self.tx_audio.stop()
         self._ptt_source = None
         self._ptt_meter_timer.stop()
         self.ptt_level.setText(f"MIC 0%  TX 0%  {self._last_ptt_network_summary}")
@@ -6185,11 +6193,15 @@ class MainWindow(QMainWindow):
         if not active:
             if self._ptt_source != "rigctl":
                 return
+            dmr_release = self._sdr_active and self.sdr_receiver.mode == "DMR"
+            if dmr_release:
+                self.tx_audio.stop()
             try:
                 self.client.set_ptt(False)
             except (ConnectionError, OSError, serial.SerialException):
                 pass
-            self.tx_audio.stop()
+            if not dmr_release:
+                self.tx_audio.stop()
             self._ptt_source = None
             return
         if self._ptt_source:
@@ -9550,6 +9562,34 @@ def udp_iq_sender(
                 else:
                     time.sleep(-lateness)
     finally:
+        # A DMR call ends with a terminator-with-LC. DMR stop paths keep CAT PTT
+        # asserted until this child exits, so drain the pending voice waveform,
+        # append the terminator, and pace it at the real radio rate before close.
+        if dmr_tx is not None and first_send_ns is not None:
+            try:
+                term = dmr_tx.finish_iq()
+                term_stereo = np.column_stack((term.real, term.imag)).astype(np.float32)
+                dmr_iq_pending = np.concatenate((dmr_iq_pending, term_stereo), axis=0)
+                if len(dmr_iq_pending):
+                    tail = np.repeat(
+                        dmr_iq_pending[-1:], IQ_PACKET_FRAMES + 2 * _RESAMPLE_HISTORY, axis=0
+                    )
+                    dmr_iq_pending = np.concatenate((dmr_iq_pending, tail), axis=0)
+                finish_phase = dmr_resample_phase
+                for _ in range(32):
+                    converted_iq = resample_float_frames(
+                        dmr_iq_pending, IQ_PACKET_FRAMES, base_ratio, finish_phase
+                    )
+                    if converted_iq is None:
+                        break
+                    iq_frames, finish_phase, dmr_iq_pending = converted_iq
+                    finish_payload = pack_iq_words(
+                        iq_frames[:, 0] + 1j * iq_frames[:, 1], swap_iq, invert_q
+                    )
+                    send(finish_payload)
+                    pause(period)
+            except Exception:
+                pass
         try:
             if dmr_tx is not None and getattr(dmr_tx, "codec", None) is not None:
                 dmr_tx.codec.close()
