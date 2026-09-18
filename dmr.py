@@ -223,7 +223,7 @@ def ambe_params_bits(params):
 
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
-  paths=[os.getenv("Q900_OPENDMR_LIB"),str(Path(__file__).with_name("libopendmr.dylib")),str(Path(__file__).with_name("libopendmr.so")),"/usr/local/lib/libopendmr.dylib","/usr/local/lib/libopendmr.so"];self.lib=None
+  paths=[os.getenv("Q900_OPENDMR_LIB"),str(Path(__file__).with_name("libopendmr-q900fix.dylib")),str(Path(__file__).with_name("libopendmr-q900fix.so")),str(Path(__file__).with_name("libopendmr.dylib")),str(Path(__file__).with_name("libopendmr.so")),"/usr/local/lib/libopendmr.dylib","/usr/local/lib/libopendmr.so"];self.lib=None
   for p in filter(None,paths):
    try:self.lib=ctypes.CDLL(p);break
    except OSError:pass
