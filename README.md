@@ -182,7 +182,10 @@ request costs radio DSP time and a host repaint that competes with the microphon
 callback. `Audio` is a host-generated receive spectrogram. It shows demodulated
 audio across a centered 8 kHz span in normal receive mode, and automatically shows the
 centered 48 kHz I/Q baseband while SDR is enabled. Audio and I/Q waterfall views
-are display-only; tune by clicking or dragging only in `Radio` mode.
+are display-only; tune by clicking or dragging only in `Radio` mode. The VFO
+tuned cursor with its receive passband and the SDR offset cursor are RF-anchored
+and persist across `Radio`/`Audio` switches, each mapped onto that view's axis
+(baseband center for demod audio, +12 kHz stream translation for I/Q).
 
 ## Audio And PTT
 
@@ -232,6 +235,60 @@ existing AGC and 750 µs pre-emphasis. WFM applies a 300 Hz voice high-pass,
 receive uses matching 75 µs de-emphasis plus channel and audio filtering. The
 encoder bakes in the radio's I/Q mirror by default (the `Swap I/Q` / `Invert Q`
 calibration toggles stack on top).
+
+USB/LSB transmit also uses a 5 ms look-ahead envelope limiter after the SSB
+filter and before frequency translation. Analytic I/Q peaks can exceed full
+scale even when the microphone stays below it. The limiter applies one smoothed
+gain to both components, with a 200 ms release and a 0.95 envelope ceiling before
+the existing 0.8 output scale. This preserves phase and prevents independent I/Q
+hard clipping; quiet signals retain unity gain through the limiter. Its state
+and timing follow samples rather than UDP packet boundaries.
+
+The transmit tooltip's `clip` counter tracks microphone clipping; `dspclip`
+separately counts encoded blocks that reach the final defensive I/Q clipper.
+Normal envelope limiting is not a clipping fault.
+
+SDR transmit displays the actual outgoing I/Q envelope as `IQ -N dBFS`, rather
+than the normal-audio `alc UNDER` estimate: raw I/Q bypasses the speech ALC.
+The `TX` meter also reads the outgoing I/Q envelope. `--analyze-iq-tx` reports
+envelope peak/RMS, ripple and component counts for comparing JS8Call Tune levels.
+
+An audit of the repository firmware image found missing fixed-point
+normalization in its raw-I/Q transmit branch: it carries an extra factor of
+65536 into the shared output stage. The operator confirmed this is the image
+running on the radio (3.7.6). A two-instruction correction is generated at
+`debug/q900_fw_3.7.6_sdr_iq_gain_fix.bin`, with the version-locked generator and
+verifier in `debug/patch_sdr_iq_gain.py`. It passed byte-level checks and exhaustive
+Cortex-M7 emulation of the raw-I/Q loop. The operator has installed it and reports
+that gain control works, but received audio remains scratchy; the scaling fix
+is not a complete audio-quality solution. See
+[`debug/SDR_TX_GAIN_AUDIT.md`](debug/SDR_TX_GAIN_AUDIT.md) for the instruction-level
+evidence, image hash, verification commands, update-format limitations and
+capture procedure. The host limiter does not correct that firmware mismatch.
+
+SDR I/Q receive packets now contribute to the radio-clock measurement and
+`Q900_RX_RECORD` arrival log just like normal audio packets. Previously the SDR
+receive branch skipped both, leaving SDR transmit on an old measurement or the
+nominal 48 kHz fallback. Allow at least several seconds of SDR reception before
+transmitting so a measurement is available; a longer receive interval improves
+its precision. `Q900_TX_PPM` also applies when using the nominal fallback.
+
+SDR transmit now waits for a CAT status reply reporting **actual TX** before
+releasing its sender. Writing the PTT command to TCP is not confirmation: the
+firmware discards media received while it still reports RX. Previously the app
+could lose its priming burst during that transition, leaving the radio's ring
+shallow and its frame-duplication corrector active even with a clean host tone.
+The radio-ring drain and priming sequence now begin after confirmation. If no
+TX confirmation arrives within two seconds, the PTT error path releases TX and
+stops the sender. Both GUI and rigctl SDR keying use this handshake.
+
+The transmit tooltip reports the confirmation delay. With `Q900_TX_RECORD`, an
+additional `<prefix>.iq.tx.json` file records that delay, first-send delay,
+configured radio clock, source settings and final sender counters. Pre-key
+capture trims are recorded separately as `startup_trim_packets`. The I/Q analyzer
+reads this metadata when present and reports interior digital-silence runs in a
+Tune recording separately from startup/shutdown silence. Keep the JSON file with
+the matching `.iq.tx.raw` and `.iq.tx.time` files when diagnosing a transmission.
 
 The tuned carrier normally sits at +12 kHz. That leaves limited upper-Nyquist
 guard for a 25 kHz channel in the 48 kHz complex stream, although the significant
@@ -757,6 +814,38 @@ as a reference. The source application, the virtual device and CoreAudio may eac
 resample it, and all of that sits upstream of anything here; a skirt measured on
 the air could belong to any of them. Measuring a transmit path needs a source
 known to be clean.
+
+For SDR, `Q900_IQ_TX_TONE_LEVEL` sets the internal tone's source peak amplitude
+from 0 to 1 (default 0.9). JS8Call's TX slider does not affect this internal
+source. A level of 0.1 produces approximately **-23 dBFS outgoing I/Q** in USB
+at 1500 Hz; 0.01 is another 20 dB lower. The SDR start message identifies the
+internal source and its level. This allows a low-drive comparison without
+confusing source-chain distortion with radio overload:
+
+```bash
+Q900_TX_TONE=1500 Q900_IQ_TX_TONE_LEVEL=0.1 Q900_TX_RECORD=/tmp/q900-internal python3 q900_control.py
+# Enable SDR USB, allow the RX clock measurement to settle, then key for 20–30 s.
+# JS8Call Tune can supply the PTT command; its audio is bypassed for this test.
+python3 q900_control.py --analyze-iq-tx /tmp/q900-internal
+```
+
+For comparison, close the app and restart without `Q900_TX_TONE` to record the
+actual JS8Call source:
+
+```bash
+Q900_TX_RECORD=/tmp/q900-js8 python3 q900_control.py
+# Use JS8Call Tune at 1500 Hz, matching the outgoing IQ dBFS level above.
+python3 q900_control.py --analyze-iq-tx /tmp/q900-js8
+```
+
+Keep the radio power, receiving-radio settings and signal path the same for both
+tests. Save the `.iq.tx.raw` and `.iq.tx.time` files from each prefix and note
+the transmit tooltip's fault counters. Recordings are replaced at each key-up,
+so save each pair before another transmission. If the internal tone sounds clean
+but JS8Call does not at matched levels, investigate the virtual-audio/capture
+chain. If both are scratchy while their payloads are clean, the remaining
+problem is downstream of the host DSP; packet delivery, radio buffering and the
+RF/receiving chain still need to be distinguished.
 
 Measured on the wire with a 1500 Hz synthesised tone, 21 s, ceiling 3637:
 

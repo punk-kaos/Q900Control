@@ -11,6 +11,7 @@ from collections import deque
 import ctypes
 from dataclasses import dataclass
 from enum import IntEnum
+import json
 import math
 import multiprocessing as mp
 import os
@@ -1028,10 +1029,11 @@ class NetworkAudioMonitor:
                     continue
                 except OSError:
                     break
+                arrived_ns = time.monotonic_ns()
                 packet_type = packet[4] if packet.startswith(SYNC) and len(packet) >= 9 else 0
                 if packet_type == 0x68:
                     payload = packet[9:]
-                    if len(payload) % 2:
+                    if not payload or len(payload) % 4:
                         continue
                     handler = self._iq_handler
                     words = np.frombuffer(payload, dtype="<i2")
@@ -1044,6 +1046,7 @@ class NetworkAudioMonitor:
                         self._last_packet_size = len(payload)
                         self._format = "Q900 IQ S16LE"
                         self._stream_type = packet_type
+                        self._record_media_arrival(arrived_ns, len(payload), packet_type, arrival_log)
                     continue
                 # Normal radio audio is duplicated stereo S16LE.
                 if packet_type == 0x67:
@@ -1071,14 +1074,7 @@ class NetworkAudioMonitor:
                     self._last_packet_size = len(packet)
                     self._format = audio_format
                     self._stream_type = packet_type
-                    arrived_ns = time.monotonic_ns()
-                    self._note_arrival(arrived_ns)
-                    if arrival_log is not None:
-                        arrival_log.write(
-                            arrived_ns.to_bytes(8, "little")
-                            + min(len(packet), 0xFFFF).to_bytes(2, "little")
-                            + packet_type.to_bytes(2, "little")
-                        )
+                    self._record_media_arrival(arrived_ns, len(packet), packet_type, arrival_log)
                 if first_packet:
                     print(
                         f"Q900 UDP audio from {peer[0]}:{peer[1]}: {len(packet)} bytes, "
@@ -1095,6 +1091,18 @@ class NetworkAudioMonitor:
 
     def set_iq_handler(self, handler: Callable[[np.ndarray], None] | None) -> None:
         self._iq_handler = handler
+
+    def _record_media_arrival(self, arrived_ns: int, size: int, packet_type: int, arrival_log) -> None:
+        """Called under the stats lock for both audio and SDR media arrivals."""
+        # SDR uses the same 48-frame radio clock as normal audio. Skipping these
+        # arrivals leaves SDR TX paced from a stale clock or nominal 48 kHz.
+        self._note_arrival(arrived_ns)
+        if arrival_log is not None:
+            arrival_log.write(
+                arrived_ns.to_bytes(8, "little")
+                + min(size, 0xFFFF).to_bytes(2, "little")
+                + packet_type.to_bytes(2, "little")
+            )
 
     def enqueue_audio(self, samples: np.ndarray) -> None:
         """Hand one block of audio to every output device.
@@ -2307,6 +2315,11 @@ def udp_audio_sender(
 
 IQ_SAMPLE_RATE = 48_000
 IQ_TX_LEVEL = 0.8
+# Set the internal SDR test source independently of JS8Call's slider, which is
+# bypassed when Q900_TX_TONE is active. Preserve the original test level by default.
+IQ_TX_TONE_LEVEL = float(os.environ.get("Q900_IQ_TX_TONE_LEVEL") or "0.9")
+if not math.isfinite(IQ_TX_TONE_LEVEL) or not 0.0 <= IQ_TX_TONE_LEVEL <= 1.0:
+    raise ValueError("Q900_IQ_TX_TONE_LEVEL must be a finite amplitude between 0 and 1")
 IQ_NFM_DEVIATION = 2_500
 IQ_NFM_PRE_EMPHASIS_ALPHA = 1.0 - float(np.exp(-1.0 / (IQ_SAMPLE_RATE * 750e-6)))
 IQ_WFM_DEVIATION = 5_000
@@ -2559,6 +2572,9 @@ class TransmitAudioRouter:
         self._udp_underruns: mp.Value | None = None
         self._udp_late_ms: mp.Value | None = None
         self._udp_clipped: mp.Value | None = None
+        self._udp_dsp_clipped: mp.Value | None = None
+        self._udp_iq_level: mp.Value | None = None
+        self._udp_ptt_confirmation_ms: mp.Value | None = None
         self._udp_trimmed: mp.Value | None = None
         self._udp_send_errors: mp.Value | None = None
         self._udp_overflows: mp.Value | None = None
@@ -2812,8 +2828,12 @@ class TransmitAudioRouter:
             f"SDR TX: microphone -> Q900 UDP {target[0]}:{target[1]} ({mode} I/Q, {offset_hz:+d} Hz)"
         )
 
-    def network_ptt_started(self) -> None:
+    def network_ptt_started(self, confirmation_ms: float | None = None) -> None:
         """Start UDP delivery only after CAT PTT has enabled the radio's TX ring."""
+        if self._udp_ptt_confirmation_ms is not None:
+            if confirmation_ms is None:
+                raise ConnectionError("SDR TX requires confirmed radio PTT before priming")
+            self._udp_ptt_confirmation_ms.value = confirmation_ms
         if self._udp_keyed:
             self._udp_keyed.set()
 
@@ -2832,6 +2852,9 @@ class TransmitAudioRouter:
                 self._udp_sender.join(timeout=0.5)
         self._udp_sender = None
         self._udp_queue = None
+        self._udp_dsp_clipped = None
+        self._udp_iq_level = None
+        self._udp_ptt_confirmation_ms = None
         self._udp_stop = None
         self._udp_keyed = None
         self._udp_ready = None
@@ -2869,6 +2892,8 @@ class TransmitAudioRouter:
 
     @property
     def output_level(self) -> float:
+        if self._udp_iq_level is not None:
+            return float(self._udp_iq_level.value)
         with self._level_lock:
             return self._output_level
 
@@ -2879,6 +2904,12 @@ class TransmitAudioRouter:
         clip count of zero cannot distinguish a healthy signal from one that never
         came close to full output, and only the latter costs transmit power.
         """
+        # Raw I/Q bypasses the radio's speech ALC. The normal-audio calculation
+        # falsely labels SDR drive as UNDER, encouraging more input precisely
+        # when the radio's later output stage may already be overloaded.
+        if self._udp_iq_level is not None:
+            peak = self.output_level
+            return f"IQ {20 * math.log10(peak):.1f} dBFS" if peak > 0 else "IQ idle"
         headroom = alc_headroom_db(self.level, self._udp_ceiling, self._udp_compressor)
         if headroom == float("-inf"):
             return "alc idle"
@@ -2903,6 +2934,7 @@ class TransmitAudioRouter:
                 ("trim", self._udp_trimmed.value if self._udp_trimmed else 0),
                 ("err", self._udp_send_errors.value if self._udp_send_errors else 0),
                 ("clip", self._udp_clipped.value if self._udp_clipped else 0),
+                ("dspclip", self._udp_dsp_clipped.value if self._udp_dsp_clipped else 0),
             )
             if count
         )
@@ -2928,11 +2960,22 @@ class TransmitAudioRouter:
         packets = self._udp_packets.value if self._udp_packets else 0
         late_ms = self._udp_late_ms.value if self._udp_late_ms else 0.0
         ring = self._udp_ring.value if self._udp_ring else 0
+        startup = (
+            f"PTT confirmed {self._udp_ptt_confirmation_ms.value:.1f}ms  "
+            if self._udp_ptt_confirmation_ms is not None and self._udp_ptt_confirmation_ms.value >= 0
+            else ""
+        )
+        drive = (
+            "raw I/Q envelope; radio ALC bypassed"
+            if self._udp_iq_level is not None
+            else f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
+            f"{'/digital' if self._udp_digital else '/voice'}"
+        )
         return (
             f"{self._alc_text()}  {self._fault_text() or 'clean'}  "
+            f"{startup}"
             f"ring {ring / 96.0:.0f}ms  late {late_ms:.1f} ms  UDP {packets} pkts  "
-            f"peak {self._udp_ceiling}/CMP {self._udp_compressor}"
-            f"{'/digital' if self._udp_digital else '/voice'}"
+            f"{drive}"
         )
 
 
@@ -3126,6 +3169,8 @@ class RadioClient:
         self._socket: socket.socket | serial.Serial | None = None
         self._tcp_peer: tuple[str, int] | None = None
         self._digital_mode_locks: dict[bool, Mode] = {}
+        self._ptt_confirmed = threading.Event()
+        self.ptt_confirmation_ms: float | None = None
         self._stop = threading.Event()
         self._listen_thread: threading.Thread | None = None
         self._thread: threading.Thread | None = None
@@ -3154,6 +3199,7 @@ class RadioClient:
 
     def disconnect(self) -> None:
         self._stop.set()
+        self._ptt_confirmed.clear()
         self._digital_mode_locks.clear()
         listener, self._listener = self._listener, None
         if listener:
@@ -3185,11 +3231,23 @@ class RadioClient:
                 raise ConnectionError("Radio is not connected")
             self._write(self._socket, data)
 
-    def set_ptt(self, active: bool) -> None:
+    def set_ptt(self, active: bool, *, wait_for_confirmation: bool = False) -> None:
+        self._ptt_confirmed.clear()
+        self.ptt_confirmation_ms = None
+        requested_at = time.monotonic()
         self.send(encode_frame(Command.PTT, bytes((0 if active else 1,))))
         self.state.ptt = active
         self.state.ptt_requested = active
         self._emit_state()
+        if active and wait_for_confirmation:
+            # sendall() acknowledges the host TCP write, not the radio's TX
+            # transition. An explicit status query avoids waiting for the next
+            # half-second poll. The receive thread sets the event directly, so
+            # this does not depend on the GUI processing a queued Qt signal.
+            self.send(encode_frame(Command.STATUS))
+            if not self._ptt_confirmed.wait(2.0):
+                raise TimeoutError("Radio did not confirm TX within 2 seconds; SDR priming was not started")
+            self.ptt_confirmation_ms = (time.monotonic() - requested_at) * 1000.0
 
     def set_stream_format(self, value: int) -> None:
         self.send(encode_frame(Command.USB_FORMAT, bytes((value,))))
@@ -3375,6 +3433,7 @@ class RadioClient:
                 self.signals.connection_error.emit(str(error))
         finally:
             self.state.connected = False
+            self._ptt_confirmed.clear()
             self.state.ptt = False
             self.state.ptt_requested = False
             self._emit_state()
@@ -3383,6 +3442,10 @@ class RadioClient:
         if len(data) < 24:
             return
         self.state.ptt = data[0] == 1
+        if self.state.ptt:
+            self._ptt_confirmed.set()
+        else:
+            self._ptt_confirmed.clear()
         for vfo_b, raw_mode in ((False, data[1]), (True, data[2])):
             if raw_mode not in Mode._value2member_map_:
                 continue
@@ -3710,6 +3773,22 @@ def should_autostart_audio(
     return not network_running
 
 
+def audio_waterfall_span_hz(sample_rate: int) -> int:
+    """Effective span of the demod-audio waterfall axis in Hz."""
+    return max(1, min(AUDIO_WATERFALL_SPAN_HZ, sample_rate))
+
+
+def audio_offset_to_x(offset_hz: float, width: int, sample_rate: int) -> float:
+    """Map a demod-audio offset (0 Hz = carrier = center) to a pixel."""
+    return width / 2 + offset_hz * width / audio_waterfall_span_hz(sample_rate)
+
+
+def iq_offset_to_x(offset_hz: float, width: int, sample_rate: int) -> float:
+    """Map a 48 kHz I/Q stream offset (0 Hz = stream reference) to a pixel."""
+    rate = sample_rate if sample_rate > 0 else 48_000
+    return width / 2 + offset_hz * width / rate
+
+
 class SpectrumWaterfall(QWidget):
     """Canvas-like spectrum and waterfall based on the HTML reference behavior."""
 
@@ -3799,19 +3878,48 @@ class SpectrumWaterfall(QWidget):
         spectrum_height = int(height * 0.43)
         self._draw_spectrum(painter, width, spectrum_height)
         self._draw_waterfall(painter, width, spectrum_height, height - spectrum_height)
-        if self._is_radio():
-            self._draw_tuned_cursor(painter, width, height)
-        if self._sdr_active and (self._is_radio() or self._active_history() == "iq"):
+        # Both markers are RF-anchored and persist across Radio/Audio switches;
+        # each view maps them onto its own axis below. Click/drag tuning stays
+        # Radio-only (see mouse handlers).
+        self._draw_tuned_cursor(painter, width, height)
+        if self._sdr_active:
             self._draw_sdr_cursor(painter, width, height)
 
     def _draw_tuned_cursor(self, painter: QPainter, width: int, height: int) -> None:
-        """Render the active VFO and its mode-specific receive passband."""
-        x = round(self._frequency_to_x(self._tuned_hz + FFT_TUNED_OFFSET_HZ, width))
+        """Render the active VFO and its mode-specific receive passband.
+
+        The marker is RF-anchored in every view: on the Radio axis it sits at
+        the CAT frequency, on the I/Q axis at the +12 kHz stream translation,
+        and on demod audio at baseband center (0 Hz = carrier).
+        """
+        history = self._active_history()
         bands = self._passband_ranges()
+        if history == WATERFALL_RADIO:
+            positions = [
+                (
+                    self._frequency_to_x(self._tuned_hz + FFT_TUNED_OFFSET_HZ + low_hz, width),
+                    self._frequency_to_x(self._tuned_hz + FFT_TUNED_OFFSET_HZ + high_hz, width),
+                )
+                for low_hz, high_hz in bands
+            ]
+            x = round(self._frequency_to_x(self._tuned_hz + FFT_TUNED_OFFSET_HZ, width))
+        elif history == "iq":
+            positions = [
+                (
+                    self._iq_to_x(FFT_TUNED_OFFSET_HZ + low_hz, width),
+                    self._iq_to_x(FFT_TUNED_OFFSET_HZ + high_hz, width),
+                )
+                for low_hz, high_hz in bands
+            ]
+            x = round(self._iq_to_x(FFT_TUNED_OFFSET_HZ, width))
+        else:
+            positions = [
+                (self._audio_to_x(low_hz, width), self._audio_to_x(high_hz, width))
+                for low_hz, high_hz in bands
+            ]
+            x = round(self._audio_to_x(0, width))
         painter.setPen(Qt.PenStyle.NoPen)
-        for low_hz, high_hz in bands:
-            left = self._frequency_to_x(self._tuned_hz + FFT_TUNED_OFFSET_HZ + low_hz, width)
-            right = self._frequency_to_x(self._tuned_hz + FFT_TUNED_OFFSET_HZ + high_hz, width)
+        for left, right in positions:
             painter.setBrush(QColor(54, 203, 221, 62))
             painter.drawRect(QRectF(min(left, right), 0, max(2, abs(right - left)), height))
             painter.setBrush(QColor(88, 230, 241, 130))
@@ -3827,42 +3935,39 @@ class SpectrumWaterfall(QWidget):
 
     def _draw_sdr_cursor(self, painter: QPainter, width: int, height: int) -> None:
         """Show the host-selected I/Q signal relative to the CAT frequency."""
+        history = self._active_history()
         if self._sdr_mode == RAW_IQ_MODE:
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(238, 174, 99, 38))
             painter.drawRect(QRectF(0, 0, width, height))
             painter.setPen(QPen(QColor("#eeae63"), 2))
-            x = width / 2 if self._active_history() == "iq" else self._frequency_to_x(
-                self._tuned_hz + FFT_TUNED_OFFSET_HZ, width
-            )
+            if history == "iq":
+                x = width / 2
+            elif history == WATERFALL_RADIO:
+                x = self._frequency_to_x(
+                    self._tuned_hz + FFT_TUNED_OFFSET_HZ, width
+                )
+            else:
+                x = self._audio_to_x(0, width)
             painter.drawLine(round(x), 0, round(x), height)
             painter.setPen(QColor("#eeae63"))
             label_x = min(max(8, int(x + 10)), max(8, width - 260))
             painter.drawText(label_x, 38, "SDR RAW IQ  48 kHz  I=L Q=R")
             return
-        iq_display = self._active_history() == "iq"
-        if iq_display:
-            x = width / 2 + self._sdr_offset_hz * width / self._audio_sample_rate
-        else:
+        low_hz, high_hz = self._sdr_passband()
+        if history == "iq":
+            x = self._iq_to_x(self._sdr_offset_hz, width)
+            left = self._iq_to_x(self._sdr_offset_hz + low_hz, width)
+            right = self._iq_to_x(self._sdr_offset_hz + high_hz, width)
+        elif history == WATERFALL_RADIO:
             frequency = self._tuned_hz + self._sdr_offset_hz
             x = self._frequency_to_x(frequency, width)
-        if self._sdr_mode == "NFM":
-            low_hz, high_hz = -2_500, 2_500
-        elif self._sdr_mode == "WFM":
-            # Carson bandwidth for 5 kHz deviation and 3 kHz voice audio.
-            low_hz, high_hz = -8_000, 8_000
-        elif self._sdr_mode == "AM":
-            low_hz, high_hz = -4_000, 4_000
-        elif self._sdr_mode == "LSB":
-            low_hz, high_hz = -2_800, -300
-        else:
-            low_hz, high_hz = 300, 2_800
-        if iq_display:
-            left = width / 2 + (self._sdr_offset_hz + low_hz) * width / self._audio_sample_rate
-            right = width / 2 + (self._sdr_offset_hz + high_hz) * width / self._audio_sample_rate
-        else:
             left = self._frequency_to_x(frequency + low_hz, width)
             right = self._frequency_to_x(frequency + high_hz, width)
+        else:
+            x = self._audio_to_x(self._sdr_offset_hz, width)
+            left = self._audio_to_x(self._sdr_offset_hz + low_hz, width)
+            right = self._audio_to_x(self._sdr_offset_hz + high_hz, width)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(238, 174, 99, 62))
         painter.drawRect(QRectF(min(left, right), 0, max(2, abs(right - left)), height))
@@ -3874,6 +3979,25 @@ class SpectrumWaterfall(QWidget):
 
     def _frequency_to_x(self, frequency_hz: int, width: int) -> float:
         return width / 2 + (frequency_hz - self._display_center_hz) * width / self._span_hz
+
+    def _audio_to_x(self, offset_hz: float, width: int) -> float:
+        return audio_offset_to_x(offset_hz, width, self._audio_sample_rate)
+
+    def _iq_to_x(self, offset_hz: float, width: int) -> float:
+        return iq_offset_to_x(offset_hz, width, self._audio_sample_rate)
+
+    def _sdr_passband(self) -> tuple[int, int]:
+        """Return the SDR demodulator bandwidth offsets in Hz."""
+        if self._sdr_mode == "NFM":
+            return (-2_500, 2_500)
+        if self._sdr_mode == "WFM":
+            # Carson bandwidth for 5 kHz deviation and 3 kHz voice audio.
+            return (-8_000, 8_000)
+        if self._sdr_mode == "AM":
+            return (-4_000, 4_000)
+        if self._sdr_mode == "LSB":
+            return (-2_800, -300)
+        return (300, 2_800)
 
     def _passband_ranges(self) -> tuple[tuple[int, int], ...]:
         """Return receive bandwidth offsets relative to the dial frequency."""
@@ -4567,10 +4691,12 @@ class MainWindow(QMainWindow):
                         self._tx_source_is_digital(microphone),
                     )
             # Audio must be established before the transmitter is keyed.
-            self.client.set_ptt(True)
+            self.client.set_ptt(
+                True, wait_for_confirmation=self._sdr_active and self.client.state.transport == "TCP"
+            )
             self._ptt_source = "gui"
             if self.client.state.transport == "TCP":
-                self.tx_audio.network_ptt_started()
+                self.tx_audio.network_ptt_started(self.client.ptt_confirmation_ms)
             self._ptt_meter_timer.start()
             self.ptt_button.setText("TRANSMITTING")
             self.ptt_button.setStyleSheet(
@@ -4792,10 +4918,12 @@ class MainWindow(QMainWindow):
                 if output is None:
                     return
                 self.tx_audio.start_usb(microphone, output)
-            self.client.set_ptt(True)
+            self.client.set_ptt(
+                True, wait_for_confirmation=self._sdr_active and self.client.state.transport == "TCP"
+            )
             self._ptt_source = "rigctl"
             if self.client.state.transport == "TCP":
-                self.tx_audio.network_ptt_started()
+                self.tx_audio.network_ptt_started(self.client.ptt_confirmation_ms)
         except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
             try:
                 self.client.set_ptt(False)
@@ -5973,6 +6101,54 @@ def self_test() -> None:
     assert iq_peak == AudioWaterfall.FFT_SIZE // 2 + round(
         5_000 * AudioWaterfall.FFT_SIZE / SDRReceiver.SAMPLE_RATE
     )
+    # Decode markers must survive Radio<->Audio switches: both cursors are
+    # RF-anchored and each view maps them onto its own axis. These cover the
+    # mapping math without needing a QApplication/widget.
+    assert audio_waterfall_span_hz(48_000) == AUDIO_WATERFALL_SPAN_HZ
+    assert audio_waterfall_span_hz(4_000) == 4_000
+    width = 800
+    assert audio_offset_to_x(0, width, 48_000) == width / 2
+    assert audio_offset_to_x(4_000, width, 48_000) == width
+    assert audio_offset_to_x(-4_000, width, 48_000) == 0
+    # USB passband sits just right of baseband center on demod audio.
+    assert audio_offset_to_x(300, width, 48_000) > width / 2
+    assert audio_offset_to_x(2_800, width, 48_000) > audio_offset_to_x(300, width, 48_000)
+    assert iq_offset_to_x(0, width, 48_000) == width / 2
+    assert iq_offset_to_x(12_000, width, 48_000) == width / 2 + width / 4
+    assert iq_offset_to_x(-24_000, width, 48_000) == 0
+    # Switching waterfall source or SDR state must not clear marker state;
+    # paint gates used to hide the cursors, so exercise the state path with a
+    # widgetless instance (no QApplication needed for the pure-math methods).
+    probe = SpectrumWaterfall.__new__(SpectrumWaterfall)
+    probe._source = WATERFALL_RADIO
+    probe._histories = {WATERFALL_RADIO: [], "audio": [], "iq": []}
+    probe._bins = bytes(SPECTRUM_BINS)
+    probe._audio_sample_rate = 48_000
+    probe._display_center_hz = 440_400_000
+    probe._tuned_hz = 440_400_000
+    probe._mode = Mode.USB
+    probe._span_hz = SPAN_HZ[2]
+    probe._sdr_active = True
+    probe._sdr_offset_hz = 12_000
+    probe._sdr_mode = "USB"
+    probe._schedule_update = lambda: None  # type: ignore[method-assign]
+    probe.set_source(WATERFALL_AUDIO)
+    assert probe._tuned_hz == 440_400_000 and probe._mode == Mode.USB
+    assert probe._sdr_offset_hz == 12_000 and probe._sdr_mode == "USB"
+    assert probe._active_history() == "iq"
+    probe.set_source(WATERFALL_RADIO)
+    probe.set_sdr(False, 0, "USB")
+    assert probe._tuned_hz == 440_400_000 and probe._mode == Mode.USB
+    assert probe._active_history() == WATERFALL_RADIO
+    # Per-axis VFO positions stay on screen for a typical window.
+    probe._sdr_active = False
+    probe._source = WATERFALL_AUDIO
+    assert probe._audio_to_x(0, width) == width / 2
+    probe._sdr_active = True
+    assert 0 <= probe._iq_to_x(FFT_TUNED_OFFSET_HZ, width) <= width
+    assert probe._sdr_passband() == (300, 2_800)
+    probe._sdr_mode = "LSB"
+    assert probe._sdr_passband() == (-2_800, -300)
     iq_tx = np.empty(48 * 2, dtype="<i2")
     iq_tx[0::2] = 100
     iq_tx[1::2] = -100
@@ -6014,8 +6190,8 @@ def self_test() -> None:
     wanted_power = np.abs(usb_spectrum[wanted_bin])
     image_power = np.abs(usb_spectrum[image_bin])
     assert image_power < wanted_power * 10 ** (-40 / 20), (image_power, wanted_power)
-    # The FFT filter first accumulates one hop, then its centered impulse
-    # response contributes half a hop of group delay.
+    # The FFT filter accumulates one hop, its centered impulse contributes half
+    # a hop of group delay, and the envelope limiter adds its look-ahead delay.
     tx_test_delay = SSB_STREAM_DELAY
     reference = tone[: len(usb_baseband) - tx_test_delay]
     measured = usb_baseband.real[tx_test_delay:]
@@ -7069,7 +7245,10 @@ SSB_HIGH_HZ = 2800.0
 SSB_FFT_SIZE = 1024
 SSB_FFT_HOP = SSB_FFT_SIZE // 2
 SSB_FILTER_DELAY = SSB_FFT_HOP // 2
-SSB_STREAM_DELAY = SSB_FFT_HOP + SSB_FILTER_DELAY
+SSB_LIMIT_LOOKAHEAD = 240  # 5 ms, independent of packet size
+SSB_LIMIT_CEILING = 0.95
+SSB_LIMIT_RELEASE = 1.0 - float(np.exp(-1.0 / (0.200 * IQ_SAMPLE_RATE)))
+SSB_STREAM_DELAY = SSB_FFT_HOP + SSB_FILTER_DELAY + SSB_LIMIT_LOOKAHEAD
 # Discarding half of a real signal's spectrum halves its amplitude. Restore it,
 # then retain SDRangel's 1 dB allowance for filter overshoot.
 SSB_ANALYTIC_SCALE = 2.0 * 0.891235351562
@@ -7121,12 +7300,52 @@ def _ssb_fft_filter() -> np.ndarray:
 SSB_FFT_FILTER = _ssb_fft_filter()
 
 
+class SsbPeakLimiter:
+    """Look-ahead envelope limiter; one continuous gain for both I and Q.
+
+    Hold each required attenuation for a look-ahead window, then smooth it over
+    the same window. Every gain in that average protects the delayed sample, so
+    smoothing the attack cannot let a peak through. Release takes 200 ms instead
+    of following the speech waveform or jumping at packet boundaries.
+    """
+
+    def __init__(self) -> None:
+        self._delay = np.zeros(SSB_LIMIT_LOOKAHEAD, dtype=np.complex128)
+        self._targets = np.ones(SSB_LIMIT_LOOKAHEAD, dtype=np.float64)
+        self._gains = np.ones(SSB_LIMIT_LOOKAHEAD, dtype=np.float64)
+        self._gain = 1.0
+
+    def process(self, samples: np.ndarray) -> np.ndarray:
+        if not len(samples):
+            return samples.copy()
+        targets = np.minimum(1.0, SSB_LIMIT_CEILING / np.maximum(np.abs(samples), 1e-15))
+        history = np.concatenate((self._targets, targets))
+        held = np.min(
+            np.lib.stride_tricks.sliding_window_view(history, SSB_LIMIT_LOOKAHEAD + 1),
+            axis=1,
+        )
+        self._targets = history[-SSB_LIMIT_LOOKAHEAD:].copy()
+        gains = np.empty(len(samples), dtype=np.float64)
+        for index, target in enumerate(held):
+            self._gain = min(float(target), self._gain + SSB_LIMIT_RELEASE * (1.0 - self._gain))
+            gains[index] = self._gain
+        history = np.concatenate((self._gains, gains))
+        smooth = np.convolve(
+            history, np.ones(SSB_LIMIT_LOOKAHEAD + 1) / (SSB_LIMIT_LOOKAHEAD + 1), mode="valid"
+        )
+        self._gains = history[-SSB_LIMIT_LOOKAHEAD:].copy()
+        delayed = np.concatenate((self._delay, samples))
+        self._delay = delayed[-SSB_LIMIT_LOOKAHEAD:].copy()
+        return delayed[:len(samples)] * smooth
+
+
 class IqEncoderState:
     """Streaming state for the corrected I/Q encoder."""
 
     __slots__ = (
         "phase", "level", "ssb_dc", "fm_dc", "pre_prev", "fm_filter_state",
         "ssb_input", "ssb_output", "ssb_overlap", "ssb_mode", "sample_count",
+        "ssb_limiter", "dsp_clipped_blocks",
     )
 
     def __init__(self) -> None:
@@ -7146,6 +7365,8 @@ class IqEncoderState:
         self.ssb_overlap = np.zeros(SSB_FFT_HOP, dtype=np.complex128)
         self.ssb_mode: str | None = None
         self.sample_count = 0
+        self.ssb_limiter = SsbPeakLimiter()
+        self.dsp_clipped_blocks = 0
 
 
 def _encode_ssb_fft(state: IqEncoderState, audio: np.ndarray, mode: str) -> np.ndarray:
@@ -7196,7 +7417,7 @@ def encode_iq_block(
     """Encode 48 kHz mono audio into corrected complex I/Q samples."""
     count = len(audio)
     if mode in ("USB", "LSB"):
-        baseband = _encode_ssb_fft(state, audio, mode)
+        baseband = state.ssb_limiter.process(_encode_ssb_fft(state, audio, mode))
     elif mode == "AM":
         state.ssb_dc = 0.995 * state.ssb_dc + 0.005 * float(np.mean(audio))
         baseband = 0.55 + np.clip(audio - state.ssb_dc, -0.45, 0.45).astype(np.complex64)
@@ -7245,6 +7466,8 @@ def encode_iq_block(
     state.sample_count += count
     carrier = np.exp(1j * 2 * np.pi * offset_hz * index / IQ_SAMPLE_RATE)
     iq = np.conj(baseband * carrier)
+    if np.any((np.abs(iq.real) > 1.0) | (np.abs(iq.imag) > 1.0)):
+        state.dsp_clipped_blocks += 1
     real = np.clip(iq.real, -1.0, 1.0) * IQ_TX_LEVEL
     imag = np.clip(iq.imag, -1.0, 1.0) * IQ_TX_LEVEL
     return real + 1j * imag
@@ -7262,7 +7485,7 @@ def _resolve_input_device(device_name):  # type: ignore[no-untyped-def]
 def _iq_radio_timing(radio_packet_rate: float) -> tuple[float, float]:
     """Return (I/Q packet period, host/input frames per radio/output frame)."""
     if radio_packet_rate <= 0.0:
-        return IQ_PERIOD, 1.0
+        radio_packet_rate = 1000.0
     radio_frames_per_second = (
         radio_packet_rate * 48.0 * (1.0 + TX_RATE_PPM * 1e-6)
     )
@@ -7292,12 +7515,17 @@ def udp_iq_sender(
     send_errors,
     dropped,
     ring_depth,
+    dsp_clipped,
+    iq_level,
+    ptt_confirmation_ms=None,
 ) -> None:
     """Capture, modulate and pace SDR I/Q while managing the radio TX ring."""
     sys.setswitchinterval(0.001)
     incoming: deque[bytes] = deque()
     pending = bytearray()
     stream = None
+    priming_started = False
+    startup_trimmed = 0
 
     def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
         if status.input_overflow:
@@ -7326,7 +7554,7 @@ def udp_iq_sender(
                 while not stop.is_set():
                     axis = (index + np.arange(step)) / IQ_SAMPLE_RATE
                     index += step
-                    block = (0.9 * np.sin(2 * np.pi * TX_TONE_HZ * axis)).astype(np.float32)
+                    block = (IQ_TX_TONE_LEVEL * np.sin(2 * np.pi * TX_TONE_HZ * axis)).astype(np.float32)
                     callback(block.reshape(-1, 1), step, None, _NoStatus())
                     deadline += step / IQ_SAMPLE_RATE
                     time.sleep(max(0.0, deadline - time.monotonic()))
@@ -7349,6 +7577,7 @@ def udp_iq_sender(
         return
 
     def refill() -> None:
+        nonlocal startup_trimmed
         while incoming:
             pending.extend(incoming.popleft())
         if len(pending) // 4 > IQ_HIGH_WATER_FRAMES:
@@ -7361,7 +7590,12 @@ def udp_iq_sender(
             )
             if trim_frames > 0:
                 del pending[: trim_frames * 4]
-                trimmed.value += trim_frames // IQ_PACKET_FRAMES
+                if priming_started:
+                    trimmed.value += trim_frames // IQ_PACKET_FRAMES
+                else:
+                    # Waiting for confirmed TX may build more pre-key capture
+                    # than we need. Discarding it is not an on-air sample splice.
+                    startup_trimmed += trim_frames // IQ_PACKET_FRAMES
 
     deadline_preroll = time.monotonic() + NETWORK_TX_READY_TIMEOUT
     while len(pending) // 4 < IQ_PREROLL_FRAMES and not stop.is_set():
@@ -7381,6 +7615,7 @@ def udp_iq_sender(
             pass
         return
 
+    keyed_at_ns = time.monotonic_ns()
     state = IqEncoderState()
     period, base_ratio = _iq_radio_timing(radio_packet_rate)
     ratio_trim = 0.0
@@ -7434,6 +7669,7 @@ def udp_iq_sender(
         frames = np.frombuffer(payload, dtype="<i2").reshape(-1, 2)
         audio = frames[:, 0].astype(np.float32) / 32768.0
         iq = encode_iq_block(state, audio, mode, offset_hz)
+        dsp_clipped.value = state.dsp_clipped_blocks
         return pack_iq_words(iq, swap_iq, invert_q)
 
     record_stream = record_times = None
@@ -7448,8 +7684,10 @@ def udp_iq_sender(
 
     last_send = [0]
     ring_words = [0]
+    first_send_ns = None
 
     def send(payload: bytes) -> bool:
+        nonlocal first_send_ns
         if mach_time and mach_wait:
             now = mach_time()
             if last_send[0]:
@@ -7463,12 +7701,17 @@ def udp_iq_sender(
         except OSError:
             send_errors.value += 1
             return False
+        sent_at_ns = time.monotonic_ns()
+        if first_send_ns is None:
+            first_send_ns = sent_at_ns
         packets.value += 1
+        sent_words = np.frombuffer(payload, dtype="<i2").reshape(-1, 2).astype(np.float64)
+        iq_level.value = float(np.max(np.hypot(sent_words[:, 0], sent_words[:, 1]))) / 32767.0
         ring_words[0] = min(ring_words[0] + IQ_PACKET_WORDS, RADIO_RING_WORDS - 1)
         ring_depth.value = ring_words[0]
         if record_stream is not None:
             record_stream.write(payload)
-            record_times.write(time.monotonic_ns().to_bytes(8, "little"))
+            record_times.write(sent_at_ns.to_bytes(8, "little"))
         return True
 
     def send_scheduled() -> bool:
@@ -7485,6 +7728,7 @@ def udp_iq_sender(
         startup_frames = target_frames + IQ_PRIME_PACKETS * IQ_PACKET_FRAMES
         if len(pending) // 4 > startup_frames:
             del pending[: (len(pending) // 4 - startup_frames) * 4]
+        priming_started = True
         for _ in range(IQ_PRIME_PACKETS):
             if stop.is_set():
                 return
@@ -7555,6 +7799,36 @@ def udp_iq_sender(
             record_stream.close()
             record_times.close()
 
+            metadata = {
+                "version": 1,
+                "mode": mode,
+                "offset_hz": offset_hz,
+                "frames_per_packet": IQ_PACKET_FRAMES,
+                "radio_packet_rate": radio_packet_rate,
+                "send_period_s": period,
+                "base_resample_ratio": base_ratio,
+                "tx_rate_ppm": TX_RATE_PPM,
+                "internal_tone_hz": TX_TONE_HZ,
+                "internal_tone_level": IQ_TX_TONE_LEVEL if TX_TONE_HZ > 0 else None,
+                "ptt_confirmation_ms": ptt_confirmation_ms.value if ptt_confirmation_ms is not None else None,
+                "startup_trim_packets": startup_trimmed,
+                "first_send_after_keyed_ms": (
+                    (first_send_ns - keyed_at_ns) / 1e6 if first_send_ns is not None else None
+                ),
+                "counters": {
+                    "packets": packets.value, "ovf": overflows.value,
+                    "skip": underruns.value, "drop": dropped.value,
+                    "trim": trimmed.value, "err": send_errors.value,
+                    "clip": clipped.value, "dspclip": dsp_clipped.value,
+                    "late_ms": late_ms.value,
+                },
+            }
+            try:
+                with open(f"{TX_RECORD_PREFIX}.iq.tx.json", "w") as handle:
+                    json.dump(metadata, handle, indent=2)
+            except OSError as error:
+                failure.value = f"SDR recording metadata: {error}".encode()[:255]
+
 
 def analyze_iq_tx_recording(prefix: str) -> None:
     """Measure tone purity and packet timing in a recorded SDR I/Q stream."""
@@ -7587,6 +7861,10 @@ def analyze_iq_tx_recording(prefix: str) -> None:
         print("SDR TX recording has no sufficiently long steady tone")
         return
     steady = signal[start:stop]
+    steady_magnitude = np.abs(steady)
+    peak_dbfs = 20 * np.log10(float(np.max(steady_magnitude)))
+    rms_dbfs = 20 * np.log10(float(np.sqrt(np.mean(steady_magnitude**2))))
+    ripple_percent = 100 * float(np.std(steady_magnitude) / np.mean(steady_magnitude))
     spectrum = np.fft.fft(steady * np.hanning(len(steady)))
     frequencies = np.fft.fftfreq(len(steady), 1 / IQ_SAMPLE_RATE)
     peak_index = int(np.argmax(np.abs(spectrum)))
@@ -7612,6 +7890,22 @@ def analyze_iq_tx_recording(prefix: str) -> None:
         f"tone {tone_hz:+.3f} Hz, phase residual rms "
         f"{np.sqrt(np.mean(residual**2)):.6f} rad, max {np.max(np.abs(residual)):.6f} rad"
     )
+    print(
+        f"I/Q envelope: peak {peak_dbfs:.2f} dBFS, rms {rms_dbfs:.2f} dBFS, "
+        f"ripple {ripple_percent:.3f}%; component peak {np.max(np.abs(words[start:stop])):.0f} counts"
+    )
+    print("Levels describe host payloads; raw I/Q bypasses the radio speech ALC.")
+    edges = np.diff(np.concatenate(([False], magnitude == 0, [False])).astype(np.int8))
+    silence = [
+        (begin, end) for begin, end in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
+        if begin >= start and end <= stop and end - begin >= IQ_SAMPLE_RATE // 1000
+    ]
+    if silence:
+        begin, end = max(silence, key=lambda run: run[1] - run[0])
+        print(
+            f"interior digital silence: {len(silence)} run(s), longest "
+            f"{(end - begin) * 1000 / IQ_SAMPLE_RATE:.3f} ms at {begin / IQ_SAMPLE_RATE:.3f} s"
+        )
     if len(edge_residual):
         print(f"packet-boundary phase residual max {np.max(np.abs(edge_residual)):.6f} rad")
     if len(gaps_ms):
@@ -7619,6 +7913,19 @@ def analyze_iq_tx_recording(prefix: str) -> None:
             f"send gaps: median {np.median(gaps_ms):.3f} ms, "
             f"p99 {np.percentile(gaps_ms, 99):.3f} ms, max {np.max(gaps_ms):.3f} ms"
         )
+    try:
+        with open(f"{prefix}.iq.tx.json") as handle:
+            metadata = json.load(handle)
+        print(
+            f"startup: PTT confirmation {metadata['ptt_confirmation_ms']} ms; "
+            f"first send {metadata['first_send_after_keyed_ms']} ms after sender release; "
+            f"radio clock {metadata['radio_packet_rate']:.3f} pkt/s"
+        )
+        print(f"sender counters: {metadata['counters']}")
+    except FileNotFoundError:
+        print("No startup metadata (recording predates confirmed-PTT diagnostics).")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Cannot read SDR startup metadata: {error}")
 
 
 def start_iq_udp(
@@ -7641,6 +7948,9 @@ def start_iq_udp(
     self._udp_underruns = self._mp.Value("L", 0, lock=False)
     self._udp_late_ms = self._mp.Value("d", 0.0, lock=False)
     self._udp_clipped = self._mp.Value("L", 0, lock=False)
+    self._udp_dsp_clipped = self._mp.Value("L", 0, lock=False)
+    self._udp_iq_level = self._mp.Value("d", 0.0, lock=False)
+    self._udp_ptt_confirmation_ms = self._mp.Value("d", -1.0, lock=False)
     self._udp_overflows = self._mp.Value("L", 0, lock=False)
     self._udp_level = self._mp.Value("d", 0.0, lock=False)
     self._udp_failure = self._mp.Array("c", 256, lock=False)
@@ -7686,14 +7996,21 @@ def start_iq_udp(
             self._udp_send_errors,
             self._udp_dropped,
             self._udp_ring,
+            self._udp_dsp_clipped,
+            self._udp_iq_level,
+            self._udp_ptt_confirmation_ms,
         ),
         name="q900-iq-tx",
         daemon=True,
     )
     self._udp_sender.start()
 
+    source = (
+        f"internal {TX_TONE_HZ:g} Hz tone, peak {IQ_TX_TONE_LEVEL:g}"
+        if TX_TONE_HZ > 0.0 else "microphone"
+    )
     state = (
-        f"SDR TX: microphone -> Q900 UDP {target[0]}:{target[1]} "
+        f"SDR TX: {source} -> Q900 UDP {target[0]}:{target[1]} "
         f"({mode} I/Q, {offset_hz:+d} Hz, {IQ_PACKET_FRAMES} frames, clock-matched"
         + (f" {radio_rate:.2f} pkt/s" if radio_rate else " nominal 48 kHz")
         + ")"
@@ -7743,6 +8060,134 @@ def _raw_iq_self_test() -> None:
     assert np.array_equal(out, stereo)
 
 
+def _sdr_ptt_self_test() -> None:
+    """A host PTT write, stale TX report or RX report must not release SDR UDP."""
+    from unittest.mock import Mock, patch
+
+    client = RadioClient(Mock())
+    router = TransmitAudioRouter(Mock())
+    router._udp_keyed = router._mp.Event()
+    router._udp_ptt_confirmation_ms = router._mp.Value("d", -1.0, lock=False)
+    tx_status = bytes([1]) + bytes(23)
+    client._handle_status(tx_status)  # Old report from a previous transmission.
+    queried = threading.Event()
+    errors: list[Exception] = []
+
+    def send(data: bytes) -> None:
+        if data == encode_frame(Command.STATUS):
+            queried.set()
+
+    def key() -> None:
+        try:
+            client.set_ptt(True, wait_for_confirmation=True)
+            router.network_ptt_started(client.ptt_confirmation_ms)
+        except Exception as error:
+            errors.append(error)
+
+    with patch.object(client, "send", side_effect=send) as writes:
+        worker = threading.Thread(target=key)
+        worker.start()
+        try:
+            assert queried.wait(1.0)
+            assert client.state.ptt_requested  # Optimistic UI state is already TX.
+            assert not router._udp_keyed.is_set()
+            assert not client._ptt_confirmed.is_set()
+            client._handle_status(bytes(24))  # Radio is still receiving.
+            client._handle_status(b"\x01")  # Truncated status must not count.
+            assert not router._udp_keyed.is_set()
+            client._handle_status(tx_status)
+            worker.join(timeout=1.0)
+            assert not worker.is_alive() and not errors, errors
+            assert router._udp_keyed.is_set()
+            assert router._udp_ptt_confirmation_ms.value >= 0.0
+            assert writes.call_args_list[0].args[0] == encode_frame(Command.PTT, b"\x00")
+
+            router._udp_keyed.clear()
+            with patch.object(client._ptt_confirmed, "wait", return_value=False):
+                try:
+                    client.set_ptt(True, wait_for_confirmation=True)
+                except TimeoutError:
+                    pass
+                else:
+                    raise AssertionError("missing PTT confirmation must fail")
+            assert not router._udp_keyed.is_set()
+            try:
+                router.network_ptt_started()
+            except ConnectionError:
+                pass
+            else:
+                raise AssertionError("SDR cannot prime without a confirmation measurement")
+            client.set_ptt(False)  # Same cleanup used by GUI/rigctl failure paths.
+            assert not client._ptt_confirmed.is_set()
+        finally:
+            client._handle_status(tx_status)
+            worker.join(timeout=3.0)
+            router.stop()
+            client.disconnect()
+
+
+def _sdr_clock_self_test() -> None:
+    """Exercise actual receive dispatch, including the former I/Q early return."""
+    import io
+    from unittest.mock import Mock, patch
+
+    class ArrivalLog(io.BytesIO):
+        def close(self) -> None:
+            pass  # Inspect the in-memory recording after the worker closes it.
+
+    for true_rate in (999.4, 1000.6):
+        monitor = NetworkAudioMonitor(Mock())
+        log = ArrivalLog()
+        sink = Mock()
+        sink.name = "test speaker"
+        sock = Mock()
+        received: list[np.ndarray] = []
+        monitor.set_iq_handler(received.append)
+        total = CLOCK_MIN_RUN_PACKETS + 100
+        packets = iter(range(total))
+        stamp = [1_000_000_000]
+
+        def recvfrom(size: int) -> tuple[bytes, tuple[str, int]]:
+            try:
+                index = next(packets)
+            except StopIteration:
+                monitor._stop.set()
+                raise OSError("end of test stream") from None
+            stamp[0] = 1_000_000_000 + round(index * 1e9 / true_rate)
+            return SYNC + b"\x68" + bytes(4 + 192), ("127.0.0.1", 8000)
+
+        sock.recvfrom.side_effect = recvfrom
+        with (
+            patch.object(socket, "socket", return_value=sock),
+            patch.object(time, "monotonic_ns", side_effect=lambda: stamp[0]),
+            patch(f"{__name__}.open_audio_sinks", return_value=([sink], [])),
+            patch(f"{__name__}.RX_RECORD_PREFIX", "memory"),
+            patch(f"{__name__}.open", return_value=log, create=True),
+        ):
+            try:
+                monitor.start(0)
+                monitor._thread.join(timeout=5)
+                assert not monitor._thread.is_alive()
+                measured = monitor.measured_packet_rate
+                assert abs(measured / true_rate - 1.0) < 1e-7, measured
+                assert len(received) == total and monitor.stream_type == 0x68
+                records = np.frombuffer(log.getvalue(), dtype=np.dtype([
+                    ("stamp", "<u8"), ("size", "<u2"), ("type", "<u2"),
+                ]))
+                assert len(records) == total
+                assert np.all(records["size"] == 192) and np.all(records["type"] == 0x68)
+                assert records["stamp"][-1] == stamp[0]
+                # Feed the dispatch-derived clock into real SDR pacing. Over a
+                # minute, residual ring drift must be well below a single frame.
+                period, ratio = _iq_radio_timing(measured)
+                radio_hz = true_rate * 48 * (1.0 + TX_RATE_PPM * 1e-6)
+                drift_frames = (IQ_PACKET_FRAMES / period - radio_hz) * 60
+                assert abs(drift_frames) < 1.0, drift_frames
+                assert abs(ratio * radio_hz - IQ_SAMPLE_RATE) < 0.01
+            finally:
+                monitor.stop()
+
+
 def _sdr_tx_self_test() -> None:
     frequencies = np.fft.fftfreq(SSB_FFT_SIZE, 1 / IQ_SAMPLE_RATE)
 
@@ -7765,6 +8210,9 @@ def _sdr_tx_self_test() -> None:
     test_radio_rate = 999.5 * 48 * (1 + TX_RATE_PPM * 1e-6)
     assert abs(test_period - IQ_PACKET_FRAMES / test_radio_rate) < 1e-12
     assert abs(test_ratio - IQ_SAMPLE_RATE / test_radio_rate) < 1e-12
+    nominal_period, nominal_ratio = _iq_radio_timing(0.0)
+    assert abs(nominal_period - IQ_PERIOD / (1 + TX_RATE_PPM * 1e-6)) < 1e-12
+    assert abs(nominal_ratio - 1 / (1 + TX_RATE_PPM * 1e-6)) < 1e-12
 
     # Once primed, one send per slot exactly replaces what the radio consumes.
     ring = IQ_SETTLED_WORDS
@@ -7794,7 +8242,7 @@ def _sdr_tx_self_test() -> None:
     assert np.allclose(packetized, irregular, atol=1e-7)
     assert len(pack_iq_words(packetized[:IQ_PACKET_FRAMES], False, False)) == IQ_PACKET_BYTES
 
-    # After startup, a coherent tone must remain continuous through every 1 ms
+    # After startup, a coherent tone must remain continuous through every
     # packet boundary. The old limiter changed gain at these boundaries.
     baseband = np.conj(packetized)
     expected = tone[: len(tone) - SSB_STREAM_DELAY]
@@ -7818,6 +8266,102 @@ def _sdr_tx_self_test() -> None:
             rejection_db = 20 * np.log10(max(image, 1e-15) / max(wanted, 1e-15))
             assert rejection_db < -70.0, (mode, frequency, rejection_db)
 
+    # A bounded microphone signal can overshoot after analytic conversion even
+    # though its input clip counter would stay zero. Reproduce the old failure.
+    stress = (0.9 * np.sign(np.sin(2 * np.pi * 700 * time_axis))).astype(np.float32)
+    unprotected = _encode_ssb_fft(IqEncoderState(), stress, "USB")
+    assert np.max(np.abs(unprotected)) > 1.3
+    for mode in ("USB", "LSB"):
+        for offset in (0, 12_000, -12_000):
+            state = IqEncoderState()
+            output = np.concatenate([
+                encode_iq_block(state, stress[i:i + IQ_PACKET_FRAMES], mode, offset)
+                for i in range(0, len(stress), IQ_PACKET_FRAMES)
+            ])
+            assert np.max(np.abs(output)) <= IQ_TX_LEVEL * SSB_LIMIT_CEILING + 1e-7
+            assert state.dsp_clipped_blocks == 0
+        regular = encode_chunks(stress, mode, (IQ_PACKET_FRAMES,))
+        irregular = encode_chunks(stress, mode, (17, 83, 5, 211))
+        assert np.allclose(regular, irregular, atol=1e-7)
+
+    # Verify the limiter itself on abrupt complex peaks, quiet passages and a
+    # two-tone envelope: no phase distortion, no gain steps, no boost, and a
+    # unity-gain recovery after silence. Chunking must not control its gain.
+    axis = np.arange(IQ_SAMPLE_RATE) / IQ_SAMPLE_RATE
+    probe = 0.1 * np.exp(2j * np.pi * 700 * axis)
+    probe[4000:8000] = 1.6 * np.exp(2j * np.pi * 700 * axis[4000:8000])
+    probe[10000:15000] = (
+        0.8 * np.exp(2j * np.pi * 700 * axis[10000:15000])
+        + 0.8 * np.exp(2j * np.pi * 1900 * axis[10000:15000])
+    )
+    probe[16000:] = 0
+    limiter = SsbPeakLimiter()
+    limited = np.concatenate([limiter.process(probe[i:i + 83]) for i in range(0, len(probe), 83)])
+    delayed = np.concatenate((np.zeros(SSB_LIMIT_LOOKAHEAD), probe))[:len(probe)]
+    assert np.max(np.abs(limited)) <= SSB_LIMIT_CEILING + 1e-12
+    active = np.abs(delayed) > 1e-5
+    gains = limited[active] / delayed[active]
+    assert np.max(np.abs(gains.imag)) < 1e-12
+    assert np.min(gains.real) > 0 and np.max(gains.real) <= 1.0 + 1e-12
+    assert np.max(np.abs(np.diff(gains.real))) < 1 / SSB_LIMIT_LOOKAHEAD
+    assert limiter._gain > 0.98
+
+    # Defensive final clipping remains observable independently of capture.
+    from unittest.mock import patch
+    state = IqEncoderState()
+    with patch.object(state.ssb_limiter, "process", return_value=np.full(48, 2 + 2j)):
+        encoded = encode_iq_block(state, np.zeros(48), "USB", 0)
+    assert state.dsp_clipped_blocks == 1
+    assert np.max(np.abs(encoded.real)) <= IQ_TX_LEVEL
+
+    # SDR bypasses speech ALC. Its display must use the measured outgoing
+    # envelope, independently of the microphone level or compressor setting.
+    router = TransmitAudioRouter(RadioSignals())
+    router._udp_iq_level = router._mp.Value("d", 0.1, lock=False)
+    assert router.level == 0.0 and router.output_level == 0.1
+    assert router.network_summary == "IQ -20.0 dBFS"
+    assert "ALC bypassed" in router.network_status
+    assert "UNDER" not in router.network_status and "CMP" not in router.network_status
+    router._udp_iq_level.value = 0.0
+    assert router.network_summary == "IQ idle"
+    router.stop()
+    assert router.output_level == 0.0 and router.network_summary == "alc idle"
+
+    # Analyze exact socket-format tones at two levels 40 dB apart. This checks
+    # dBFS normalization, word geometry and the diagnostic CLI without hardware.
+    import io
+    from contextlib import redirect_stdout
+
+    packet_count = 100
+    count = packet_count * IQ_PACKET_FRAMES
+    stamps = (1_000_000_000 + np.arange(packet_count) * IQ_PERIOD * 1e9).astype("<u8").tobytes()
+    for amplitude in (0.5, 0.005):
+        tone = amplitude * np.exp(-2j * np.pi * 13_500 * np.arange(count) / IQ_SAMPLE_RATE)
+        tone[count // 2:count // 2 + 96] = 0  # Known interior 2 ms dropout.
+        raw = pack_iq_words(tone, False, False)
+
+        def recording_file(path: str, mode: str = "r"):
+            if path == "test.iq.tx.json":
+                return io.StringIO(json.dumps({
+                    "ptt_confirmation_ms": 125.0,
+                    "first_send_after_keyed_ms": 71.0,
+                    "radio_packet_rate": 999.4,
+                    "counters": {"packets": packet_count, "skip": 0},
+                }))
+            assert path in ("test.iq.tx.raw", "test.iq.tx.time") and mode == "rb"
+            return io.BytesIO(raw if path.endswith(".raw") else stamps)
+
+        report = io.StringIO()
+        with patch(f"{__name__}.open", side_effect=recording_file, create=True), redirect_stdout(report):
+            analyze_iq_tx_recording("test")
+        text = report.getvalue()
+        assert "I/Q envelope:" in text and "component peak" in text
+        reported_peak = float(text.split("I/Q envelope: peak ")[1].split()[0])
+        assert abs(reported_peak - 20 * np.log10(amplitude)) < 0.06, text
+        assert "raw I/Q bypasses the radio speech ALC" in text
+        assert "longest 2.000 ms" in text
+        assert "PTT confirmation 125.0 ms" in text and "999.400 pkt/s" in text
+
     frames = np.arange(12_000, dtype=np.int16)
     stereo = np.column_stack((frames, frames)).astype("<i2")
     converted = resample_stereo(bytearray(stereo.tobytes()), 48, 1.000493, 0.0)
@@ -7835,7 +8379,10 @@ _protocol_self_test = self_test
 def self_test() -> None:
     _protocol_self_test()
     _raw_iq_self_test()
+    _sdr_ptt_self_test()
+    _sdr_clock_self_test()
     _sdr_tx_self_test()
+    print("Q900 SDR clock and transmit self-tests passed")
 
 
 if __name__ == "__main__":
