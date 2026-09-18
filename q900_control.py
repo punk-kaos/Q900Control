@@ -30,6 +30,8 @@ import sounddevice as sd
 import serial
 from serial.tools import list_ports
 
+import dmr
+
 from PyQt6.QtCore import (
     QObject,
     QPoint,
@@ -813,6 +815,11 @@ class SDRReceiver:
         # offset control to retune and the mode selector to pick a sideband.
         self.swap_iq = False
         self.invert_q = False
+        self.dmr_status = dmr.DmrStatus()
+        self._dmr = dmr.DmrAirReceiver(self._output, self._dmr_status_updated)
+
+    def _dmr_status_updated(self, status: dmr.DmrStatus) -> None:
+        self.dmr_status = status
 
     def reset_stats(self) -> None:
         self.queue_drops = 0
@@ -822,6 +829,9 @@ class SDRReceiver:
         if self._thread:
             return
         self._stop.clear()
+        if self.mode == "DMR":
+            self._dmr.reset()
+            self.dmr_status = self._dmr.status
         self._thread = threading.Thread(target=self._run, name="q900-sdr-rx", daemon=True)
         self._thread.start()
 
@@ -902,6 +912,9 @@ class SDRReceiver:
             if self.swap_iq:
                 iq = iq[:, ::-1]
             signal = iq[:, 0] + 1j * iq[:, 1] * (-1 if self.invert_q else 1)
+            if self.mode == "DMR":
+                self._dmr.feed(signal, self.offset_hz)
+                continue
             # Do not subtract each packet's mean: at a 1 ms packet size that
             # removes/modulates wanted low-frequency SSB audio. Track only the
             # slowly varying I/Q DC component across full audio blocks.
@@ -5671,9 +5684,9 @@ class MainWindow(QMainWindow):
         self.sdr_button = QPushButton("SDR Off")
         self.sdr_button.clicked.connect(self.toggle_sdr)
         self.sdr_mode_selector = QComboBox()
-        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM", "WFM", "AM"))
+        self.sdr_mode_selector.addItems(("USB", "LSB", "NFM", "WFM", "AM", "DMR"))
         self.sdr_mode_selector.addItem(RAW_IQ_MODE)
-        self.sdr_mode_selector.setToolTip("Host SDR mode; WFM is 5 kHz-deviation voice FM for 25 kHz channels")
+        self.sdr_mode_selector.setToolTip("Host SDR mode; DMR is host-side Tier II 4FSK/AMBE; WFM is voice FM")
         self.sdr_mode_selector.setVisible(False)
         self.sdr_mode_selector.currentTextChanged.connect(self.set_sdr_mode)
         self.sdr_offset = QSpinBox()
@@ -6009,7 +6022,7 @@ class MainWindow(QMainWindow):
                 "background: #6b1e2b; border: 1px solid #ff667a; border-radius: 10px; "
                 "color: white; font: 700 16px Menlo; padding: 10px 24px;"
             )
-        except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
+        except (ConnectionError, OSError, RuntimeError, ValueError, serial.SerialException, sd.PortAudioError) as error:
             try:
                 self.client.set_ptt(False)
             except (ConnectionError, OSError, serial.SerialException):
@@ -6230,7 +6243,7 @@ class MainWindow(QMainWindow):
             self._ptt_source = "rigctl"
             if self.client.state.transport == "TCP":
                 self.tx_audio.network_ptt_started(self.client.ptt_confirmation_ms)
-        except (ConnectionError, OSError, serial.SerialException, sd.PortAudioError) as error:
+        except (ConnectionError, OSError, RuntimeError, ValueError, serial.SerialException, sd.PortAudioError) as error:
             try:
                 self.client.set_ptt(False)
             except (ConnectionError, OSError, serial.SerialException):
@@ -6306,6 +6319,12 @@ class MainWindow(QMainWindow):
                 # loud that the audio is remote so the two are never confused.
                 summary = f"KIWI {self.kiwi.label()} | {summary}"
                 detail = f"{self.kiwi.detail()}  {detail}".strip()
+            if self._sdr_active and self.sdr_receiver.mode == "DMR":
+                ds = self.sdr_receiver.dmr_status
+                summary = f"{ds.summary()} | {summary}"
+                detail = (f"DMR sync={ds.sync or 'search'} quality={ds.sync_quality:.3f} "
+                          f"corrected={ds.corrected} AMBE={ds.ambe_frames} "
+                          f"vocoder-errors={ds.vocoder_errors}  {detail}").strip()
             self.network_audio_status.setText(summary)
             self.network_audio_status.set_detail(detail)
         else:
@@ -6369,6 +6388,11 @@ class MainWindow(QMainWindow):
         raw = mode == RAW_IQ_MODE
         self.sdr_offset.setEnabled(not raw)
         self.sdr_tx_calibrate.setEnabled(not raw)
+        if mode == "DMR":
+            cfg = dmr.DmrConfig.from_env()
+            target = f"TG {cfg.destination_id}" if cfg.group else f"ID {cfg.destination_id}"
+            self.status.setText(f"SDR DMR: RX auto-detect; simplex TX ID {cfg.source_id or 'unset'} -> "
+                                f"{target if cfg.destination_id else 'target unset'}, CC{cfg.color_code}, TS{cfg.slot}.")
         if raw:
             with self.network_audio._sink_lock:
                 stereo = any(sink.output_channels >= 2 for sink in self.network_audio._sinks)
@@ -6397,6 +6421,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Use low power and an external receiver. Change one setting per test."))
         if self.sdr_receiver.mode == "WFM":
             layout.addWidget(QLabel("For WFM, 0 Hz gives the most margin inside the 48 kHz I/Q stream."))
+        if self.sdr_receiver.mode == "DMR":
+            layout.addWidget(QLabel("DMR TX is direct/simplex; repeater slot alignment is not enabled yet."))
         offset = QComboBox()
         for value in (12_000, 0, -12_000):
             offset.addItem(f"{value:+d} Hz", value)
@@ -9211,6 +9237,9 @@ def udp_iq_sender(
     stream = None
     priming_started = False
     startup_trimmed = 0
+    dmr_tx = None
+    dmr_iq_pending = np.empty((0, 2), dtype=np.float32)
+    dmr_resample_phase = 0.0
 
     def callback(indata, frames, timing, status):  # type: ignore[no-untyped-def]
         if status.input_overflow:
@@ -9282,6 +9311,19 @@ def udp_iq_sender(
                     # than we need. Discarding it is not an on-air sample splice.
                     startup_trimmed += trim_frames // IQ_PACKET_FRAMES
 
+    if mode == "DMR":
+        try:
+            dmr_tx = dmr.DmrVoiceTransmitter(dmr.DmrConfig.from_env(), offset_hz)
+        except Exception as error:  # noqa: BLE001
+            failure.value = f"DMR: {error}".encode()[:255]
+            ready.set()
+            try:
+                if stream is not None:
+                    stream.stop(); stream.close()
+            except Exception:
+                pass
+            return
+
     deadline_preroll = time.monotonic() + NETWORK_TX_READY_TIMEOUT
     while len(pending) // 4 < IQ_PREROLL_FRAMES and not stop.is_set():
         refill()
@@ -9336,17 +9378,30 @@ def udp_iq_sender(
 
     def next_payload() -> bytes | None:
         nonlocal ratio_trim, ratio_smooth, resample_phase
+        nonlocal dmr_iq_pending, dmr_resample_phase
         refill()
-        ratio, ratio_trim, ratio_smooth =  resample_ratio(
-            len(pending) // 4,
-            target_frames,
-            ratio_trim,
-            base_ratio,
-            ratio_smooth,
-        )
-        converted =  resample_stereo(
-            pending, IQ_PACKET_FRAMES, ratio, resample_phase
-        )
+        if dmr_tx is not None:
+            if len(pending) >= 4:
+                usable = len(pending) - len(pending) % 4
+                captured = np.frombuffer(bytes(pending[:usable]), dtype="<i2").reshape(-1, 2)
+                del pending[:usable]
+                generated = dmr_tx.feed_pcm(captured[:, 0].astype(np.float32) / 32768.0)
+                if len(generated):
+                    stereo = np.column_stack((generated.real, generated.imag)).astype(np.float32)
+                    dmr_iq_pending = np.concatenate((dmr_iq_pending, stereo), axis=0)
+            ratio, ratio_trim, ratio_smooth = resample_ratio(
+                len(dmr_iq_pending), max(2_880, target_frames), ratio_trim, base_ratio, ratio_smooth)
+            converted_iq = resample_float_frames(
+                dmr_iq_pending, IQ_PACKET_FRAMES, ratio, dmr_resample_phase)
+            if converted_iq is None:
+                underruns.value += 1
+                return None
+            iq_frames, dmr_resample_phase, dmr_iq_pending = converted_iq
+            iq = iq_frames[:, 0] + 1j * iq_frames[:, 1]
+            return pack_iq_words(iq, swap_iq, invert_q)
+        ratio, ratio_trim, ratio_smooth = resample_ratio(
+            len(pending) // 4, target_frames, ratio_trim, base_ratio, ratio_smooth)
+        converted = resample_stereo(pending, IQ_PACKET_FRAMES, ratio, resample_phase)
         if converted is None:
             underruns.value += 1
             return None
@@ -9474,6 +9529,11 @@ def udp_iq_sender(
                 else:
                     time.sleep(-lateness)
     finally:
+        try:
+            if dmr_tx is not None and getattr(dmr_tx, "codec", None) is not None:
+                dmr_tx.codec.close()
+        except Exception:
+            pass
         try:
             if stream is not None:
                 stream.stop()
@@ -9625,6 +9685,8 @@ def start_iq_udp(
 ) -> None:
     """Start corrected SDR TX with capture owned by the sender process."""
     self.stop()
+    if mode == "DMR":
+        dmr.DmrConfig.from_env().validate_tx()
     self._udp_target = target
     self._udp_queue = None
     self._udp_stop = self._mp.Event()
@@ -9700,11 +9762,14 @@ def start_iq_udp(
         + (f" {radio_rate:.2f} pkt/s" if radio_rate else " nominal 48 kHz")
         + ")"
     )
-    if not self._udp_ready.wait(timeout= NETWORK_TX_READY_TIMEOUT):
-        state += " -- sender did not report ready"
+    if not self._udp_ready.wait(timeout=NETWORK_TX_READY_TIMEOUT):
+        self.stop()
+        raise RuntimeError("SDR sender did not report ready")
     problem = bytes(self._udp_failure.value if self._udp_failure else b"")
     if problem:
-        state += f" -- {problem.decode(errors='replace')}"
+        message = problem.decode(errors="replace")
+        self.stop()
+        raise RuntimeError(message)
     self.signals.audio_state_changed.emit(state)
 
 
@@ -10390,8 +10455,9 @@ def self_test() -> None:
     _sdr_ptt_self_test()
     _sdr_clock_self_test()
     _sdr_tx_self_test()
+    dmr.self_test()
     _kiwi_self_test()
-    print("Q900 SDR RX continuity, clock, transmit and Kiwi self-tests passed")
+    print("Q900 SDR RX continuity, DMR, clock, transmit and Kiwi self-tests passed")
 
 
 if __name__ == "__main__":
