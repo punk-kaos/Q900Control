@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: sudo apt-get update && sudo apt-get install -y libportaudio2
+      - run: sudo apt-get update && sudo apt-get install -y libportaudio2 libegl1
       - run: python -m pip install numpy PyQt6 pyserial sounddevice websocket-client
       - run: python -m py_compile dmr.py q900_control.py
       - run: python dmr.py
