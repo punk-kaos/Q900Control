@@ -6442,8 +6442,10 @@ class MainWindow(QMainWindow):
         if mode == "DMR":
             cfg = dmr.DmrConfig.from_env()
             target = f"TG {cfg.destination_id}" if cfg.group else f"ID {cfg.destination_id}"
-            self.status.setText(f"SDR DMR: RX auto-detect; simplex TX ID {cfg.source_id or 'unset'} -> "
-                                f"{target if cfg.destination_id else 'target unset'}, CC{cfg.color_code}, TS{cfg.slot}.")
+            self.status.setText(
+                f"SDR DMR: RX auto-detect; TX {cfg.tx_label()} ID {cfg.source_id or 'unset'} -> "
+                f"{target if cfg.destination_id else 'target unset'}, CC{cfg.color_code}."
+            )
         self._update_dmr_status_panel()
         if raw:
             with self.network_audio._sink_lock:
@@ -6480,15 +6482,20 @@ class MainWindow(QMainWindow):
             dmr_id = QSpinBox(); dmr_id.setRange(0, 0xFFFFFF); dmr_id.setValue(cfg.source_id)
             dmr_target = QSpinBox(); dmr_target.setRange(0, 0xFFFFFF); dmr_target.setValue(cfg.destination_id)
             dmr_cc = QSpinBox(); dmr_cc.setRange(0, 15); dmr_cc.setValue(cfg.color_code)
-            dmr_slot = QComboBox(); dmr_slot.addItem("Direct slot 1", 1); dmr_slot.addItem("Direct slot 2", 2)
+            dmr_direct = QCheckBox("Use TDMA-direct TS1/TS2 sync (advanced)")
+            dmr_direct.setChecked(cfg.tdma_direct)
+            dmr_slot = QComboBox(); dmr_slot.addItem("TDMA-direct slot 1", 1); dmr_slot.addItem("TDMA-direct slot 2", 2)
             dmr_slot.setCurrentIndex(max(0, dmr_slot.findData(cfg.slot)))
+            dmr_slot.setEnabled(cfg.tdma_direct)
+            dmr_direct.toggled.connect(dmr_slot.setEnabled)
             dmr_private = QCheckBox("Private call (unchecked = group/TG)")
             dmr_private.setChecked(not cfg.group)
             layout.addWidget(QLabel("DMR Radio ID")); layout.addWidget(dmr_id)
             layout.addWidget(QLabel("DMR TG / target ID")); layout.addWidget(dmr_target)
             layout.addWidget(QLabel("DMR color code")); layout.addWidget(dmr_cc)
-            layout.addWidget(dmr_slot); layout.addWidget(dmr_private)
-            dmr_controls = (dmr_id, dmr_target, dmr_cc, dmr_slot, dmr_private)
+            layout.addWidget(QLabel("Normal handheld simplex uses MS-sourced sync."))
+            layout.addWidget(dmr_direct); layout.addWidget(dmr_slot); layout.addWidget(dmr_private)
+            dmr_controls = (dmr_id, dmr_target, dmr_cc, dmr_slot, dmr_private, dmr_direct)
         offset = QComboBox()
         for value in (12_000, 0, -12_000):
             offset.addItem(f"{value:+d} Hz", value)
@@ -6524,12 +6531,13 @@ class MainWindow(QMainWindow):
             self._sdr_tx_swap_iq = swap.isChecked()
             self._sdr_tx_invert_q = invert.isChecked()
             if dmr_controls is not None:
-                dmr_id, dmr_target, dmr_cc, dmr_slot, dmr_private = dmr_controls
+                dmr_id, dmr_target, dmr_cc, dmr_slot, dmr_private, dmr_direct = dmr_controls
                 os.environ["Q900_DMR_ID"] = str(dmr_id.value())
                 os.environ["Q900_DMR_TG"] = str(dmr_target.value())
                 os.environ["Q900_DMR_CC"] = str(dmr_cc.value())
                 os.environ["Q900_DMR_SLOT"] = str(int(dmr_slot.currentData()))
                 os.environ["Q900_DMR_PRIVATE"] = "1" if dmr_private.isChecked() else "0"
+                os.environ["Q900_DMR_TDMA_DIRECT"] = "1" if dmr_direct.isChecked() else "0"
             self.status.setText(f"SDR TX calibration set: {current.text()}")
 
     def poll_sdr_stream(self) -> None:
@@ -9472,7 +9480,7 @@ def udp_iq_sender(
                 underruns.value += 1
                 return None
             iq_frames, dmr_resample_phase, dmr_iq_pending = converted_iq
-            iq = iq_frames[:, 0] + 1j * iq_frames[:, 1]
+            iq = (iq_frames[:, 0] + 1j * iq_frames[:, 1]) * IQ_TX_LEVEL
             return pack_iq_words(iq, swap_iq, invert_q)
         ratio, ratio_trim, ratio_smooth = resample_ratio(
             len(pending) // 4, target_frames, ratio_trim, base_ratio, ratio_smooth)
@@ -9626,7 +9634,8 @@ def udp_iq_sender(
                         break
                     iq_frames, finish_phase, dmr_iq_pending = converted_iq
                     finish_payload = pack_iq_words(
-                        iq_frames[:, 0] + 1j * iq_frames[:, 1], swap_iq, invert_q
+                        (iq_frames[:, 0] + 1j * iq_frames[:, 1]) * IQ_TX_LEVEL,
+                        swap_iq, invert_q
                     )
                     send(finish_payload)
                     pause(period)
@@ -9651,6 +9660,10 @@ def udp_iq_sender(
                 "version": 1,
                 "mode": mode,
                 "offset_hz": offset_hz,
+                "dmr_profile": (dmr_tx.c.tx_label() if dmr_tx is not None else None),
+                "dmr_source": (dmr_tx.c.source_id if dmr_tx is not None else None),
+                "dmr_destination": (dmr_tx.c.destination_id if dmr_tx is not None else None),
+                "dmr_color_code": (dmr_tx.c.color_code if dmr_tx is not None else None),
                 "frames_per_packet": IQ_PACKET_FRAMES,
                 "radio_packet_rate": radio_packet_rate,
                 "send_period_s": period,
@@ -9678,6 +9691,26 @@ def udp_iq_sender(
                 failure.value = f"SDR recording metadata: {error}".encode()[:255]
 
 
+def analyze_dmr_tx_signal(signal: np.ndarray) -> list[dmr.DmrStatus]:
+    """Decode a recorded host->Q900 DMR I/Q stream as an independent TX check."""
+    statuses: list[dmr.DmrStatus] = []
+
+    def snapshot(status: dmr.DmrStatus) -> None:
+        statuses.append(
+            dmr.DmrStatus(
+                **{name: getattr(status, name) for name in status.__dataclass_fields__}
+            )
+        )
+
+    receiver = dmr.DmrAirReceiver(status_output=snapshot)
+    try:
+        for start in range(0, len(signal), SDRReceiver.BLOCK_FRAMES):
+            receiver.feed(signal[start : start + SDRReceiver.BLOCK_FRAMES], 0)
+    finally:
+        receiver.close()
+    return statuses
+
+
 def analyze_iq_tx_recording(prefix: str) -> None:
     """Measure tone purity and packet timing in a recorded SDR I/Q stream."""
     try:
@@ -9698,6 +9731,54 @@ def analyze_iq_tx_recording(prefix: str) -> None:
     packet_frames = len(raw) // len(stamps) // 4
     words = np.frombuffer(raw, dtype="<i2").reshape(-1, 2).astype(np.float64)
     signal = (words[:, 0] + 1j * words[:, 1]) / 32767.0
+    metadata = {}
+    try:
+        with open(f"{prefix}.iq.tx.json") as handle:
+            metadata = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        metadata = {}
+
+    if metadata.get("mode") == "DMR":
+        statuses = analyze_dmr_tx_signal(signal)
+        locked = [status for status in statuses if status.sync]
+        print(
+            f"DMR TX: {len(stamps)} packets, {packet_frames} frames/packet, "
+            f"{len(signal) / IQ_SAMPLE_RATE:.2f} s, profile {metadata.get('dmr_profile')}"
+        )
+        if not locked:
+            print("  ERROR: recorded host->Q900 I/Q does not decode as DMR")
+        else:
+            best = max(locked, key=lambda status: status.sync_quality)
+            headers = [
+                status for status in locked
+                if status.source is not None and status.destination is not None
+            ]
+            print(
+                f"  sync {best.sync}, quality {best.sync_quality:.3f}, "
+                f"carrier {best.carrier_hz:+.1f} Hz, polarity {best.sync_polarity:+d}"
+            )
+            if headers:
+                status = headers[-1]
+                print(
+                    f"  LC: CC{status.color_code} "
+                    f"{'TG' if status.group else 'ID'} {status.destination} "
+                    f"SRC {status.source}; AMBE {max(s.ambe_frames for s in locked)}"
+                )
+            print(
+                "  verdict: host payload is independently decodable DMR"
+                if headers else
+                "  verdict: DMR sync found, but no valid LC header/terminator decoded"
+            )
+        gaps_ms = np.diff(stamps.astype(np.float64)) / 1e6
+        if len(gaps_ms):
+            print(
+                f"  send gaps: median {np.median(gaps_ms):.3f} ms, "
+                f"p99 {np.percentile(gaps_ms, 99):.3f} ms, max {np.max(gaps_ms):.3f} ms"
+            )
+        if metadata:
+            print(f"  sender counters: {metadata.get('counters', {})}")
+        return
+
     magnitude = np.abs(signal)
     if not len(signal) or float(np.max(magnitude)) == 0.0:
         print("SDR TX recording contains no signal")
