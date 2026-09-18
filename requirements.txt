@@ -1,4 +1,6 @@
 PyQt6>=6.7
+PyQt6-WebEngine>=6.7
 pyserial>=3.5
 sounddevice>=0.5
 numpy>=2.0
+websocket-client>=1.7

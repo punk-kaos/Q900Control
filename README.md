@@ -423,6 +423,41 @@ USB receive plays one device only. It negotiates its sample rate against both th
 input and the output, so it cannot fan out, and `both` falls back to the first
 destination on that transport.
 
+### KiwiSDR External RX
+
+The `KiwiSDR` row replaces the Q900's incoming audio with a remote KiwiSDR
+receiver while the Q900's own transmit path keeps working. Enter a host as
+`hostname[:port]` (default port 8073), or press `Map…` to pick a receiver on
+`rx.linkfanel.net` embedded in the app (needs `PyQt6-WebEngine`).
+Clicking a receiver closes the map and starts its audio immediately (or
+switches receivers if already listening); anything that is not a receiver
+link only fills the host field for the manual `Use Receiver` button. Both
+new dependencies come from `pip install -r requirements.txt`; without them
+the buttons explain what is missing on the status line instead of
+connecting.
+
+While active, Q900 receive packets are still counted for the radio-clock
+measurement that transmit pacing depends on, but they are no longer played:
+muting keeps UDP/8000 bound instead of releasing it. The Kiwi's 12 kHz audio
+is resampled to 48 kHz and fed through the normal speaker/virtual-device
+fan-out, so RX routing behaves identically, and the
+audio row reads `KIWI <host> …` so the remote audio is never confused with
+the radio's own S-meter. Entering Kiwi mode switches the waterfall to the
+remote Kiwi's own RF waterfall over a second stream (the muted radio's
+passband would be meaningless) and restores the previous source on exit.
+The remote view follows the Q900's active VFO and span selector; its axis
+comes from the server's zoom echo, so a server that clamps the zoom still
+labels correctly. Tuning stays with the Q900 entry and VFO controls, which
+the Kiwi follows.
+
+The Kiwi follows the Q900's active VFO frequency and CAT mode. Q900
+`NFM`/`WFM` (2.5/5 kHz deviation) map to Kiwi `nnfm`/`nbfm` respectively;
+`CWR`/`CWL` both map to `cw`; `DIGI`/`PKT` hold the Kiwi's current mode.
+The Kiwi covers 0–30 MHz, so starting or following outside that range says
+so on the status line instead of silently playing the wrong frequency.
+Kiwi mode needs the TCP transport and is unavailable in SDR mode; keying PTT
+transmits normally through the radio.
+
 ## Rigctl Relay
 
 The embedded relay listens only on:

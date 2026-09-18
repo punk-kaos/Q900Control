@@ -18,9 +18,11 @@ import os
 import queue
 import signal
 import socket
+import struct
 import sys
 import threading
 import time
+import urllib.parse
 from typing import Callable, Sequence
 
 import numpy as np
@@ -34,6 +36,7 @@ from PyQt6.QtCore import (
     QRectF,
     Qt,
     QTimer,
+    QUrl,
     pyqtSignal,
     qInstallMessageHandler,
 )
@@ -70,6 +73,7 @@ SPECTRUM_BINS = 512
 SPECTRUM_MAX_REPAINT_HZ = 15
 WATERFALL_RADIO = "radio"
 WATERFALL_AUDIO = "audio"
+WATERFALL_KIWI = "kiwi"
 RAW_IQ_MODE = "RAW IQ"
 AUDIO_WATERFALL_SPAN_HZ = 8_000
 SPAN_HZ = (48_000, 24_000, 12_000, 6_000, 3_000, 1_500)
@@ -324,6 +328,7 @@ class RadioSignals(QObject):
     state_changed = pyqtSignal(object)
     spectrum_received = pyqtSignal(bytes)
     audio_waterfall_received = pyqtSignal(bytes, int, bool)
+    kiwi_waterfall_received = pyqtSignal(bytes, float, float)
     connection_error = pyqtSignal(str)
     audio_state_changed = pyqtSignal(str)
     rigctl_clients_changed = pyqtSignal(int)
@@ -955,6 +960,12 @@ class NetworkAudioMonitor:
         self._stats_lock = threading.Lock()
         self._iq_handler: Callable[[np.ndarray], None] | None = None
         self._stream_type = 0
+        # While external KiwiSDR audio replaces the Q900's incoming audio, the
+        # Q900 packets are still counted for the radio-clock measurement but no
+        # longer played or sent to the waterfall. Muting rather than stopping
+        # keeps UDP/8000 bound and the clock accumulator intact, which transmit
+        # pacing depends on.
+        self._kiwi_mute = False
         # The radio's media stream is clocked by its own crystal, and neither this
         # application nor the radio's UHSDR firmware rate-matches the two ends.
         # The arrival rate of its packets therefore measures that clock, which is
@@ -1065,9 +1076,10 @@ class NetworkAudioMonitor:
                 else:
                     mono = samples
                     audio_format += " mono"
-                if self._waterfall:
-                    self._waterfall.feed_audio(mono, self.SAMPLE_RATE)
-                self.enqueue_audio(mono)
+                if not self._kiwi_mute:
+                    if self._waterfall:
+                        self._waterfall.feed_audio(mono, self.SAMPLE_RATE)
+                    self.enqueue_audio(mono)
                 with self._stats_lock:
                     first_packet = self._packet_count == 0
                     self._packet_count += 1
@@ -1091,6 +1103,19 @@ class NetworkAudioMonitor:
 
     def set_iq_handler(self, handler: Callable[[np.ndarray], None] | None) -> None:
         self._iq_handler = handler
+
+    def set_kiwi_mute(self, muted: bool) -> None:
+        """Mute Q900 receive audio while external Kiwi audio plays instead.
+
+        Reception, packet stats and the radio-clock accumulator are untouched:
+        only playback and the waterfall feed are suppressed. Called from the
+        GUI thread; read by the receive thread.
+        """
+        self._kiwi_mute = muted
+
+    def _q900_audio_playable(self) -> bool:
+        """Whether Q900 receive audio currently reaches the outputs."""
+        return not self._kiwi_mute
 
     def _record_media_arrival(self, arrived_ns: int, size: int, packet_type: int, arrival_log) -> None:
         """Called under the stats lock for both audio and SDR media arrivals."""
@@ -1341,6 +1366,806 @@ class NetworkAudioMonitor:
                 f"UDP {self._packet_count} pkts  {self._last_packet_size} B  "
                 f"{self._format}"
             ).lstrip()
+
+
+# ---------------------------------------------------------------------------
+# External KiwiSDR receive audio.
+#
+# A remote KiwiSDR can replace the Q900's incoming audio while the Q900's own
+# transmit path keeps working. The Kiwi websocket protocol below follows
+# jks-prv/kiwiclient (kiwi/client.py): a raw HYBI13 websocket to
+# ws://<host>:<port>/<timestamp>/SND, an opening "SET auth t=kiwi p=" plus
+# "SET ident_user=", then "SET mod=.. low_cut=.. high_cut=.. freq=.." with
+# "SET compression=0" (uncompressed big-endian int16 mono at the server's
+# advertised sample rate, normally 12 kHz), and "SET keepalive" at 1 Hz, after
+# which the server drops the client. The server sends everything -- including
+# MSG control frames -- as binary websocket frames, so frames are routed by
+# their 3-byte tag, not the opcode. SND frames carry a 5-byte little-endian
+# (flags, seq) header plus a 2-byte big-endian S-meter; only mono frames are
+# played. Server errors arrive as MSG frames (too_busy, badp, redirect, down).
+#
+# Decoded 12 kHz audio is resampled to the 48 kHz the output sinks run at and
+# handed to NetworkAudioMonitor.enqueue_audio -- the same single fan-out point
+# the Q900 receiver and the SDR demodulator use -- so speaker/virtual-device
+# routing, rigctl destinations and the audio waterfall all behave identically.
+
+KIWI_SAMPLE_RATE = 12_000
+KIWI_MAP_URL = "http://rx.linkfanel.net/"
+KIWI_DEFAULT_PORT = 8073
+# Map pins link at map/rx.kiwisdr.com hosts; those are the directory, not a
+# receiver, and must not be offered as a connection target.
+KIWI_DIRECTORY_HOSTS = (
+    "map.kiwisdr.com",
+    "rx.kiwisdr.com",
+    "kiwisdr.com",
+    "www.kiwisdr.com",
+    "rx.linkfanel.net",
+)
+
+# Kiwi passbands transcribed from the KiwiSDR server (rx/rx_util.cpp modes[]):
+# nbfm is the 9.8 kHz channel, nnfm the 6 kHz channel. The Q900's NFM/WFM are
+# both narrowband voice FM at 2.5/5 kHz deviation, so NFM maps to the narrower
+# nnfm and WFM to the wider nbfm -- neither is broadcast FM.
+KIWI_PASSBANDS = {
+    "am": (-4900, 4900),
+    "usb": (300, 2700),
+    "lsb": (-2700, -300),
+    "cw": (300, 700),
+    "nbfm": (-6000, 6000),
+    "nnfm": (-3000, 3000),
+}
+
+# Q900 CAT mode -> Kiwi SND mode. DIGI/PKT have no remote analogue and map to
+# None, meaning the Kiwi keeps its current mode. CWR and CWL both map to cw.
+Q900_MODE_TO_KIWI: dict[Mode, str | None] = {
+    Mode.USB: "usb",
+    Mode.LSB: "lsb",
+    Mode.AM: "am",
+    Mode.NFM: "nnfm",
+    Mode.WFM: "nbfm",
+    Mode.CWR: "cw",
+    Mode.CWL: "cw",
+    Mode.DIGI: None,
+    Mode.PKT: None,
+}
+
+# SND frame flags from kiwi/client.py.
+KIWI_SND_ADC_OVFL = 0x02
+KIWI_SND_STEREO = 0x08
+KIWI_SND_COMPRESSED = 0x10
+KIWI_SND_LITTLE_ENDIAN = 0x80
+
+
+class _KiwiError(ConnectionError):
+    """A KiwiSDR server or handshake failure, reported on the status line."""
+
+
+def _kiwi_server_error(name: str, value: str | None, host: str) -> _KiwiError | None:
+    """Map Kiwi MSG errors to exceptions; None means informational.
+
+    Shared by the audio and waterfall streams. In particular 'badp=0'
+    reports no password problem and must not raise.
+    """
+    if name == "too_busy":
+        return _KiwiError(f"{host} is full (all {value or 'client'} slots taken)")
+    if name == "badp" and value is not None and value != "0":
+        if value == "1":
+            return _KiwiError(f"{host} needs a password or has no open channels")
+        return _KiwiError(f"{host} refused the connection (badp={value})")
+    if name == "redirect" and value is not None:
+        return _KiwiError(f"redirected to {urllib.parse.unquote(value)}; use that host")
+    if name == "down":
+        return _KiwiError(f"{host} reports it is down")
+    return None
+
+
+def kiwi_mode_for_q900(mode: Mode) -> str | None:
+    """Return the Kiwi SND mode following a Q900 CAT mode, or None to hold."""
+    return Q900_MODE_TO_KIWI.get(mode)
+
+
+def parse_kiwi_receiver_url(url: str) -> tuple[str, int] | None:
+    """Split a KiwiSDR receiver URL or bare host into (host, port).
+
+    Accepts http(s)://host[:port]/... links as produced by map.kiwisdr.com --
+    including proxy hosts like 12345.proxy.kiwisdr.com:8073 -- as well as bare
+    "hostname" or "hostname:port" text typed into the host field. A missing
+    port means 8073. Returns None when no hostname can be found.
+    """
+    text = (url or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = "http://" + text
+    try:
+        parts = urllib.parse.urlparse(text)
+    except ValueError:
+        return None
+    host = parts.hostname
+    if not host:
+        return None
+    try:
+        port = parts.port or KIWI_DEFAULT_PORT
+    except ValueError:
+        return None
+    return host, port
+
+
+def is_kiwi_directory_host(host: str) -> bool:
+    """True for the map/directory site itself, which is not a receiver."""
+    return host.casefold() in KIWI_DIRECTORY_HOSTS
+
+
+# Kiwi receivers cover HF, 0-30 MHz (plus per-site converter offsets). A Q900
+# sitting on VHF/UHF has nothing to offer one: the server silently clamps an
+# out-of-range frequency, so refuse with a message instead of playing audio
+# from the wrong frequency.
+KIWI_MAX_FREQ_HZ = 32_000_000
+
+
+def kiwi_freq_in_range(freq_hz: int) -> bool:
+    """True when a Q900 frequency is inside a Kiwi's HF coverage."""
+    return 0 <= freq_hz <= KIWI_MAX_FREQ_HZ
+
+
+def should_auto_use_kiwi_receiver(host: str, port: int) -> bool:
+    """True when a map navigation looks like a Kiwi receiver worth opening.
+
+    The directory itself is never a receiver. Anything else on the Kiwi port
+    or on a Kiwi proxy host is treated as a receiver click; other links (help
+    pages, maps) only fill the host field for the manual Use button.
+    """
+    if is_kiwi_directory_host(host):
+        return False
+    if host.casefold().endswith(".proxy.kiwisdr.com"):
+        return True
+    return port == KIWI_DEFAULT_PORT
+
+
+def kiwi_mod_message(kiwi_mode: str, freq_hz: int) -> str:
+    """Build the SET mod message tuning the Kiwi to a frequency and mode."""
+    low, high = KIWI_PASSBANDS[kiwi_mode]
+    return f"SET mod={kiwi_mode} low_cut={low} high_cut={high} freq={freq_hz / 1000.0:.3f}"
+
+
+def kiwi_resample_12k_to_48k(samples: np.ndarray) -> np.ndarray:
+    """Upsample 12 kHz Kiwi mono to the 48 kHz the output sinks run at."""
+    mono = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if mono.size == 0:
+        return mono
+    if mono.size == 1:
+        return np.full(4, mono[0], dtype=np.float32)
+    source = np.arange(mono.size, dtype=np.float64)
+    target = np.arange(mono.size * 4, dtype=np.float64) / 4.0
+    return np.interp(target, source, mono).astype(np.float32)
+
+
+# IMA-ADPCM step tables, as used by the Kiwi server's compressed SND frames
+# (see jks-prv/kiwiclient kiwi/client.py). Compression is requested off, but a
+# server that sends compressed frames anyway must still be decodable.
+_KIWI_ADPCM_STEPS = (
+    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34,
+    37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+    157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494,
+    544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552,
+    1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026,
+    4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
+    11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623,
+    27086, 29794, 32767,
+)
+_KIWI_ADPCM_INDEX_ADJUST = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
+
+
+class KiwiAdpcmDecoder:
+    """IMA-ADPCM decoder for compressed Kiwi SND frames."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.index = 0
+        self.prev = 0
+
+    def preset(self, index: int, prev: int) -> None:
+        self.index = max(0, min(len(_KIWI_ADPCM_STEPS) - 1, index))
+        self.prev = max(-32768, min(32767, prev))
+
+    def decode(self, data: bytes) -> np.ndarray:
+        samples = np.empty(len(data) * 2, dtype=np.int16)
+        position = 0
+        for byte in data:
+            for code in (byte & 0x0F, byte >> 4):
+                step = _KIWI_ADPCM_STEPS[self.index]
+                self.index = max(
+                    0, min(len(_KIWI_ADPCM_STEPS) - 1, self.index + _KIWI_ADPCM_INDEX_ADJUST[code])
+                )
+                difference = step >> 3
+                if code & 1:
+                    difference += step >> 2
+                if code & 2:
+                    difference += step >> 1
+                if code & 4:
+                    difference += step
+                if code & 8:
+                    difference = -difference
+                self.prev = max(-32768, min(32767, self.prev + difference))
+                samples[position] = self.prev
+                position += 1
+        return samples
+
+
+class KiwiAudioMonitor:
+    """Play a remote KiwiSDR's demodulated audio through the local outputs.
+
+    One worker thread owns a websocket-client SND stream: it runs the Kiwi
+    handshake, requests uncompressed mono, resamples 12 kHz to 48 kHz and
+    hands each block to the shared output fan-out and the audio waterfall.
+    Retunes requested from the GUI thread are applied by the worker, so all
+    socket I/O stays on one thread. Fatal server/handshake failures are kept
+    as text for the GUI watchdog, which owns all user-visible state.
+    """
+
+    def __init__(
+        self,
+        signals: RadioSignals,
+        output: Callable[[np.ndarray], None],
+        waterfall: AudioWaterfall | None = None,
+    ) -> None:
+        self.signals = signals
+        self._output = output
+        self._waterfall = waterfall
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._socket = None
+        self._tune_lock = threading.Lock()
+        self._freq_hz = 0
+        self._kiwi_mode = "usb"
+        self._retune_pending = False
+        self._setup_sent = False
+        self._host = ""
+        self._port = KIWI_DEFAULT_PORT
+        self._packets = 0
+        self._last_rssi = 0.0
+        self._error = ""
+        self._stats_lock = threading.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def error(self) -> str:
+        with self._stats_lock:
+            return self._error
+
+    def start(self, host: str, port: int, freq_hz: int, kiwi_mode: str) -> None:
+        """Connect to a KiwiSDR in the background; failures surface via error."""
+        self.stop()
+        with self._tune_lock:
+            self._freq_hz = freq_hz
+            self._kiwi_mode = kiwi_mode
+            self._retune_pending = True
+            self._setup_sent = False
+        with self._stats_lock:
+            self._host = host
+            self._port = port
+            self._packets = 0
+            self._last_rssi = 0.0
+            self._error = ""
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="q900-kiwi", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        sock, self._socket = self._socket, None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def retune(self, freq_hz: int, kiwi_mode: str | None) -> None:
+        """Follow the Q900's active VFO; a None mode holds the Kiwi's mode."""
+        with self._tune_lock:
+            self._freq_hz = freq_hz
+            if kiwi_mode is not None:
+                self._kiwi_mode = kiwi_mode
+            self._retune_pending = True
+
+    def label(self) -> str:
+        with self._stats_lock:
+            host, port = self._host, self._port
+        with self._tune_lock:
+            freq_hz, kiwi_mode = self._freq_hz, self._kiwi_mode
+        if not host:
+            return "idle"
+        return f"{host}:{port} {freq_hz / 1000.0:.3f} kHz {kiwi_mode}"
+
+    def detail(self) -> str:
+        with self._stats_lock:
+            return f"Kiwi {self._host}:{self._port}  {self._packets} audio blocks  RSSI {self._last_rssi:.1f}"
+
+    def _fail(self, message: str) -> None:
+        with self._stats_lock:
+            if not self._error:
+                self._error = message
+
+    def _run(self) -> None:
+        set_interactive_qos()
+        with self._stats_lock:
+            host, port = self._host, self._port
+        try:
+            self._stream_loop(host, port)
+        except _KiwiError as error:
+            self._fail(str(error))
+            self.signals.audio_state_changed.emit(f"Kiwi RX failed: {error}")
+        except Exception as error:
+            self._fail(str(error) or type(error).__name__)
+            self.signals.audio_state_changed.emit(f"Kiwi RX failed: {error or type(error).__name__}")
+
+    def _stream_loop(self, host: str, port: int) -> None:
+        try:
+            import websocket
+        except ImportError:
+            raise _KiwiError("needs websocket-client (pip install websocket-client)")
+        try:
+            ws = websocket.create_connection(
+                f"ws://{host}:{port}/{int(time.time()) & 0xFFFFFFFF}/SND", timeout=10
+            )
+        except Exception as error:
+            raise _KiwiError(f"cannot connect to {host}:{port} ({error})")
+        self._socket = ws
+        try:
+            ws.settimeout(1.0)
+        except Exception:
+            pass
+        decoder = KiwiAdpcmDecoder()
+        debug = bool(os.environ.get("Q900_KIWI_DEBUG"))
+        ws.send("SET auth t=kiwi p=")
+        ws.send("SET ident_user=Q900Control")
+        last_keepalive = 0.0
+        while not self._stop.is_set():
+            try:
+                frame = ws.recv()
+            except Exception as error:
+                name = type(error).__name__
+                if "Timeout" in name:
+                    self._send_retune(ws)
+                    if time.monotonic() - last_keepalive >= 1.0:
+                        try:
+                            ws.send("SET keepalive")
+                        except Exception:
+                            break
+                        last_keepalive = time.monotonic()
+                    continue
+                if self._stop.is_set():
+                    break
+                raise _KiwiError(f"connection lost ({error})")
+            self._dispatch_frame(ws, frame, decoder, debug)
+            self._send_retune(ws)
+            if time.monotonic() - last_keepalive >= 1.0:
+                try:
+                    ws.send("SET keepalive")
+                except Exception:
+                    break
+                last_keepalive = time.monotonic()
+
+    def _dispatch_frame(self, ws, frame, decoder: KiwiAdpcmDecoder, debug: bool) -> None:  # type: ignore[no-untyped-def]
+        """Route one websocket frame by its 3-byte tag, not its opcode.
+
+        The server sends everything -- including MSG control frames -- as
+        binary websocket frames, so a bytes frame is not necessarily audio.
+        Only SND frames reach the audio parser, and only with the tag
+        stripped: the header offsets assume the body after the tag.
+        """
+        if isinstance(frame, str):
+            text: str | None = frame
+        else:
+            raw = bytes(frame)
+            if raw[:3] == b"MSG":
+                try:
+                    text = raw.decode("ascii")
+                except UnicodeDecodeError:
+                    return
+            elif raw[:3] == b"SND":
+                self._handle_audio(raw[3:], decoder)
+                return
+            else:
+                return
+        if debug:
+            print(f"kiwi MSG: {text[:160]}", file=sys.stderr)
+        self._handle_text(ws, text, decoder)
+
+    def _current_tune(self) -> tuple[int, str]:
+        with self._tune_lock:
+            return self._freq_hz, self._kiwi_mode
+
+    def _send_retune(self, ws) -> None:  # type: ignore[no-untyped-def]
+        with self._tune_lock:
+            if not self._retune_pending or not self._setup_sent:
+                return
+            freq_hz, kiwi_mode = self._freq_hz, self._kiwi_mode
+            self._retune_pending = False
+        try:
+            ws.send(kiwi_mod_message(kiwi_mode, freq_hz))
+        except Exception:
+            pass
+
+    def _setup_receiver(self, ws, sample_rate: float) -> None:  # type: ignore[no-untyped-def]
+        freq_hz, kiwi_mode = self._current_tune()
+        ws.send(kiwi_mod_message(kiwi_mode, freq_hz))
+        ws.send("SET agc=1 hang=0 thresh=-100 slope=6 decay=1000 manGain=50")
+        # Uncompressed mono: big-endian int16 at the advertised rate, so no
+        # ADPCM decoder runs in the common case.
+        ws.send("SET compression=0")
+        ws.send("SET squelch=0 max=0")
+        ws.send("SET gen=0 mix=-1")
+        ws.send("SET keepalive")
+        with self._tune_lock:
+            self._setup_sent = True
+            self._retune_pending = False
+
+    def _handle_text(self, ws, frame: str, decoder: KiwiAdpcmDecoder) -> None:  # type: ignore[no-untyped-def]
+        if not frame.startswith("MSG"):
+            return
+        for pair in frame[3:].strip().split(" "):
+            if "=" in pair:
+                name, value = pair.split("=", 1)
+            else:
+                name, value = pair, None
+            self._handle_msg_param(ws, name, value, decoder)
+
+    def _handle_msg_param(self, ws, name: str, value: str | None, decoder: KiwiAdpcmDecoder) -> None:  # type: ignore[no-untyped-def]
+        if name == "audio_rate" and value is not None:
+            try:
+                ws.send(f"SET AR OK in={int(value)} out=44100")
+            except Exception:
+                pass
+        elif name == "sample_rate" and value is not None:
+            try:
+                rate = float(value)
+            except ValueError:
+                return
+            # Live servers report their sound-card clock, e.g. 11998.94 Hz,
+            # not exactly 12000. Only a gross mismatch is worth mentioning;
+            # the fixed 4x resample that follows is 88 ppm off at worst.
+            if abs(rate - KIWI_SAMPLE_RATE) > 1000:
+                self.signals.audio_state_changed.emit(
+                    f"Kiwi RX: unexpected sample rate {rate:g} Hz (expected {KIWI_SAMPLE_RATE})"
+                )
+            self._setup_receiver(ws, rate)
+        elif name == "audio_adpcm_state" and value is not None:
+            try:
+                index, prev = (int(part) for part in value.split(",")[:2])
+            except ValueError:
+                return
+            decoder.preset(index, prev)
+        else:
+            error = _kiwi_server_error(name, value, self._host)
+            if error is not None:
+                raise error
+
+    def _handle_audio(self, frame: bytes, decoder: KiwiAdpcmDecoder) -> None:
+        if len(frame) < 7:
+            return
+        flags, _seq = struct.unpack("<BI", frame[0:5])
+        (smeter,) = struct.unpack(">H", frame[5:7])
+        rssi = 0.1 * smeter - 127
+        data = frame[7:]
+        if flags & KIWI_SND_STEREO:
+            return
+        if flags & KIWI_SND_COMPRESSED:
+            samples = decoder.decode(data).astype(np.float32) / 32768.0
+        else:
+            if len(data) < 2 or len(data) % 2:
+                return
+            samples = np.frombuffer(data, dtype=">h").astype(np.float32) / 32768.0
+        if samples.size == 0:
+            return
+        block = kiwi_resample_12k_to_48k(samples)
+        if self._waterfall is not None:
+            self._waterfall.feed_audio(block, NetworkAudioMonitor.SAMPLE_RATE)
+        self._output(block)
+        with self._stats_lock:
+            first = self._packets == 0
+            self._packets += 1
+            self._last_rssi = rssi
+        if first:
+            with self._stats_lock:
+                host, port = self._host, self._port
+            self.signals.audio_state_changed.emit(f"Kiwi RX audio from {host}:{port}")
+
+
+# Kiwi zoom levels halve the baseband per step: span is maxfreq/2^zoom for
+# zoom 0-14, with maxfreq normally 30 MHz. Live servers advertise a zoom_cap
+# (seen at 11); requesting above it risks the server ignoring the SET, so
+# clamp there. The zoom/start echo corrects the render axis regardless.
+KIWI_MAX_ZOOM = 11
+KIWI_WF_BINS = 1024
+KIWI_WF_ZOOM_LEVELS = 14
+KIWI_WF_SPEED = 4
+
+
+def kiwi_zoom_for_span(span_hz: int) -> int:
+    """Nearest Kiwi zoom for an RF span in Hz, following the radio's span."""
+    if span_hz <= 0:
+        return KIWI_MAX_ZOOM
+    zoom = round(math.log2(30_000_000.0 / span_hz))
+    return max(0, min(KIWI_MAX_ZOOM, zoom))
+
+
+def kiwi_waterfall_axis(
+    max_freq_khz: float, zoom: int, start_counter: int
+) -> tuple[float, float]:
+    """Return (center_hz, span_hz) for a Kiwi zoom/start echo.
+
+    Inverts kiwiclient's start_frequency_to_counter: the counter addresses the
+    full 2^14 x 1024 grid regardless of zoom.
+    """
+    span_khz = max_freq_khz / 2**zoom
+    start_khz = start_counter * max_freq_khz / KIWI_WF_BINS / 2**KIWI_WF_ZOOM_LEVELS
+    return (start_khz + span_khz / 2) * 1000.0, span_khz * 1000.0
+
+
+class KiwiWaterfallMonitor:
+    """Stream a remote KiwiSDR's RF waterfall into the main window.
+
+    A second worker thread owns a W/F websocket: zoom/cf follow the Q900's
+    active VFO and span selector, rows arrive as 1024 raw magnitude bytes and
+    are emitted with their RF axis. Like the audio monitor, all socket I/O
+    stays on the worker and fatal failures are kept as text for the GUI.
+    """
+
+    def __init__(self, signals: RadioSignals) -> None:
+        self.signals = signals
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._socket = None
+        self._tune_lock = threading.Lock()
+        self._freq_hz = 0
+        self._zoom = KIWI_MAX_ZOOM
+        self._retune_pending = False
+        self._setup_sent = False
+        self._host = ""
+        self._port = KIWI_DEFAULT_PORT
+        self._stats_lock = threading.Lock()
+        self._max_freq_khz = 30_000.0
+        self._zoom_actual = KIWI_MAX_ZOOM
+        self._center_hz = 0.0
+        self._span_hz = 0.0
+        self._frames = 0
+        self._error = ""
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def error(self) -> str:
+        with self._stats_lock:
+            return self._error
+
+    def start(self, host: str, port: int, freq_hz: int, zoom: int) -> None:
+        """Connect the waterfall stream in the background."""
+        self.stop()
+        span_khz = 30_000.0 / 2**zoom
+        with self._tune_lock:
+            self._freq_hz = freq_hz
+            self._zoom = zoom
+            self._retune_pending = True
+            self._setup_sent = False
+        with self._stats_lock:
+            self._host = host
+            self._port = port
+            self._max_freq_khz = 30_000.0
+            self._zoom_actual = zoom
+            self._center_hz = float(freq_hz)
+            self._span_hz = span_khz * 1000.0
+            self._frames = 0
+            self._error = ""
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="q900-kiwi-wf", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        sock, self._socket = self._socket, None
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def retune(self, freq_hz: int, zoom: int) -> None:
+        """Follow the Q900's active VFO and span selector."""
+        with self._tune_lock:
+            self._freq_hz = freq_hz
+            self._zoom = zoom
+            self._retune_pending = True
+
+    def _fail(self, message: str) -> None:
+        with self._stats_lock:
+            if not self._error:
+                self._error = message
+
+    def _run(self) -> None:
+        set_interactive_qos()
+        with self._stats_lock:
+            host, port = self._host, self._port
+        try:
+            self._stream_loop(host, port)
+        except _KiwiError as error:
+            self._fail(str(error))
+            self.signals.audio_state_changed.emit(f"Kiwi waterfall failed: {error}")
+        except Exception as error:
+            self._fail(str(error) or type(error).__name__)
+            self.signals.audio_state_changed.emit(
+                f"Kiwi waterfall failed: {error or type(error).__name__}"
+            )
+
+    def _stream_loop(self, host: str, port: int) -> None:
+        try:
+            import websocket
+        except ImportError:
+            raise _KiwiError("needs websocket-client (pip install websocket-client)")
+        try:
+            ws = websocket.create_connection(
+                f"ws://{host}:{port}/{int(time.time()) & 0xFFFFFFFF}/W/F", timeout=10
+            )
+        except Exception as error:
+            raise _KiwiError(f"cannot connect to {host}:{port} ({error})")
+        self._socket = ws
+        try:
+            ws.settimeout(1.0)
+        except Exception:
+            pass
+        debug = bool(os.environ.get("Q900_KIWI_DEBUG"))
+        ws.send("SET auth t=kiwi p=")
+        ws.send("SET ident_user=Q900Control")
+        # The reference client waits for wf_setup, but setup SETs are
+        # idempotent and live servers act on an early setup, so send now and
+        # re-send if wf_setup ever arrives. Waiting is what starves the
+        # stream when the trigger message differs by version.
+        self._send_setup(ws)
+        last_keepalive = 0.0
+        while not self._stop.is_set():
+            try:
+                frame = ws.recv()
+            except Exception as error:
+                name = type(error).__name__
+                if "Timeout" in name:
+                    self._send_retune(ws)
+                    if time.monotonic() - last_keepalive >= 1.0:
+                        try:
+                            ws.send("SET keepalive")
+                        except Exception:
+                            break
+                        last_keepalive = time.monotonic()
+                    continue
+                if self._stop.is_set():
+                    break
+                raise _KiwiError(f"connection lost ({error})")
+            self._dispatch_frame(ws, frame, debug)
+            self._send_retune(ws)
+            if time.monotonic() - last_keepalive >= 1.0:
+                try:
+                    ws.send("SET keepalive")
+                except Exception:
+                    break
+                last_keepalive = time.monotonic()
+
+    def _current_tune(self) -> tuple[int, int]:
+        with self._tune_lock:
+            return self._freq_hz, self._zoom
+
+    def _send_setup(self, ws) -> None:  # type: ignore[no-untyped-def]
+        freq_hz, zoom = self._current_tune()
+        ws.send(f"SET zoom={zoom} cf={freq_hz / 1000.0:.3f}")
+        ws.send("SET maxdb=-10 mindb=-110")
+        ws.send(f"SET wf_speed={KIWI_WF_SPEED}")
+        ws.send("SET wf_comp=0")
+        ws.send("SET keepalive")
+        with self._tune_lock:
+            self._setup_sent = True
+            self._retune_pending = False
+
+    def _send_retune(self, ws) -> None:  # type: ignore[no-untyped-def]
+        with self._tune_lock:
+            if not self._retune_pending or not self._setup_sent:
+                return
+            freq_hz, zoom = self._freq_hz, self._zoom
+            self._retune_pending = False
+        try:
+            ws.send(f"SET zoom={zoom} cf={freq_hz / 1000.0:.3f}")
+        except Exception:
+            pass
+
+    def _dispatch_frame(self, ws, frame, debug: bool) -> None:  # type: ignore[no-untyped-def]
+        if isinstance(frame, str):
+            text: str | None = frame
+        else:
+            raw = bytes(frame)
+            if raw[:3] == b"MSG":
+                try:
+                    text = raw.decode("ascii")
+                except UnicodeDecodeError:
+                    return
+            elif raw[:3] == b"W/F":
+                # kiwiclient skips one pad byte after the tag before the
+                # three little-endian words (x-bin, flags/zoom, seq).
+                self._handle_waterfall(raw[4:])
+                return
+            else:
+                return
+        if debug:
+            print(f"kiwi WF MSG: {text[:160]}", file=sys.stderr)
+        self._handle_text(ws, text)
+
+    def _handle_text(self, ws, frame: str) -> None:  # type: ignore[no-untyped-def]
+        if not frame.startswith("MSG"):
+            return
+        for pair in frame[3:].strip().split(" "):
+            if "=" in pair:
+                name, value = pair.split("=", 1)
+            else:
+                name, value = pair, None
+            self._handle_msg_param(ws, name, value)
+
+    def _handle_msg_param(self, ws, name: str, value: str | None) -> None:  # type: ignore[no-untyped-def]
+        if name == "bandwidth" and value is not None:
+            try:
+                if float(value) > 0:
+                    with self._stats_lock:
+                        self._max_freq_khz = float(value) / 1000.0
+            except ValueError:
+                pass
+        elif name == "zoom" and value is not None:
+            try:
+                with self._stats_lock:
+                    self._zoom_actual = int(value)
+            except ValueError:
+                pass
+        elif name == "start" and value is not None:
+            try:
+                start = int(value)
+            except ValueError:
+                return
+            with self._stats_lock:
+                center, span = kiwi_waterfall_axis(
+                    self._max_freq_khz, self._zoom_actual, start
+                )
+                self._center_hz, self._span_hz = center, span
+        elif name == "wf_setup":
+            try:
+                self._send_setup(ws)
+            except Exception:
+                pass
+        else:
+            with self._stats_lock:
+                host = self._host
+            error = _kiwi_server_error(name, value, host)
+            if error is not None:
+                raise error
+
+    def _handle_waterfall(self, body: bytes) -> None:
+        if len(body) < 12:
+            return
+        data = body[12:]
+        if not data:
+            return
+        with self._stats_lock:
+            center_hz, span_hz = self._center_hz, self._span_hz
+            self._frames += 1
+        # Uncompressed rows were requested (wf_comp=0); the shared renderer
+        # drops any row whose length disagrees with the history.
+        self.signals.kiwi_waterfall_received.emit(bytes(data), center_hz, span_hz)
 
 
 # One network TX datagram is the radio's native media quantum: 48 interleaved
@@ -3801,13 +4626,16 @@ class SpectrumWaterfall(QWidget):
         self._source = WATERFALL_RADIO
         self._bins = bytes(SPECTRUM_BINS)
         self._histories: dict[str, list[bytes]] = {
-            WATERFALL_RADIO: [], "audio": [], "iq": []
+            WATERFALL_RADIO: [], "audio": [], "iq": [], WATERFALL_KIWI: []
         }
         self._audio_sample_rate = 48_000
         self._display_center_hz = 440_400_000
         self._tuned_hz = 440_400_000
         self._mode = Mode.NFM
         self._span_hz = SPAN_HZ[2]
+        # Remote Kiwi waterfall axis, from the server's zoom/start echo.
+        self._kiwi_center_hz = 0
+        self._kiwi_span_hz = 0
         self._drag_start: QPoint | None = None
         self._drag_center = 0
         self._last_drag_send = 0.0
@@ -3846,6 +4674,18 @@ class SpectrumWaterfall(QWidget):
         self._audio_sample_rate = sample_rate
         self._add_bins("iq" if iq else "audio", bins)
 
+    def add_kiwi_bins(self, bins: bytes, center_hz: float, span_hz: float) -> None:
+        """Append one remote-Kiwi waterfall row with its RF axis.
+
+        Rows are raw server bytes (0-255 magnitude, like every other history),
+        so mixed lengths are filtered by the shared renderer. The axis comes
+        from the server's zoom/start echo rather than the request, so a server
+        that clamps the zoom still labels correctly.
+        """
+        self._kiwi_center_hz = int(center_hz)
+        self._kiwi_span_hz = int(span_hz)
+        self._add_bins(WATERFALL_KIWI, bins)
+
     def _add_bins(self, source: str, bins: bytes) -> None:
         history = self._histories[source]
         history.insert(0, bins)
@@ -3866,10 +4706,15 @@ class SpectrumWaterfall(QWidget):
     def _active_history(self) -> str:
         if self._source == WATERFALL_RADIO:
             return WATERFALL_RADIO
+        if self._source == WATERFALL_KIWI:
+            return WATERFALL_KIWI
         return "iq" if self._sdr_active else "audio"
 
     def _is_radio(self) -> bool:
         return self._source == WATERFALL_RADIO
+
+    def _is_kiwi(self) -> bool:
+        return self._source == WATERFALL_KIWI
 
     def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         painter = QPainter(self)
@@ -3912,6 +4757,15 @@ class SpectrumWaterfall(QWidget):
                 for low_hz, high_hz in bands
             ]
             x = round(self._iq_to_x(FFT_TUNED_OFFSET_HZ, width))
+        elif history == WATERFALL_KIWI:
+            positions = [
+                (
+                    self._kiwi_to_x(self._tuned_hz + low_hz, width),
+                    self._kiwi_to_x(self._tuned_hz + high_hz, width),
+                )
+                for low_hz, high_hz in bands
+            ]
+            x = round(self._kiwi_to_x(self._tuned_hz, width))
         else:
             positions = [
                 (self._audio_to_x(low_hz, width), self._audio_to_x(high_hz, width))
@@ -3986,6 +4840,12 @@ class SpectrumWaterfall(QWidget):
     def _iq_to_x(self, offset_hz: float, width: int) -> float:
         return iq_offset_to_x(offset_hz, width, self._audio_sample_rate)
 
+    def _kiwi_to_x(self, frequency_hz: int, width: int) -> float:
+        """Map an RF frequency onto the remote waterfall's own axis."""
+        if not self._kiwi_span_hz:
+            return width / 2
+        return width / 2 + (frequency_hz - self._kiwi_center_hz) * width / self._kiwi_span_hz
+
     def _sdr_passband(self) -> tuple[int, int]:
         """Return the SDR demodulator bandwidth offsets in Hz."""
         if self._sdr_mode == "NFM":
@@ -4043,6 +4903,9 @@ class SpectrumWaterfall(QWidget):
         if self._is_radio():
             left_label = f"{self._display_center_hz - self._span_hz // 2:,} Hz"
             right_label = f"{self._display_center_hz + self._span_hz // 2:,} Hz"
+        elif self._is_kiwi():
+            left_label = f"Kiwi {self._kiwi_center_hz - self._kiwi_span_hz // 2:,} Hz"
+            right_label = f"Kiwi {self._kiwi_center_hz + self._kiwi_span_hz // 2:,} Hz"
         elif self._active_history() == "iq":
             left_label = f"IQ {-self._audio_sample_rate // 2:,} Hz"
             right_label = f"IQ +{self._audio_sample_rate // 2:,} Hz"
@@ -4058,7 +4921,12 @@ class SpectrumWaterfall(QWidget):
         history = self._histories[self._active_history()]
         if not history or width < 1:
             painter.setPen(QColor("#63727d"))
-            label = "Waiting for radio spectrum frames" if self._is_radio() else "Waiting for receive audio"
+            if self._is_radio():
+                label = "Waiting for radio spectrum frames"
+            elif self._is_kiwi():
+                label = "Waiting for Kiwi waterfall"
+            else:
+                label = "Waiting for receive audio"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, label)
             return
         row_height = max(1, height // min(len(history), 100))
@@ -4131,6 +4999,14 @@ class MainWindow(QMainWindow):
         self.audio = UsbAudioMonitor(self.signals, self.audio_waterfall)
         self.network_audio = NetworkAudioMonitor(self.signals, self.audio_waterfall)
         self.sdr_receiver = SDRReceiver(self.network_audio.enqueue_audio)
+        self.kiwi = KiwiAudioMonitor(
+            self.signals, self.network_audio.enqueue_audio, self.audio_waterfall
+        )
+        self.kiwi_waterfall = KiwiWaterfallMonitor(self.signals)
+        self._kiwi_active = False
+        self._kiwi_host = ""
+        self._kiwi_port = KIWI_DEFAULT_PORT
+        self._kiwi_prev_waterfall: int | None = None
         self.tx_audio = TransmitAudioRouter(self.signals)
         self.rigctl = RigctlServer(self.client, self.signals)
         self._ptt_source: str | None = None
@@ -4161,6 +5037,9 @@ class MainWindow(QMainWindow):
         self._network_audio_timer = QTimer(self)
         self._network_audio_timer.setInterval(500)
         self._network_audio_timer.timeout.connect(self.update_network_audio_status)
+        self._kiwi_timer = QTimer(self)
+        self._kiwi_timer.setInterval(500)
+        self._kiwi_timer.timeout.connect(self._poll_kiwi)
         # A window wider than the display cannot be corrected after the fact, so
         # the only useful response is to say which widget is responsible.
         self._width_reported = 0
@@ -4198,6 +5077,7 @@ class MainWindow(QMainWindow):
         self.spectrum = SpectrumWaterfall()
         self.signals.spectrum_received.connect(self.spectrum.add_radio_bins)
         self.signals.audio_waterfall_received.connect(self.spectrum.add_audio_bins)
+        self.signals.kiwi_waterfall_received.connect(self.spectrum.add_kiwi_bins)
         self.spectrum.tune_requested.connect(self.tune)
         layout.addWidget(self.spectrum, 1)
         layout.addLayout(self._audio_panel())
@@ -4413,7 +5293,11 @@ class MainWindow(QMainWindow):
         self.waterfall_source = QComboBox()
         self.waterfall_source.addItem("Waterfall: Radio", WATERFALL_RADIO)
         self.waterfall_source.addItem("Waterfall: Audio", WATERFALL_AUDIO)
-        self.waterfall_source.setToolTip("Radio uses CAT spectrum; Audio follows RX audio or SDR I/Q")
+        self.waterfall_source.addItem("Waterfall: Kiwi", WATERFALL_KIWI)
+        self.waterfall_source.setToolTip(
+            "Radio uses CAT spectrum; Audio follows RX audio or SDR I/Q; "
+            "Kiwi shows the remote waterfall in Kiwi mode"
+        )
         self.waterfall_source.currentIndexChanged.connect(self.set_waterfall_source)
         header.addWidget(self.waterfall_source)
         self.vfo_badge = QLabel("A")
@@ -4514,6 +5398,28 @@ class MainWindow(QMainWindow):
         self.rigctl_status = ElidedLabel("rigctl: listening on 127.0.0.1:4532")
         self.rigctl_status.setStyleSheet("color: #8ba0ae; font: 13px Menlo")
         audio.addWidget(self.rigctl_status, 2)
+        # KiwiSDR controls share this row rather than taking a second one: a
+        # second row grows the window's layout minimum past small displays and
+        # pushes the PTT row off the bottom. The Kiwi badge lives in the
+        # network status label (see update_network_audio_status), so no extra
+        # label is needed here either.
+        audio.addWidget(QLabel("Kiwi"))
+        self.kiwi_host = QLineEdit()
+        self.kiwi_host.setPlaceholderText("kiwi host[:port]")
+        self.kiwi_host.setMaximumWidth(140)
+        self.kiwi_host.setToolTip("Remote KiwiSDR hostname, optionally with :port (default 8073).")
+        self.kiwi_map_button = QPushButton("Map…")
+        self.kiwi_map_button.setToolTip(f"Pick a receiver on {KIWI_MAP_URL}.")
+        self.kiwi_map_button.clicked.connect(self.open_kiwi_map)
+        self.kiwi_button = QPushButton("Kiwi RX")
+        self.kiwi_button.setToolTip(
+            "Replace Q900 receive audio with the remote KiwiSDR. "
+            "The Q900 transmit path keeps working."
+        )
+        self.kiwi_button.clicked.connect(self.toggle_kiwi)
+        audio.addWidget(self.kiwi_host)
+        audio.addWidget(self.kiwi_map_button)
+        audio.addWidget(self.kiwi_button)
         return audio
 
     def _ptt_panel(self) -> QHBoxLayout:
@@ -4944,6 +5850,9 @@ class MainWindow(QMainWindow):
 
     def toggle_audio(self) -> None:
         if self.audio.running or self.network_audio.running:
+            if self._kiwi_active:
+                # Stopping audio releases the fan-out Kiwi plays through.
+                self.exit_kiwi()
             self._audio_wanted = False
             self.audio.stop()
             self.network_audio.stop()
@@ -4990,8 +5899,15 @@ class MainWindow(QMainWindow):
 
     def update_network_audio_status(self) -> None:
         if self.network_audio.running:
-            self.network_audio_status.setText(self.network_audio.summary)
-            self.network_audio_status.set_detail(self.network_audio.status)
+            summary = self.network_audio.summary
+            detail = self.network_audio.status
+            if self._kiwi_active:
+                # The CAT S-meter below still reports the local radio; say out
+                # loud that the audio is remote so the two are never confused.
+                summary = f"KIWI {self.kiwi.label()} | {summary}"
+                detail = f"{self.kiwi.detail()}  {detail}".strip()
+            self.network_audio_status.setText(summary)
+            self.network_audio_status.set_detail(detail)
         else:
             self._network_audio_timer.stop()
             self._clear_network_audio_status()
@@ -5005,6 +5921,9 @@ class MainWindow(QMainWindow):
         if self._sdr_active:
             self.exit_sdr()
             return
+        if self._kiwi_active:
+            # SDR needs the Q900's own I/Q stream and TX path; Kiwi holds neither.
+            self.exit_kiwi("Kiwi RX stopped for SDR mode.")
         if self._sdr_switch_pending or self._sdr_restore_pending or not self.client.state.connected:
             return
         if self.client.state.transport != "TCP":
@@ -5226,10 +6145,209 @@ class MainWindow(QMainWindow):
             return
         self._sdr_restore_timer.start(400)
 
+    def toggle_kiwi(self) -> None:
+        """Replace Q900 receive audio with a remote KiwiSDR, or restore it.
+
+        Muting keeps UDP/8000 bound and the radio-clock accumulator intact, so
+        network PTT keeps working while Kiwi audio plays. A separate
+        _kiwi_active flag (not _sdr_active) keeps transmit on the normal audio
+        path instead of hijacking it to SDR I/Q.
+        """
+        if self._kiwi_active:
+            self.exit_kiwi("Kiwi RX stopped; Q900 audio restored.")
+            return
+        if not self.client.state.connected:
+            self.status.setText("Connect the radio before using Kiwi RX.")
+            return
+        if self.client.state.transport != "TCP":
+            self.status.setText("Kiwi RX replaces network audio and needs the TCP transport.")
+            return
+        if self._sdr_active or self._sdr_switch_pending or self._sdr_restore_pending:
+            self.status.setText("Exit SDR mode before using Kiwi RX.")
+            return
+        if self._ptt_source:
+            self.status.setText("Release PTT before starting Kiwi RX.")
+            return
+        try:
+            import websocket  # noqa: F401
+        except ImportError:
+            self.status.setText("Kiwi RX needs websocket-client: pip install -r requirements.txt")
+            return
+        parsed = parse_kiwi_receiver_url(self.kiwi_host.text())
+        if parsed is None:
+            self.status.setText("Enter a Kiwi host as hostname[:port], or pick one from the map.")
+            return
+        host, port = parsed
+        if is_kiwi_directory_host(host):
+            self.status.setText("That is the Kiwi directory, not a receiver; pick a receiver pin.")
+            return
+        if not self.network_audio.running:
+            # Kiwi audio fans out through the network sinks, and network PTT
+            # needs the same socket, so this is a request for the media stream.
+            self._audio_wanted = True
+            self.start_audio_default()
+        if not self.network_audio.running:
+            self.status.setText("Start network receive audio before using Kiwi RX.")
+            return
+        state = self.client.state
+        freq_hz = state.vfo_b_hz if state.active_vfo_b else state.vfo_a_hz
+        mode = state.vfo_b_mode if state.active_vfo_b else state.vfo_a_mode
+        kiwi_mode = kiwi_mode_for_q900(mode)
+        if kiwi_mode is None:
+            self.status.setText(
+                f"Kiwi has no equivalent for Q900 mode {mode.name}; select another mode first."
+            )
+            return
+        if not kiwi_freq_in_range(freq_hz):
+            self.status.setText(
+                f"Q900 is on {freq_hz / 1_000_000:.3f} MHz, outside the Kiwi's "
+                "0-30 MHz range; tune to HF first."
+            )
+            return
+        zoom = kiwi_zoom_for_span(SPAN_HZ[state.span_index])
+        self.network_audio.set_kiwi_mute(True)
+        try:
+            self.kiwi.start(host, port, freq_hz, kiwi_mode)
+            self.kiwi_waterfall.start(host, port, freq_hz, zoom)
+            self._kiwi_active = True
+            self._kiwi_host = host
+            self._kiwi_port = port
+            self.kiwi_host.setText(f"{host}:{port}")
+            self.kiwi_button.setText("Stop Kiwi")
+            self._kiwi_timer.start()
+            # The radio waterfall shows the muted Q900's passband, which is
+            # meaningless while Kiwi audio plays. Show the remote waterfall
+            # instead and put the previous source back on exit.
+            self._kiwi_prev_waterfall = self.waterfall_source.currentIndex()
+            kiwi_index = self.waterfall_source.findData(WATERFALL_KIWI)
+            if kiwi_index >= 0 and kiwi_index != self.waterfall_source.currentIndex():
+                self.waterfall_source.setCurrentIndex(kiwi_index)
+        except Exception as error:
+            # A slot exception otherwise reaches only stderr, which reads as
+            # "the button does nothing". Unmute and say so on the status line.
+            self.network_audio.set_kiwi_mute(False)
+            self._kiwi_active = False
+            self.status.setText(f"Kiwi RX failed: {error}")
+            return
+        self.status.setText(f"Kiwi RX connecting to {host}:{port}; Q900 RX muted, TX stays on the radio.")
+
+    def exit_kiwi(self, message: str | None = None) -> None:
+        """Stop Kiwi RX and restore Q900 receive audio."""
+        self._kiwi_timer.stop()
+        self.kiwi.stop()
+        self.kiwi_waterfall.stop()
+        self.network_audio.set_kiwi_mute(False)
+        self._kiwi_active = False
+        self.kiwi_button.setText("Kiwi RX")
+        previous, self._kiwi_prev_waterfall = self._kiwi_prev_waterfall, None
+        if previous is not None and previous != self.waterfall_source.currentIndex():
+            self.waterfall_source.setCurrentIndex(previous)
+        if message:
+            self.status.setText(message)
+
+    def _poll_kiwi(self) -> None:
+        """Watchdog: surface Kiwi failures on the GUI thread, where unmuting
+        is safe. The worker thread never touches GUI state directly; the
+        live KIWI badge is drawn by update_network_audio_status instead."""
+        if not self._kiwi_active:
+            self._kiwi_timer.stop()
+            return
+        error = self.kiwi.error
+        if error:
+            self.exit_kiwi(f"Kiwi RX failed: {error}")
+
+    def _kiwi_follow_radio(self) -> None:
+        """Retune the Kiwi to the Q900's active VFO frequency, mode and span."""
+        if not self._kiwi_active:
+            return
+        state = self.client.state
+        freq_hz = state.vfo_b_hz if state.active_vfo_b else state.vfo_a_hz
+        if not kiwi_freq_in_range(freq_hz):
+            self.status.setText(
+                "Q900 left the Kiwi's 0-30 MHz range; "
+                f"Kiwi holding {self.kiwi.label()}."
+            )
+            return
+        self.kiwi_waterfall.retune(freq_hz, kiwi_zoom_for_span(SPAN_HZ[state.span_index]))
+        mode = state.vfo_b_mode if state.active_vfo_b else state.vfo_a_mode
+        kiwi_mode = kiwi_mode_for_q900(mode)
+        if kiwi_mode is None:
+            # DIGI/PKT have no remote analogue: hold frequency and mode.
+            self.kiwi.retune(freq_hz, None)
+            return
+        self.kiwi.retune(freq_hz, kiwi_mode)
+
+    def open_kiwi_map(self) -> None:
+        """Show map.kiwisdr.com embedded; a chosen receiver fills the host field."""
+        try:
+            from PyQt6.QtWebEngineWidgets import QWebEngineView
+        except ImportError:
+            self.status.setText(
+                "Embedded map needs PyQt6-WebEngine (pip install PyQt6-WebEngine); "
+                "or type a Kiwi host manually."
+            )
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("KiwiSDR Map — click a receiver, then Use Receiver")
+        dialog.resize(1000, 700)
+        layout = QVBoxLayout(dialog)
+        view = QWebEngineView(dialog)
+        layout.addWidget(view, 1)
+        row = QHBoxLayout()
+        chosen = QLineEdit(dialog)
+        chosen.setReadOnly(True)
+        chosen.setPlaceholderText("Click a receiver pin on the map…")
+        use = QPushButton("Use Receiver")
+        use.setEnabled(False)
+        row.addWidget(chosen, 1)
+        row.addWidget(use)
+        layout.addLayout(row)
+
+        def accept() -> None:
+            hostport = chosen.text()
+            if not hostport:
+                return
+            self.kiwi_host.setText(hostport)
+            dialog.accept()
+            # A receiver click hands its audio straight to the main window:
+            # switch receivers if already listening, else start. Guard
+            # failures (no radio, SDR active) land on the status line, which
+            # is visible again once the map closes, with the host kept for a
+            # manual retry.
+            if self._kiwi_active:
+                self.exit_kiwi()
+            self.toggle_kiwi()
+
+        def offer(url_string: str) -> None:
+            parsed = parse_kiwi_receiver_url(url_string)
+            if parsed is None:
+                return
+            host, port = parsed
+            if is_kiwi_directory_host(host):
+                return
+            chosen.setText(f"{host}:{port}")
+            use.setEnabled(True)
+            if should_auto_use_kiwi_receiver(host, port):
+                accept()
+
+        view.urlChanged.connect(lambda url: offer(url.toString()))
+        try:
+            view.page().newWindowRequest.connect(
+                lambda request: offer(request.requestedUrl().toString())
+            )
+        except (AttributeError, RuntimeError):
+            pass
+
+        use.clicked.connect(accept)
+        view.load(QUrl(KIWI_MAP_URL))
+        dialog.exec()
+
     def toggle_connection(self) -> None:
         if self.client.state.connected or self.client.state.listening:
             if self._sdr_active or self._sdr_switch_pending:
                 self.exit_sdr()
+            if self._kiwi_active:
+                self.exit_kiwi()
             self._sdr_restore_timer.stop()
             self._sdr_restore_pending = False
             self.client.disconnect()
@@ -5310,12 +6428,16 @@ class MainWindow(QMainWindow):
             self.client.set_mode(mode)
         except (ConnectionError, OSError) as error:
             self.show_error(str(error))
+            return
+        self._kiwi_follow_radio()
 
     def tune(self, frequency: int) -> None:
         try:
             self.client.tune(frequency)
         except ConnectionError:
             self.status.setText("Wait for the radio to connect before tuning.")
+            return
+        self._kiwi_follow_radio()
 
     def keyboard_tune(self, direction: int) -> None:
         """Step the active VFO by 0.01 kHz (10 Hz) from a rounded boundary."""
@@ -5389,8 +6511,10 @@ class MainWindow(QMainWindow):
                 self.client.set_split(not self.client.state.split)
             elif action == "vfo":
                 self.client.select_vfo(not self.client.state.active_vfo_b)
+                self._kiwi_follow_radio()
             elif action == "span":
                 self.client.set_span((self.client.state.span_index + 1) % len(SPAN_HZ))
+                self._kiwi_follow_radio()
             elif action == "atu":
                 self.client.set_atu((self.client.state.atu + 1) % 3)
             elif action == "tx_power":
@@ -5475,6 +6599,10 @@ class MainWindow(QMainWindow):
             self.network_audio.running,
         ):
             QTimer.singleShot(0, self.start_audio_default)
+        # Kiwi RX needs the radio for TX and for what to follow; without it
+        # there is nothing to follow and no transmit path to keep alive.
+        if self._kiwi_active and not state.connected:
+            self.exit_kiwi("Radio disconnected; Kiwi RX stopped.")
         # Keep UDP/8000 bound while the TCP listener waits for a radio. Some
         # firmware starts media before the first status frame reaches the UI.
         if not state.connected and not state.listening and self.network_audio.running:
@@ -5494,6 +6622,8 @@ class MainWindow(QMainWindow):
             self.handle_rigctl_ptt(False)
         if self._sdr_active or self._sdr_switch_pending:
             self.exit_sdr()
+        if self._kiwi_active:
+            self.exit_kiwi()
         self._sdr_restore_timer.stop()
         self._sdr_restore_pending = False
         self.audio.stop()
@@ -7228,6 +8358,10 @@ def main() -> None:
             return
         analyze_iq_tx_recording(sys.argv[index + 1])
         return
+    # The Map button imports QWebEngineView lazily so the radio works without
+    # the WebEngine package installed. Qt only allows that late import if
+    # AA_ShareOpenGLContexts was set before the QApplication existed.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     app.setFont(QFont("Arial", 10))
@@ -8373,6 +9507,234 @@ def _sdr_tx_self_test() -> None:
     assert 0.0 <= phase < 1.0
 
 
+def _kiwi_self_test() -> None:
+    # Q900 CAT mode -> Kiwi SND mode. Every selectable mode must map, with
+    # NFM/WFM landing on distinct narrowband FM channels (2.5/5 kHz deviation
+    # -> nnfm/nbfm) and DIGI/PKT holding the Kiwi's current mode.
+    assert kiwi_mode_for_q900(Mode.USB) == "usb"
+    assert kiwi_mode_for_q900(Mode.LSB) == "lsb"
+    assert kiwi_mode_for_q900(Mode.AM) == "am"
+    assert kiwi_mode_for_q900(Mode.NFM) == "nnfm"
+    assert kiwi_mode_for_q900(Mode.WFM) == "nbfm"
+    assert kiwi_mode_for_q900(Mode.CWR) == "cw"
+    assert kiwi_mode_for_q900(Mode.CWL) == "cw"
+    assert kiwi_mode_for_q900(Mode.DIGI) is None
+    assert kiwi_mode_for_q900(Mode.PKT) is None
+    assert len(set(Q900_MODE_TO_KIWI)) == len(Mode)
+    # The narrow FM channel really is narrower.
+    nnfm_low, nnfm_high = KIWI_PASSBANDS["nnfm"]
+    nbfm_low, nbfm_high = KIWI_PASSBANDS["nbfm"]
+    assert nnfm_high - nnfm_low < nbfm_high - nbfm_low
+
+    # Receiver URL parsing: map links, proxy hosts, bare host text.
+    assert parse_kiwi_receiver_url("http://12345.proxy.kiwisdr.com:8073/?f=14074usb") == (
+        "12345.proxy.kiwisdr.com", 8073,
+    )
+    assert parse_kiwi_receiver_url("mykiwi.local") == ("mykiwi.local", 8073)
+    assert parse_kiwi_receiver_url("mykiwi.local:8074") == ("mykiwi.local", 8074)
+    assert parse_kiwi_receiver_url("https://map.kiwisdr.com/") == ("map.kiwisdr.com", 8073)
+    assert parse_kiwi_receiver_url("") is None
+    assert parse_kiwi_receiver_url("http://") is None
+    assert is_kiwi_directory_host("map.kiwisdr.com")
+    assert is_kiwi_directory_host("RX.KIWISDR.COM")
+    assert is_kiwi_directory_host("rx.linkfanel.net")
+    assert not is_kiwi_directory_host("12345.proxy.kiwisdr.com")
+    # Map clicks: receivers auto-connect, directory and help links do not.
+    assert should_auto_use_kiwi_receiver("12345.proxy.kiwisdr.com", 8073)
+    assert should_auto_use_kiwi_receiver("sdr.example.com", 8073)
+    assert not should_auto_use_kiwi_receiver("sdr.example.com", 8074)
+    assert not should_auto_use_kiwi_receiver("rx.linkfanel.net", 80)
+    assert not should_auto_use_kiwi_receiver("map.kiwisdr.com", 8073)
+
+    # SET mod message geometry.
+    assert kiwi_mod_message("usb", 14_074_000) == "SET mod=usb low_cut=300 high_cut=2700 freq=14074.000"
+    assert kiwi_mod_message("nnfm", 440_400_000) == "SET mod=nnfm low_cut=-3000 high_cut=3000 freq=440400.000"
+
+    # 12 kHz -> 48 kHz resampling: exact 4x length, exact endpoints, finite.
+    probe = np.sin(2 * np.pi * 1000 * np.arange(1200) / 12_000).astype(np.float32)
+    upsampled = kiwi_resample_12k_to_48k(probe)
+    assert upsampled.shape == (4800,)
+    assert upsampled[0] == probe[0]
+    assert abs(upsampled[-1] - probe[-1]) < 1e-6
+    assert np.all(np.isfinite(upsampled))
+    assert kiwi_resample_12k_to_48k(np.empty(0, dtype=np.float32)).size == 0
+    assert kiwi_resample_12k_to_48k(np.array([0.5], dtype=np.float32)).shape == (4,)
+
+    # Compressed-frame decoder: silence in, silence out, one sample per nibble.
+    decoder = KiwiAdpcmDecoder()
+    silent = decoder.decode(bytes(8))
+    assert silent.shape == (16,)
+    assert np.all(silent == 0)
+    decoder.reset()
+    assert np.all(decoder.decode(bytes(8)) == 0)
+    decoder.preset(0, 0)
+    assert decoder.decode(bytes([0xFF])).size == 2
+    assert decoder.decode(bytes([0xFF])).min() >= -32768
+
+    # A mono SND frame reaches the output resampled 4x with its RSSI kept.
+    blocks: list[np.ndarray] = []
+    fed: list[tuple[np.ndarray, int]] = []
+
+    class _Waterfall:
+        def feed_audio(self, samples: np.ndarray, rate: int) -> None:
+            fed.append((samples.copy(), rate))
+
+    stream = KiwiAudioMonitor(RadioSignals(), blocks.append, _Waterfall())
+    payload = np.arange(24, dtype=">i2").tobytes()
+    stream._handle_audio(
+        struct.pack("<BI", 0, 7) + struct.pack(">H", 1000) + payload,
+        KiwiAdpcmDecoder(),
+    )
+    assert len(blocks) == 1 and blocks[0].shape == (96,)
+    assert fed and fed[0][1] == NetworkAudioMonitor.SAMPLE_RATE
+    assert abs(stream._last_rssi - (0.1 * 1000 - 127)) < 1e-9
+    expected = kiwi_resample_12k_to_48k(np.arange(24, dtype=np.float32) / 32768.0)
+    assert np.allclose(blocks[0], expected, atol=1e-9)
+
+    # MSG parameters: AR acknowledgement, receiver setup, busy/down errors.
+    sent: list[str] = []
+
+    class _Socket:
+        def send(self, message: str) -> None:
+            sent.append(message)
+
+    stream._handle_msg_param(_Socket(), "audio_rate", "12000", decoder)
+    assert sent == ["SET AR OK in=12000 out=44100"]
+    stream._freq_hz, stream._kiwi_mode = 14_074_000, "usb"
+    del sent[:]
+    stream._handle_msg_param(_Socket(), "sample_rate", "12000.0", decoder)
+    assert sent[0] == "SET mod=usb low_cut=300 high_cut=2700 freq=14074.000"
+    assert "SET compression=0" in sent and "SET keepalive" in sent
+    for name, value in (("too_busy", "4"), ("badp", "1"), ("badp", "5"), ("down", None)):
+        try:
+            stream._handle_msg_param(_Socket(), name, value, decoder)
+        except _KiwiError:
+            pass
+        else:
+            raise AssertionError(f"MSG {name} must raise")
+    # badp=0 reports no password problem and must not raise.
+    stream._handle_msg_param(_Socket(), "badp", "0", decoder)
+
+    # Frame dispatch: the server sends MSG control frames as binary, so the
+    # tag -- not the opcode -- decides. SND frames arrive with the tag
+    # stripped at the audio parser; unknown tags are ignored.
+    routed: list[str] = []
+
+    class _RouterSocket:
+        def send(self, message: str) -> None:
+            routed.append(message)
+
+    router = KiwiAudioMonitor(RadioSignals(), lambda block: None)
+    router._freq_hz, router._kiwi_mode = 14_074_000, "usb"
+    router._dispatch_frame(_RouterSocket(), b"MSG audio_rate=12000", KiwiAdpcmDecoder(), False)
+    assert routed == ["SET AR OK in=12000 out=44100"], routed
+    del routed[:]
+    router._dispatch_frame(
+        _RouterSocket(), b"MSG sample_rate=11998.944323", KiwiAdpcmDecoder(), False
+    )
+    assert routed[0] == "SET mod=usb low_cut=300 high_cut=2700 freq=14074.000", routed
+    assert "SET compression=0" in routed
+    router._dispatch_frame(_RouterSocket(), "MSG unknown_thing=1", KiwiAdpcmDecoder(), False)
+    heard: list[np.ndarray] = []
+    router2 = KiwiAudioMonitor(RadioSignals(), heard.append, None)
+    tag = b"SND" + struct.pack("<BI", 0, 42) + struct.pack(">H", 1000)
+    router2._dispatch_frame(
+        _RouterSocket(), tag + np.arange(512, dtype=">i2").tobytes(), KiwiAdpcmDecoder(), False
+    )
+    assert len(heard) == 1 and heard[0].shape == (2048,), [b.shape for b in heard]
+    router2._dispatch_frame(
+        _RouterSocket(), b"XYZ" + np.arange(512, dtype=">i2").tobytes(), KiwiAdpcmDecoder(), False
+    )
+    assert len(heard) == 1, "unknown tags must be ignored"
+
+    # Frequency coverage: HF in, UHF out.
+    assert kiwi_freq_in_range(14_074_000)
+    assert kiwi_freq_in_range(30_000_000)
+    assert not kiwi_freq_in_range(440_400_000)
+
+    # Kiwi zoom follows the radio span; the zoom/start echo defines the axis.
+    assert kiwi_zoom_for_span(48_000) == 9
+    assert kiwi_zoom_for_span(24_000) == 10
+    assert kiwi_zoom_for_span(12_000) == 11
+    assert kiwi_zoom_for_span(6_000) == KIWI_MAX_ZOOM
+    assert kiwi_zoom_for_span(0) == KIWI_MAX_ZOOM
+    center, span = kiwi_waterfall_axis(30_000.0, 10, 7_862_559)
+    assert abs(center - 14_073_030) < 2_000, center
+    assert abs(span - 29_296.875) < 1.0, span
+
+    # Waterfall stream: bandwidth sets the baseband, zoom/start sets the
+    # axis, W/F rows (tag stripped) reach the signal with that axis.
+    emitted: list[tuple] = []
+
+    class _Emitter:
+        def emit(self, *args) -> None:
+            emitted.append(args)
+
+    class _KiwiSignals:
+        kiwi_waterfall_received = _Emitter()
+        audio_state_changed = _Emitter()
+
+    wf = KiwiWaterfallMonitor(_KiwiSignals())  # type: ignore[arg-type]
+    wf._freq_hz, wf._zoom = 14_074_000, 10
+    wf._dispatch_frame(None, b"MSG bandwidth=30000000", False)
+    wf._dispatch_frame(None, b"MSG zoom=10 start=7862559", False)
+    assert abs(wf._center_hz - 14_073_030) < 2_000
+    assert abs(wf._span_hz - 29_296.875) < 1.0
+    row = bytes(range(256)) * 4
+    wf._dispatch_frame(
+        None, b"W/F\x00" + struct.pack("<III", 1, 10, 7) + row, False
+    )
+    assert len(emitted) == 1 and emitted[0][0] == row
+    assert abs(emitted[0][1] - wf._center_hz) < 1e-9
+    wf._dispatch_frame(None, b"XYZ" + row, False)
+    assert len(emitted) == 1, "unknown tags must be ignored"
+    sent_wf: list[str] = []
+
+    class _WfSocket:
+        def send(self, message: str) -> None:
+            sent_wf.append(message)
+
+    wf._retune_pending = True
+    wf._setup_sent = True
+    wf._send_retune(_WfSocket())
+    assert sent_wf == ["SET zoom=10 cf=14074.000"], sent_wf
+
+    # Remote waterfall rows land in their own history with an RF axis, using
+    # a widgetless instance like the existing marker-state tests.
+    view = SpectrumWaterfall.__new__(SpectrumWaterfall)
+    view._source = WATERFALL_KIWI
+    view._histories = {WATERFALL_RADIO: [], "audio": [], "iq": [], WATERFALL_KIWI: []}
+    view._bins = bytes(SPECTRUM_BINS)
+    view._tuned_hz = 14_074_000
+    view._mode = Mode.USB
+    view._sdr_active = False
+    view._kiwi_center_hz = 0
+    view._kiwi_span_hz = 0
+    view._schedule_update = lambda: None  # type: ignore[method-assign]
+    assert view._active_history() == WATERFALL_KIWI
+    assert view._is_kiwi()
+    view.add_kiwi_bins(bytes(KIWI_WF_BINS), 14_073_030.0, 29_296.875)
+    assert view._bins == bytes(KIWI_WF_BINS)
+    assert view._kiwi_to_x(14_073_030, 800) == 400
+    assert abs(view._kiwi_to_x(14_087_678, 800) - 800) < 1
+
+    # Muting suppresses Q900 playback accounting-wise: stats still run (they
+    # are updated by the receive path regardless), but nothing may play.
+    monitor = NetworkAudioMonitor(RadioSignals())
+    assert monitor._q900_audio_playable()
+    monitor.set_kiwi_mute(True)
+    assert not monitor._q900_audio_playable()
+    monitor.set_kiwi_mute(False)
+    assert monitor._q900_audio_playable()
+
+    # A fresh Kiwi monitor is idle with no error and a sane label.
+    kiwi = KiwiAudioMonitor(RadioSignals(), lambda block: None)
+    assert not kiwi.running
+    assert kiwi.error == ""
+    assert kiwi.label() == "idle"
+    kiwi.stop()
+
+
 _protocol_self_test = self_test
 
 
@@ -8382,7 +9744,8 @@ def self_test() -> None:
     _sdr_ptt_self_test()
     _sdr_clock_self_test()
     _sdr_tx_self_test()
-    print("Q900 SDR clock and transmit self-tests passed")
+    _kiwi_self_test()
+    print("Q900 SDR clock, transmit and Kiwi self-tests passed")
 
 
 if __name__ == "__main__":
