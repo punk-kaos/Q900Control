@@ -267,6 +267,18 @@ Voice encode/decode uses the OpenDMR shared library. Build
 export Q900_OPENDMR_LIB=/path/to/libopendmr.dylib
 ```
 
+For transmit, Q900Control deliberately does **not** call OpenDMR 1.0's public
+`opendmr_encode()` frame builder. That path serializes the nine AMBE parameters
+consecutively, but DMR AMBE 3600x2450 uses the non-sequential 49-bit layout in
+OpenDMR's own older OP25-derived `encode_49bit()`; the public path also differs
+from the established encoder on the Golay(23,12) B-codeword alignment. The result
+is a structurally valid DMR call whose LC/ID/TG decodes while speech is mostly
+garbage. Q900Control instead calls the already-linked `MBEEncoder` parameter
+encoder, applies that established 49-bit permutation, and feeds it through
+`MBEEncoder::encode_dmr()`. No patched OpenDMR library is required. Builds that
+hide those C++ symbols are rejected for DMR TX rather than silently using the
+known-bad public path.
+
 DMR transmit is currently **simplex only**. By default it uses the standard
 MS-sourced voice/data sync used by normal handheld simplex operation (and by the
 handheld capture used to validate Q900 RX). Open **SDR TX Cal** while DMR is
