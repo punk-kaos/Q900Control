@@ -228,8 +228,12 @@ class OpenDmrCodec:
    try:self.lib=ctypes.CDLL(p);break
    except OSError:pass
   if self.lib is None:raise RuntimeError("OpenDMR library not found; set Q900_OPENDMR_LIB")
-  L=self.lib;L.opendmr_decoder_create.restype=ctypes.c_void_p;L.opendmr_encoder_create.restype=ctypes.c_void_p
+  L=self.lib;L.opendmr_version.restype=ctypes.c_char_p;self.version=(L.opendmr_version() or b"").decode("ascii","replace")
+  L.opendmr_decoder_create.restype=ctypes.c_void_p;L.opendmr_encoder_create.restype=ctypes.c_void_p
   L.opendmr_decoder_destroy.argtypes=(ctypes.c_void_p,);L.opendmr_encoder_destroy.argtypes=(ctypes.c_void_p,)
+  allow_stock=os.getenv("Q900_DMR_ALLOW_STOCK_OPENDMR","0").lower() in ("1","true","yes")
+  if enc and "q900fix" not in self.version and not allow_stock:
+   raise RuntimeError("DMR TX needs the fixed OpenDMR encoder; run: bash tools/build_opendmr_fixed.sh")
   L.opendmr_decode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));L.opendmr_decode.restype=ctypes.c_bool
   L.opendmr_encode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_uint8));L.opendmr_encode.restype=ctypes.c_bool
   if hasattr(L,"opendmr_encoder_reset"):L.opendmr_encoder_reset.argtypes=(ctypes.c_void_p,)
