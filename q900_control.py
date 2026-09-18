@@ -102,11 +102,16 @@ CLOCK_STALL_NS = 4_000_000
 # radio genuinely stops producing audio during one.
 CLOCK_RUN_GAP_NS = 50_000_000
 CLOCK_MIN_RUN_PACKETS = 5_000
+RADIO_MEDIA_PACKET_FRAMES = 48
+RADIO_MEDIA_PACKET_BYTES = RADIO_MEDIA_PACKET_FRAMES * 4
+RADIO_MEDIA_NOMINAL_PPS = 1_000.0
 # Set Q900_RX_RECORD to a path prefix to log the arrival pattern of the radio's
 # media stream: one 12-byte record per packet holding an 8-byte little-endian
 # monotonic nanosecond stamp, a 2-byte payload length and a 2-byte stream type.
-# Analyse with `--analyze-rx <prefix>`. This distinguishes a radio that sends in
-# bursts from a receive thread that is being starved, which need opposite fixes.
+# SDR I/Q additionally records <prefix>.iq.rx.raw, <prefix>.iq.rx.time and
+# <prefix>.iq.rx.json so packet timing can be compared with the actual complex
+# samples. Analyse with --analyze-rx or --analyze-iq-rx. Recording is diagnostic
+# only and deliberately stays off unless the environment variable is set.
 RX_RECORD_PREFIX = os.environ.get("Q900_RX_RECORD") or None
 # The Q900 default IQ translation places the CAT-tuned carrier 12 kHz above
 # the stream reference. Use the same reference for the CAT spectrum cursor.
@@ -362,19 +367,15 @@ def audio_spectrum_db(
 class AudioSink:
     """One output device fed from its own copy of a receive stream.
 
-    A PortAudio output callback consumes what it plays, so two devices cannot
-    share a queue: each would get only part of the audio. Every sink therefore
-    holds its own.
+    The radio/remote source and the audio device have independent clocks. Instead
+    of eventually deleting a queued block (or running dry) when those clocks
+    differ, a per-sink fractional-delay resampler steers its ratio from queue
+    depth. Emergency deletion remains as a last-resort latency bound and is
+    counted rather than being silent.
 
-    Each device also runs on its own clock, so each drifts against the source
-    independently. There is no resampling on the receive path: the queue is
-    capped and drops from the front when a device runs slow, and counts an
-    underflow when it runs fast. Keeping that per sink is what attributes a click
-    to the device that produced it rather than blaming the whole monitor.
-
-    For simultaneous playback a macOS Multi-Output Device is better than two
-    sinks, because Core Audio resamples the slaved device to the master's clock
-    and only one stream is then drifting against the radio.
+    Every sink has its own matcher because two physical output devices also have
+    independent clocks. A macOS Multi-Output Device is still preferable when the
+    same audio must reach two devices in lockstep.
     """
 
     def __init__(
@@ -389,10 +390,22 @@ class AudioSink:
         self.name = str(info["name"])
         self.output_channels = min(2, int(info["max_output_channels"]))
         self.underflows = 0
+        self.starved_frames = 0
+        self.dropped_frames = 0
+        self.max_queued_frames_seen = 0
         self._queue: deque[np.ndarray] = deque()
         self._lock = threading.Lock()
+        self._producer_lock = threading.Lock()
         self._queued_frames = 0
         self._max_queued_frames = max_queued_frames
+        # Hold a small cushion before playback begins. Starting the PortAudio
+        # callback immediately is still useful because it validates the device,
+        # but it emits silence without consuming our queue until this is reached.
+        self._target_queued_frames = min(
+            max_queued_frames, max(blocksize * 3, blocksize)
+        )
+        self._primed = False
+        self._rate_matcher = RxRateMatcher(blocksize)
         self._stream = sd.OutputStream(
             device=device,
             samplerate=sample_rate,
@@ -408,12 +421,17 @@ class AudioSink:
 
     def _callback(self, outdata, frames, timing, status):  # type: ignore[no-untyped-def]
         if status.output_underflow:
-            # Playback ran dry: audible as a click, and a symptom of this
-            # process being too busy to service the audio device in time.
             self.underflows += 1
         outdata.fill(0)
         offset = 0
         with self._lock:
+            # Do not begin by consuming the very first packet as soon as it
+            # arrives. A short cushion gives the rate matcher room to move in
+            # either direction without a startup click.
+            if not getattr(self, "_primed", True):
+                if self._queued_frames < getattr(self, "_target_queued_frames", 0):
+                    return
+                self._primed = True
             while offset < frames and self._queue:
                 block = self._queue[0]
                 count = min(frames - offset, len(block))
@@ -428,6 +446,24 @@ class AudioSink:
                 else:
                     self._queue[0] = block[count:]
                 self._queued_frames -= count
+            if offset < frames:
+                # The old path silently filled this tail with zero and only
+                # sometimes received a PortAudio underflow flag. Count the exact
+                # missing frames and re-prime instead of repeatedly clicking.
+                self.starved_frames += frames - offset
+                self._primed = False
+
+    def _enqueue_output(self, block: np.ndarray) -> None:
+        with self._lock:
+            while self._queue and self._queued_frames + len(block) > self._max_queued_frames:
+                discarded = self._queue.popleft()
+                self._queued_frames -= len(discarded)
+                self.dropped_frames += len(discarded)
+            self._queue.append(block)
+            self._queued_frames += len(block)
+            self.max_queued_frames_seen = max(
+                self.max_queued_frames_seen, self._queued_frames
+            )
 
     def enqueue(self, samples: np.ndarray) -> None:
         block = np.asarray(samples, dtype=np.float32)
@@ -436,11 +472,34 @@ class AudioSink:
         if block.ndim == 2 and block.shape[1] > self.output_channels:
             # A mono device cannot preserve both channels of raw I/Q.
             return
+
+        # Object.__new__ is used by the lightweight self-tests. Keeping the
+        # direct path when no matcher exists also makes the queue primitive
+        # independently testable.
+        matcher = getattr(self, "_rate_matcher", None)
+        if matcher is None:
+            self._enqueue_output(block)
+            return
+
+        with self._producer_lock:
+            with self._lock:
+                depth = self._queued_frames
+                primed = self._primed
+            outputs = matcher.feed(
+                block, depth, self._target_queued_frames, servo_enabled=primed
+            )
+        for output in outputs:
+            self._enqueue_output(output)
+
+    @property
+    def queued_frames(self) -> int:
         with self._lock:
-            while self._queue and self._queued_frames + len(block) > self._max_queued_frames:
-                self._queued_frames -= len(self._queue.popleft())
-            self._queue.append(block)
-            self._queued_frames += len(block)
+            return self._queued_frames
+
+    @property
+    def rate_ppm(self) -> float:
+        matcher = getattr(self, "_rate_matcher", None)
+        return (matcher.ratio - 1.0) * 1e6 if matcher is not None else 0.0
 
     def close(self) -> None:
         try:
@@ -448,11 +507,16 @@ class AudioSink:
             self._stream.close()
         except (OSError, sd.PortAudioError):
             pass
+        matcher = getattr(self, "_rate_matcher", None)
+        if matcher is not None:
+            matcher.reset()
         with self._lock:
             self._queue.clear()
             self._queued_frames = 0
+            self._primed = False
 
 
+def open_audio_sinks(
 def open_audio_sinks(
     devices: Sequence[int],
     sample_rate: int,
@@ -737,9 +801,11 @@ class SDRReceiver:
         self._queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=32)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._input_blocks: deque[np.ndarray] = deque()
+        self._input_buffer = np.empty(self.BLOCK_FRAMES * 2, dtype="<i2")
         self._input_words = 0
         self._input_lock = threading.Lock()
+        self.queue_drops = 0
+        self.max_queue_depth = 0
         self.mode = "USB"
         # Q900 network IQ places the CAT-tuned carrier near +12 kHz.
         self.offset_hz = 12_000
@@ -748,6 +814,10 @@ class SDRReceiver:
         # offset control to retune and the mode selector to pick a sideband.
         self.swap_iq = False
         self.invert_q = False
+
+    def reset_stats(self) -> None:
+        self.queue_drops = 0
+        self.max_queue_depth = 0
 
     def start(self) -> None:
         if self._thread:
@@ -766,7 +836,6 @@ class SDRReceiver:
             self._thread.join(timeout=0.5)
         self._thread = None
         with self._input_lock:
-            self._input_blocks.clear()
             self._input_words = 0
         while not self._queue.empty():
             try:
@@ -777,32 +846,34 @@ class SDRReceiver:
     def feed(self, words: np.ndarray) -> None:
         if len(words) < 2:
             return
+        source = np.asarray(words, dtype="<i2").reshape(-1)
+        ready: list[np.ndarray] = []
+        source_offset = 0
         with self._input_lock:
-            self._input_blocks.append(words.copy())
-            self._input_words += len(words)
-            if self._input_words < self.BLOCK_FRAMES * 2:
-                return
-            blocks: list[np.ndarray] = []
-            remaining = self.BLOCK_FRAMES * 2
-            while remaining:
-                block = self._input_blocks.popleft()
-                if len(block) <= remaining:
-                    blocks.append(block)
-                    remaining -= len(block)
-                else:
-                    blocks.append(block[:remaining])
-                    self._input_blocks.appendleft(block[remaining:])
-                    remaining = 0
-            self._input_words -= self.BLOCK_FRAMES * 2
-            block = np.concatenate(blocks)
-        if self.mode == RAW_IQ_MODE:
-            self._output(block.astype(np.float32).reshape(-1, 2) / 32768.0)
-            return
-        try:
-            self._queue.put_nowait(block)
-        except queue.Full:
-            pass
+            while source_offset < len(source):
+                space = len(self._input_buffer) - self._input_words
+                take = min(space, len(source) - source_offset)
+                self._input_buffer[self._input_words : self._input_words + take] = (
+                    source[source_offset : source_offset + take]
+                )
+                self._input_words += take
+                source_offset += take
+                if self._input_words == len(self._input_buffer):
+                    ready.append(self._input_buffer.copy())
+                    self._input_words = 0
 
+        for block in ready:
+            if self.mode == RAW_IQ_MODE:
+                self._output(block.astype(np.float32).reshape(-1, 2) / 32768.0)
+                continue
+            try:
+                self._queue.put_nowait(block)
+                self.max_queue_depth = max(self.max_queue_depth, self._queue.qsize())
+            except queue.Full:
+                # This used to throw away a complete 20 ms I/Q block silently.
+                self.queue_drops += 1
+
+    def _run(self) -> None:
     def _run(self) -> None:
         set_interactive_qos()
         phase = 0
@@ -959,7 +1030,9 @@ class NetworkAudioMonitor:
         self._format = "waiting"
         self._stats_lock = threading.Lock()
         self._iq_handler: Callable[[np.ndarray], None] | None = None
+        self._iq_receiver = None
         self._stream_type = 0
+        self._socket_rcvbuf = 0
         # While external KiwiSDR audio replaces the Q900's incoming audio, the
         # Q900 packets are still counted for the radio-clock measurement but no
         # longer played or sent to the waterfall. Muting rather than stopping
@@ -1004,6 +1077,17 @@ class NetworkAudioMonitor:
         # process to bind the same port and consume the radio's datagrams.
         # A bind conflict must fail visibly rather than leave us "waiting".
         try:
+            # Give lwIP bursts and a briefly descheduled Python receive thread
+            # room in the host kernel before UDP loss occurs. The firmware-side
+            # FIFO is much smaller, but host loss should not add another limit.
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        except OSError:
+            pass
+        try:
+            self._socket_rcvbuf = int(sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF))
+        except (OSError, TypeError, ValueError):
+            self._socket_rcvbuf = 0
+        try:
             sock.bind(("0.0.0.0", port))
         except OSError:
             sock.close()
@@ -1020,18 +1104,45 @@ class NetworkAudioMonitor:
 
         def receive_loop() -> None:
             set_interactive_qos()
-            arrival_log = None
+            arrival_log = iq_raw_log = iq_time_log = None
+            capture = {"iq_packets": 0}
             if RX_RECORD_PREFIX:
                 try:
                     arrival_log = open(f"{RX_RECORD_PREFIX}.rx.time", "wb")
+                    iq_raw_log = open(f"{RX_RECORD_PREFIX}.iq.rx.raw", "wb")
+                    iq_time_log = open(f"{RX_RECORD_PREFIX}.iq.rx.time", "wb")
                 except OSError:
-                    arrival_log = None
+                    for handle in (arrival_log, iq_raw_log, iq_time_log):
+                        if handle is not None:
+                            handle.close()
+                    arrival_log = iq_raw_log = iq_time_log = None
             try:
-                receive_packets(arrival_log)
+                receive_packets(arrival_log, iq_raw_log, iq_time_log, capture)
             finally:
-                if arrival_log is not None:
-                    arrival_log.close()
+                for handle in (arrival_log, iq_raw_log, iq_time_log):
+                    if handle is not None:
+                        handle.close()
+                if RX_RECORD_PREFIX and capture["iq_packets"]:
+                    metadata = {
+                        "version": 1,
+                        "sample_rate": self.SAMPLE_RATE,
+                        "frames_per_packet": RADIO_MEDIA_PACKET_FRAMES,
+                        "packets": capture["iq_packets"],
+                        "socket_rcvbuf": self._socket_rcvbuf,
+                        "sdr_worker_drops": self.iq_worker_drops,
+                        "sdr_worker_max_queue": self.iq_worker_max_queue,
+                        "playback_underflows": self.underflows,
+                        "playback_starved_frames": self.playback_starved_frames,
+                        "playback_dropped_frames": self.playback_dropped_frames,
+                        "playback_rate_ppm": self.playback_rate_ppm,
+                    }
+                    try:
+                        with open(f"{RX_RECORD_PREFIX}.iq.rx.json", "w") as handle:
+                            json.dump(metadata, handle, indent=2)
+                    except OSError:
+                        pass
 
+        def receive_packets(arrival_log, iq_raw_log, iq_time_log, capture) -> None:  # type: ignore[no-untyped-def]
         def receive_packets(arrival_log) -> None:  # type: ignore[no-untyped-def]
             while not self._stop.is_set() and self._socket:
                 try:
@@ -1046,6 +1157,10 @@ class NetworkAudioMonitor:
                     payload = packet[9:]
                     if not payload or len(payload) % 4:
                         continue
+                    if iq_raw_log is not None and iq_time_log is not None:
+                        iq_raw_log.write(payload)
+                        iq_time_log.write(arrived_ns.to_bytes(8, "little"))
+                        capture["iq_packets"] += 1
                     handler = self._iq_handler
                     words = np.frombuffer(payload, dtype="<i2")
                     if self._waterfall:
@@ -1103,6 +1218,7 @@ class NetworkAudioMonitor:
 
     def set_iq_handler(self, handler: Callable[[np.ndarray], None] | None) -> None:
         self._iq_handler = handler
+        self._iq_receiver = getattr(handler, "__self__", None) if handler else None
 
     def set_kiwi_mute(self, muted: bool) -> None:
         """Mute Q900 receive audio while external Kiwi audio plays instead.
@@ -1186,6 +1302,9 @@ class NetworkAudioMonitor:
         sock, self._socket = self._socket, None
         if sock:
             sock.close()
+        thread, self._thread = self._thread, None
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=0.75)
         with self._sink_lock:
             sinks, self._sinks = self._sinks, []
         for sink in sinks:
@@ -1206,6 +1325,8 @@ class NetworkAudioMonitor:
             self._clock_align_last_ns = 0
             self._clock_align_last_index = 0
         self._stream_type = 0
+        self._socket_rcvbuf = 0
+        self._iq_receiver = None
 
     def sendto(self, payload: bytes, target: tuple[str, int]) -> None:
         """Send from the same UDP/8000 socket used by the Q900 media session."""
@@ -1229,6 +1350,29 @@ class NetworkAudioMonitor:
         """Total playback dropouts across every output device."""
         with self._sink_lock:
             return sum(sink.underflows for sink in self._sinks)
+
+    @property
+    def playback_starved_frames(self) -> int:
+        with self._sink_lock:
+            return sum(sink.starved_frames for sink in self._sinks)
+
+    @property
+    def playback_dropped_frames(self) -> int:
+        with self._sink_lock:
+            return sum(sink.dropped_frames for sink in self._sinks)
+
+    @property
+    def playback_rate_ppm(self) -> list[float]:
+        with self._sink_lock:
+            return [sink.rate_ppm for sink in self._sinks]
+
+    @property
+    def iq_worker_drops(self) -> int:
+        return int(getattr(self._iq_receiver, "queue_drops", 0))
+
+    @property
+    def iq_worker_max_queue(self) -> int:
+        return int(getattr(self._iq_receiver, "max_queue_depth", 0))
 
     @property
     def output_names(self) -> list[str]:
@@ -1331,7 +1475,14 @@ class NetworkAudioMonitor:
         with self._stats_lock:
             if not self._packet_count:
                 return "UDP waiting"
-            troubled = bool(self.underflows or self._clock_gaps or self._clock_outliers)
+            troubled = bool(
+                self.underflows
+                or self.playback_starved_frames
+                or self.playback_dropped_frames
+                or self.iq_worker_drops
+                or self._clock_gaps
+                or self._clock_outliers
+            )
             return f"{self._format}  faults" if troubled else self._format
 
     @property
@@ -1340,10 +1491,21 @@ class NetworkAudioMonitor:
         with self._stats_lock:
             if not self._packet_count:
                 return "UDP waiting"
-            drops = self.underflows
+            underflow_events = self.underflows
+            starved = self.playback_starved_frames
+            discarded = self.playback_dropped_frames
+            iq_drops = self.iq_worker_drops
             # Anomalies lead and the steady-state volume trails, because the tooltip
             # is read top-down when something looks wrong.
-            underflows = f"drops {drops}  " if drops else ""
+            playback = ""
+            if underflow_events:
+                playback += f"devund {underflow_events}  "
+            if starved:
+                playback += f"starve {starved}f  "
+            if discarded:
+                playback += f"qdrop {discarded}f  "
+            if iq_drops:
+                playback += f"iqdrop {iq_drops}x20ms  "
             gaps = f"breaks {self._clock_gaps}  " if self._clock_gaps else ""
             if self._clock_outliers:
                 gaps += f"stalls {self._clock_outliers}  "
@@ -1353,16 +1515,22 @@ class NetworkAudioMonitor:
                 # assumption that a 192-byte payload is one millisecond of
                 # 48 kHz stereo: a wildly different figure means the assumed
                 # cadence, not the crystal, is wrong.
-                frames = NETWORK_TX_PACKET_BYTES // 4
-                nominal = 1.0 / NETWORK_TX_PERIOD
+                frames = RADIO_MEDIA_PACKET_FRAMES
+                nominal = RADIO_MEDIA_NOMINAL_PPS
                 clock = (
                     f"radio {rate:.2f} pkt/s = {rate * frames:.0f} Hz "
                     f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm) over {seconds:.0f}s"
                 )
             else:
                 clock = f"radio clock: {run_packets}/{CLOCK_MIN_RUN_PACKETS} pkts"
+            ppm = self.playback_rate_ppm
+            resample = (
+                "rxresamp " + ",".join(f"{value:+.0f}" for value in ppm) + "ppm  "
+                if ppm else ""
+            )
+            rcvbuf = f"rcvbuf {self._socket_rcvbuf // 1024}k  " if self._socket_rcvbuf else ""
             return (
-                f"{gaps}{underflows}{clock}  "
+                f"{gaps}{playback}{clock}  {resample}{rcvbuf}"
                 f"UDP {self._packet_count} pkts  {self._last_packet_size} B  "
                 f"{self._format}"
             ).lstrip()
@@ -2389,6 +2557,150 @@ _RESAMPLE_BANK = _resample_bank()
 # position, which happens naturally because only the integer advance is deleted.
 _RESAMPLE_HISTORY = RESAMPLE_TAPS // 2
 
+
+# Receive playback rate matching. The TX path already proved that dropping a
+# whole block to reconcile independent clocks is much worse than continuously
+# moving the fractional sample position. RX has the same three-clock problem:
+# radio/remote source, Python scheduling, and the output device.
+RX_RESAMPLE_KP = 0.002
+RX_RESAMPLE_KI = 5.0e-5
+RX_RESAMPLE_TRIM_LIMIT = 0.005
+RX_RESAMPLE_SMOOTH_BLOCKS = 50.0
+
+
+def resample_float_frames(
+    pending: np.ndarray, frames_out: int, ratio: float, phase: float
+) -> tuple[np.ndarray, float, np.ndarray] | None:
+    """Emit fixed-size float audio/IQ using the same polyphase bank as TX."""
+    if frames_out < 1 or ratio <= 0.0 or pending.ndim not in (1, 2):
+        return None
+    history = _RESAMPLE_HISTORY
+    reach = RESAMPLE_TAPS - history
+    last_position = history + phase + ratio * (frames_out - 1)
+    required = int(last_position) + reach + 1
+    if len(pending) < required:
+        return None
+    position = history + phase + ratio * np.arange(frames_out)
+    index = position.astype(np.int64)
+    row = np.minimum(
+        ((position - index) * RESAMPLE_PHASES).astype(np.int64),
+        RESAMPLE_PHASES - 1,
+    )
+    kernel = _RESAMPLE_BANK[row]
+    tap_offset = np.arange(RESAMPLE_TAPS) - (history - 1)
+    window = pending[index[:, None] + tap_offset[None, :]]
+    if pending.ndim == 1:
+        output = np.einsum("ft,ft->f", kernel, window.astype(np.float32))
+    else:
+        output = np.einsum("ft,ftc->fc", kernel, window.astype(np.float32))
+    advance = phase + ratio * frames_out
+    consumed = int(advance)
+    return output.astype(np.float32), advance - consumed, pending[consumed:]
+
+
+class RxRateMatcher:
+    """Stateful fractional resampler steered by an AudioSink's queue depth."""
+
+    def __init__(self, block_frames: int) -> None:
+        self.block_frames = block_frames
+        self.ratio = 1.0
+        self.phase = 0.0
+        self.trim = 0.0
+        self.smooth = (0.0, 0.0)
+        self._chunks: deque[np.ndarray] = deque()
+        self._frames = 0
+        self._shape: tuple[int, ...] | None = None
+
+    def reset(self) -> None:
+        self.ratio = 1.0
+        self.phase = 0.0
+        self.trim = 0.0
+        self.smooth = (0.0, 0.0)
+        self._chunks.clear()
+        self._frames = 0
+        self._shape = None
+
+    def _update_ratio(
+        self, depth_frames: int, target_frames: int, servo_enabled: bool
+    ) -> float:
+        if servo_enabled and target_frames > 0:
+            error = (depth_frames - target_frames) / target_frames
+            alpha = 1.0 / RX_RESAMPLE_SMOOTH_BLOCKS
+            first = self.smooth[0] + alpha * (error - self.smooth[0])
+            second = self.smooth[1] + alpha * (first - self.smooth[1])
+            self.smooth = (first, second)
+            self.trim = float(np.clip(
+                self.trim + RX_RESAMPLE_KI * second,
+                -RX_RESAMPLE_TRIM_LIMIT,
+                RX_RESAMPLE_TRIM_LIMIT,
+            ))
+            correction = RX_RESAMPLE_KP * second + self.trim
+        else:
+            # Retain a learned clock correction while re-priming after a real
+            # starvation event, but do not integrate the intentionally empty
+            # startup queue.
+            correction = self.trim
+        self.ratio = float(np.clip(
+            1.0 + correction,
+            1.0 - RX_RESAMPLE_TRIM_LIMIT,
+            1.0 + RX_RESAMPLE_TRIM_LIMIT,
+        ))
+        return self.ratio
+
+    def _required(self, ratio: float) -> int:
+        history = _RESAMPLE_HISTORY
+        reach = RESAMPLE_TAPS - history
+        last = history + self.phase + ratio * (self.block_frames - 1)
+        return int(last) + reach + 1
+
+    def feed(
+        self,
+        samples: np.ndarray,
+        depth_frames: int,
+        target_frames: int,
+        servo_enabled: bool,
+    ) -> list[np.ndarray]:
+        block = np.asarray(samples, dtype=np.float32)
+        shape = block.shape[1:] if block.ndim == 2 else ()
+        if self._shape is None:
+            self._shape = shape
+        elif shape != self._shape:
+            self.reset()
+            self._shape = shape
+        if not len(block):
+            return []
+        self._chunks.append(block.copy())
+        self._frames += len(block)
+        outputs: list[np.ndarray] = []
+        virtual_depth = depth_frames
+
+        while self._frames >= self._required(self.ratio):
+            ratio = self._update_ratio(
+                virtual_depth, target_frames, servo_enabled
+            )
+            if self._frames < self._required(ratio):
+                break
+            pending = (
+                self._chunks[0]
+                if len(self._chunks) == 1
+                else np.concatenate(tuple(self._chunks), axis=0)
+            )
+            self._chunks.clear()
+            converted = resample_float_frames(
+                pending, self.block_frames, ratio, self.phase
+            )
+            if converted is None:
+                self._chunks.append(pending)
+                self._frames = len(pending)
+                break
+            output, self.phase, remaining = converted
+            if len(remaining):
+                self._chunks.append(remaining)
+            self._frames = len(remaining)
+            outputs.append(output)
+            virtual_depth += len(output)
+        return outputs
+
 # Upper bound on the pre-key wait for the sender process to report ready. It
 # covers interpreter spawn and module import, not audio latency.
 NETWORK_TX_READY_TIMEOUT = 3.0
@@ -2607,7 +2919,7 @@ def resample_stereo(
 ) -> tuple[bytes, float] | None:
     """Emit `frames_out` interleaved stereo S16LE frames from `pending`.
 
-    Consumes `ratio` input frames per output frame using linear interpolation,
+    Consumes `ratio` input frames per output frame using polyphase interpolation,
     deletes what it consumed, and returns the payload with the new fractional
     phase. Returns None if `pending` does not yet hold enough input.
 
@@ -6133,6 +6445,7 @@ class MainWindow(QMainWindow):
         self._sdr_switch_timer.stop()
         self._sdr_switch_pending = False
         self._sdr_active = True
+        self.sdr_receiver.reset_stats()
         self.network_audio.set_iq_handler(self.sdr_receiver.feed)
         self.sdr_receiver.start()
         self.sdr_button.setText("SDR On")
@@ -8342,7 +8655,7 @@ def analyze_rx_recording(prefix: str) -> None:
     span = (stamps[-1] - stamps[0]) / 1e9
     print(f"received {records:,} packets over {span:.2f} s")
     print(f"  overall rate      : {(records - 1) / span:.2f} pkt/s")
-    frames = NETWORK_TX_PACKET_BYTES // 4
+    frames = RADIO_MEDIA_PACKET_FRAMES
     print(f"  implied sample rate: {(records - 1) / span * frames:,.0f} Hz "
           f"(payload {int(np.median(sizes))} B, "
           f"types {', '.join(hex(int(t)) for t in np.unique(types))})")
@@ -8361,7 +8674,7 @@ def analyze_rx_recording(prefix: str) -> None:
     print(f"  median {np.median(delta):.3f} ms   p99 {np.percentile(delta, 99):.3f} ms   "
           f"max {delta.max():.1f} ms")
 
-    nominal_ms = NETWORK_TX_PERIOD * 1000.0
+    nominal_ms = 1000.0 / RADIO_MEDIA_NOMINAL_PPS
     paced = int(np.count_nonzero((delta >= 0.5 * nominal_ms) & (delta <= 1.5 * nominal_ms)))
     grouped = int(np.count_nonzero(delta < 0.05))
     paced_fraction = paced / len(delta)
@@ -8388,7 +8701,7 @@ def analyze_rx_recording(prefix: str) -> None:
         diagnosis = "host-starved"
 
     print("\n-- clock estimate --")
-    nominal = 1.0 / NETWORK_TX_PERIOD
+    nominal = RADIO_MEDIA_NOMINAL_PPS
     def report(rate: float, seconds: float, label: str) -> None:
         print(f"  {label}: {rate:.2f} pkt/s = {rate * frames:,.0f} Hz "
               f"({(rate / nominal - 1.0) * 1e6:+.0f} ppm) over {seconds:.2f} s")
@@ -8431,6 +8744,140 @@ def analyze_rx_recording(prefix: str) -> None:
         print("  timestamps as a clock reference until the receive path is fixed.")
 
 
+
+def analyze_iq_rx_recording(prefix: str) -> None:
+    """Inspect captured radio->host complex I/Q and its packet timing."""
+    try:
+        with open(f"{prefix}.iq.rx.raw", "rb") as handle:
+            raw = handle.read()
+        with open(f"{prefix}.iq.rx.time", "rb") as handle:
+            stamp_raw = handle.read()
+    except OSError as error:
+        print(f"cannot read SDR RX recording: {error}")
+        return
+    if len(raw) < 4 or len(raw) % 4:
+        print("invalid SDR RX payload file: expected interleaved complex S16LE")
+        return
+    if len(stamp_raw) % 8:
+        print("invalid SDR RX timestamp file")
+        return
+    stamps = np.frombuffer(stamp_raw, dtype="<u8")
+    frames = np.frombuffer(raw, dtype="<i2").reshape(-1, 2)
+    if not len(stamps):
+        print("SDR RX recording contains no packet timestamps")
+        return
+    if len(frames) % len(stamps):
+        print(
+            f"SDR RX geometry mismatch: {len(frames)} frames for "
+            f"{len(stamps)} packet timestamps"
+        )
+        return
+    packet_frames = len(frames) // len(stamps)
+    signal = (frames[:, 0].astype(np.float64) + 1j * frames[:, 1]) / 32768.0
+    duration = len(signal) / 48_000.0
+    print(
+        f"SDR RX: {len(stamps):,} packets, {packet_frames} frames/packet, "
+        f"{len(signal):,} complex frames ({duration:.3f} s)"
+    )
+    if packet_frames != RADIO_MEDIA_PACKET_FRAMES:
+        print(
+            f"  WARNING: firmware normally emits {RADIO_MEDIA_PACKET_FRAMES} "
+            "complex frames per packet"
+        )
+
+    envelope = np.abs(signal)
+    peak = float(np.max(envelope))
+    rms = float(np.sqrt(np.mean(envelope * envelope)))
+    dc = np.mean(signal)
+    i_rms = float(np.sqrt(np.mean(frames[:, 0].astype(np.float64) ** 2)))
+    q_rms = float(np.sqrt(np.mean(frames[:, 1].astype(np.float64) ** 2)))
+    iq_gain_db = 20 * np.log10((i_rms + 1e-30) / (q_rms + 1e-30))
+    correlation = float(
+        np.mean(frames[:, 0].astype(np.float64) * frames[:, 1].astype(np.float64))
+        / (i_rms * q_rms + 1e-30)
+    )
+    print(
+        f"  envelope peak {20*np.log10(peak + 1e-30):+.2f} dBFS  "
+        f"rms {20*np.log10(rms + 1e-30):+.2f} dBFS"
+    )
+    print(
+        f"  DC I {dc.real:+.6f}  Q {dc.imag:+.6f}  "
+        f"I/Q rms ratio {iq_gain_db:+.2f} dB  correlation {correlation:+.4f}"
+    )
+    zero_frames = int(np.count_nonzero(envelope == 0))
+    if zero_frames:
+        print(f"  exact zero complex frames: {zero_frames:,}")
+
+    timing_bad = False
+    if len(stamps) > 1:
+        gaps_ms = np.diff(stamps.astype(np.int64)) / 1e6
+        median_gap = float(np.median(gaps_ms))
+        p99 = float(np.percentile(gaps_ms, 99))
+        maximum = float(np.max(gaps_ms))
+        long_gaps = int(np.count_nonzero(gaps_ms > 4.0))
+        print(
+            f"  packet gaps: median {median_gap:.3f} ms  p99 {p99:.3f} ms  "
+            f"max {maximum:.3f} ms  >4 ms {long_gaps}"
+        )
+        timing_bad = maximum > 4.0
+
+    phase_bad = False
+    if peak > 1e-4 and len(signal) > 2:
+        active = envelope > max(peak * 0.05, 1e-5)
+        pair_active = active[1:] & active[:-1]
+        step = np.angle(signal[1:] * np.conj(signal[:-1]))
+        selected = step[pair_active]
+        if len(selected) > 32:
+            median_step = float(np.angle(np.mean(np.exp(1j * selected))))
+            residual = np.angle(np.exp(1j * (selected - median_step)))
+            frequency = median_step * 48_000.0 / (2 * np.pi)
+            rms_phase = float(np.sqrt(np.mean(residual * residual)))
+            max_phase = float(np.max(np.abs(residual)))
+            jumps = int(np.count_nonzero(np.abs(residual) > 0.20))
+            print(
+                f"  phase-implied carrier {frequency:+.3f} Hz  "
+                f"step residual rms {rms_phase:.6f} rad  "
+                f"max {max_phase:.6f} rad  jumps>0.20 {jumps}"
+            )
+            phase_bad = jumps > 0
+
+            boundaries = np.arange(1, len(stamps), dtype=np.int64) * packet_frames - 1
+            boundaries = boundaries[boundaries < len(step)]
+            if len(boundaries):
+                boundary_residual = np.angle(
+                    np.exp(1j * (step[boundaries] - median_step))
+                )
+                print(
+                    f"  packet-boundary phase: rms "
+                    f"{np.sqrt(np.mean(boundary_residual**2)):.6f} rad  "
+                    f"max {np.max(np.abs(boundary_residual)):.6f} rad"
+                )
+
+    metadata = None
+    try:
+        with open(f"{prefix}.iq.rx.json") as handle:
+            metadata = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        pass
+    if metadata:
+        print(
+            "  capture counters: "
+            f"worker drops {metadata.get('sdr_worker_drops', 0)}, "
+            f"playback starved {metadata.get('playback_starved_frames', 0)}f, "
+            f"queue drops {metadata.get('playback_dropped_frames', 0)}f"
+        )
+
+    print("\n-- verdict --")
+    if packet_frames != RADIO_MEDIA_PACKET_FRAMES:
+        print("  Unexpected packet geometry; fix framing before judging DSP quality.")
+    elif timing_bad or phase_bad:
+        print("  Discontinuities are already present at the raw radio->host I/Q boundary.")
+        print("  The demodulator/playback path cannot repair those missing phase samples.")
+    else:
+        print("  No obvious raw-I/Q continuity failure was found in this capture.")
+        print("  If decoded audio is still rough, inspect worker/playback counters next.")
+
+
 def main() -> None:
     if "--self-test" in sys.argv:
         self_test()
@@ -8443,6 +8890,13 @@ def main() -> None:
             print("usage: q900_control.py --analyze-rx <prefix>")
             return
         analyze_rx_recording(sys.argv[index + 1])
+        return
+    if "--analyze-iq-rx" in sys.argv:
+        index = sys.argv.index("--analyze-iq-rx")
+        if index + 1 >= len(sys.argv):
+            print("usage: q900_control.py --analyze-iq-rx <prefix>")
+            return
+        analyze_iq_rx_recording(sys.argv[index + 1])
         return
     if "--analyze-tx" in sys.argv:
         index = sys.argv.index("--analyze-tx")
@@ -9260,6 +9714,73 @@ def start_iq_udp(
 TransmitAudioRouter.start_iq_udp = start_iq_udp
 
 
+
+def _rx_continuity_self_test() -> None:
+    import io
+    from contextlib import redirect_stdout
+    from unittest.mock import patch
+
+    # Unity ratio is bit/float transparent apart from the intentional FIR
+    # history delay. This also checks stereo/IQ channels share one timebase.
+    pending = np.column_stack((
+        np.arange(2000, dtype=np.float32),
+        -np.arange(2000, dtype=np.float32),
+    ))
+    converted = resample_float_frames(pending, 48, 1.0, 0.0)
+    assert converted is not None
+    output, phase, remaining = converted
+    expected = pending[_RESAMPLE_HISTORY : _RESAMPLE_HISTORY + 48]
+    assert np.array_equal(output, expected)
+    assert phase == 0.0 and len(remaining) == len(pending) - 48
+
+    # A persistently deep playback queue must make the matcher consume source
+    # samples faster; a shallow queue must pull the learned correction back.
+    matcher = RxRateMatcher(48)
+    for _ in range(250):
+        matcher._update_ratio(1200, 1000, True)
+    high_ratio = matcher.ratio
+    assert high_ratio > 1.0
+    for _ in range(500):
+        matcher._update_ratio(800, 1000, True)
+    assert matcher.ratio < high_ratio
+
+    # Diagnostic parser: exact 12 kHz carrier in the firmware's native 48-frame
+    # packet geometry should parse cleanly and report the carrier.
+    packet_count = 100
+    count = packet_count * RADIO_MEDIA_PACKET_FRAMES
+    axis = np.arange(count) / 48_000.0
+    tone = 0.25 * np.exp(1j * 2 * np.pi * 12_000 * axis)
+    words = np.empty((count, 2), dtype="<i2")
+    words[:, 0] = np.rint(tone.real * 32767).astype("<i2")
+    words[:, 1] = np.rint(tone.imag * 32767).astype("<i2")
+    raw = words.tobytes()
+    stamps = (
+        1_000_000_000
+        + np.arange(packet_count, dtype=np.uint64) * 1_000_000
+    ).astype("<u8").tobytes()
+
+    def recording_file(path: str, mode: str = "r"):
+        if path == "test.iq.rx.raw" and mode == "rb":
+            return io.BytesIO(raw)
+        if path == "test.iq.rx.time" and mode == "rb":
+            return io.BytesIO(stamps)
+        if path == "test.iq.rx.json":
+            return io.StringIO(json.dumps({
+                "sdr_worker_drops": 0,
+                "playback_starved_frames": 0,
+                "playback_dropped_frames": 0,
+            }))
+        raise FileNotFoundError(path)
+
+    report = io.StringIO()
+    with patch(f"{__name__}.open", side_effect=recording_file, create=True), redirect_stdout(report):
+        analyze_iq_rx_recording("test")
+    text = report.getvalue()
+    assert "48 frames/packet" in text
+    assert "phase-implied carrier +12000." in text
+    assert "No obvious raw-I/Q continuity failure" in text
+
+
 def _raw_iq_self_test() -> None:
     frames = np.empty((SDRReceiver.BLOCK_FRAMES, 2), dtype="<i2")
     frames[:, 0] = np.arange(SDRReceiver.BLOCK_FRAMES, dtype=np.int16) - 480
@@ -9361,20 +9882,19 @@ def _sdr_ptt_self_test() -> None:
 
 
 def _sdr_clock_self_test() -> None:
-    """Exercise actual receive dispatch, including the former I/Q early return."""
-    import io
+    """Exercise actual I/Q receive dispatch and its media-clock measurement."""
     from unittest.mock import Mock, patch
-
-    class ArrivalLog(io.BytesIO):
-        def close(self) -> None:
-            pass  # Inspect the in-memory recording after the worker closes it.
 
     for true_rate in (999.4, 1000.6):
         monitor = NetworkAudioMonitor(Mock())
-        log = ArrivalLog()
         sink = Mock()
         sink.name = "test speaker"
+        sink.underflows = 0
+        sink.starved_frames = 0
+        sink.dropped_frames = 0
+        sink.rate_ppm = 0.0
         sock = Mock()
+        sock.getsockopt.return_value = 1 << 20
         received: list[np.ndarray] = []
         monitor.set_iq_handler(received.append)
         total = CLOCK_MIN_RUN_PACKETS + 100
@@ -9388,15 +9908,16 @@ def _sdr_clock_self_test() -> None:
                 monitor._stop.set()
                 raise OSError("end of test stream") from None
             stamp[0] = 1_000_000_000 + round(index * 1e9 / true_rate)
-            return SYNC + b"\x68" + bytes(4 + 192), ("127.0.0.1", 8000)
+            return SYNC + b"\x68" + bytes(4 + RADIO_MEDIA_PACKET_BYTES), (
+                "127.0.0.1", 8000
+            )
 
         sock.recvfrom.side_effect = recvfrom
         with (
             patch.object(socket, "socket", return_value=sock),
             patch.object(time, "monotonic_ns", side_effect=lambda: stamp[0]),
             patch(f"{__name__}.open_audio_sinks", return_value=([sink], [])),
-            patch(f"{__name__}.RX_RECORD_PREFIX", "memory"),
-            patch(f"{__name__}.open", return_value=log, create=True),
+            patch(f"{__name__}.RX_RECORD_PREFIX", None),
         ):
             try:
                 monitor.start(0)
@@ -9405,22 +9926,20 @@ def _sdr_clock_self_test() -> None:
                 measured = monitor.measured_packet_rate
                 assert abs(measured / true_rate - 1.0) < 1e-7, measured
                 assert len(received) == total and monitor.stream_type == 0x68
-                records = np.frombuffer(log.getvalue(), dtype=np.dtype([
-                    ("stamp", "<u8"), ("size", "<u2"), ("type", "<u2"),
-                ]))
-                assert len(records) == total
-                assert np.all(records["size"] == 192) and np.all(records["type"] == 0x68)
-                assert records["stamp"][-1] == stamp[0]
-                # Feed the dispatch-derived clock into real SDR pacing. Over a
-                # minute, residual ring drift must be well below a single frame.
+                assert monitor._socket_rcvbuf == 1 << 20
                 period, ratio = _iq_radio_timing(measured)
-                radio_hz = true_rate * 48 * (1.0 + TX_RATE_PPM * 1e-6)
+                radio_hz = (
+                    true_rate * RADIO_MEDIA_PACKET_FRAMES
+                    * (1.0 + TX_RATE_PPM * 1e-6)
+                )
                 drift_frames = (IQ_PACKET_FRAMES / period - radio_hz) * 60
                 assert abs(drift_frames) < 1.0, drift_frames
                 assert abs(ratio * radio_hz - IQ_SAMPLE_RATE) < 0.01
             finally:
                 monitor.stop()
 
+
+def _sdr_tx_self_test() -> None:
 
 def _sdr_tx_self_test() -> None:
     frequencies = np.fft.fftfreq(SSB_FFT_SIZE, 1 / IQ_SAMPLE_RATE)
@@ -9872,11 +10391,12 @@ _protocol_self_test = self_test
 def self_test() -> None:
     _protocol_self_test()
     _raw_iq_self_test()
+    _rx_continuity_self_test()
     _sdr_ptt_self_test()
     _sdr_clock_self_test()
     _sdr_tx_self_test()
     _kiwi_self_test()
-    print("Q900 SDR clock, transmit and Kiwi self-tests passed")
+    print("Q900 SDR RX continuity, clock, transmit and Kiwi self-tests passed")
 
 
 if __name__ == "__main__":
