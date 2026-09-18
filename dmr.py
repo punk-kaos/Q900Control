@@ -234,14 +234,15 @@ class DmrVoiceTransmitter:
 
 @dataclass(slots=True)
 class DmrStatus:
- sync:str="";slot:int|None=None;color_code:int|None=None;source:int|None=None;destination:int|None=None;group:bool|None=None;data_type:int|None=None;sync_quality:float=0.;corrected:int=0;ambe_frames:int=0;vocoder_errors:int=0;message:str="searching"
+ sync:str="";slot:int|None=None;color_code:int|None=None;source:int|None=None;destination:int|None=None;group:bool|None=None;data_type:int|None=None;sync_quality:float=0.;corrected:int=0;ambe_frames:int=0;vocoder_errors:int=0;message:str="searching";input_dbfs:float=-120.;acquisition_quality:float=0.;sync_polarity:int=0
  def summary(self):
   p=["DMR"]
   if self.color_code is not None:p.append(f"CC{self.color_code}")
   if self.slot is not None:p.append(f"TS{self.slot}")
   if self.destination is not None:p.append(f"{'TG' if self.group else 'ID'} {self.destination}")
   if self.source is not None:p.append(f"SRC {self.source}")
-  if len(p)==1:p.append(self.message)
+  if len(p)==1:
+   p.append(f"search {self.input_dbfs:.0f}dBFS q{self.acquisition_quality:.2f}")
   return "  ".join(p)
 
 class DmrAirReceiver:
@@ -259,7 +260,11 @@ class DmrAirReceiver:
   i=start-self.base
   return None if i<0 or i+1320>len(self.samples) else self.samples[i:i+1320:10][:132]
  def feed(self,iq,offset_hz):
-  z=np.asarray(iq,dtype=np.complex64).reshape(-1);ix=np.arange(self.count,self.count+len(z));self.count+=len(z);z=z*np.exp(-1j*2*np.pi*offset_hz*ix/48000);pr=np.r_[self.prev,z[:-1]];self.prev=z[-1] if len(z) else self.prev;d=np.angle(z*np.conj(pr))*48000/(2*np.pi);c=np.r_[self.fs,d];f=np.convolve(c,RRC,mode="valid");self.fs=c[-(len(RRC)-1):];self.samples=np.r_[self.samples,f];self._track();self._find()
+  z=np.asarray(iq,dtype=np.complex64).reshape(-1)
+  if len(z):
+   rms=float(np.sqrt(np.mean(np.abs(z.astype(np.complex128))**2)))
+   self.status.input_dbfs=20*np.log10(max(rms,1e-6))
+  ix=np.arange(self.count,self.count+len(z));self.count+=len(z);z=z*np.exp(-1j*2*np.pi*offset_hz*ix/48000);pr=np.r_[self.prev,z[:-1]];self.prev=z[-1] if len(z) else self.prev;d=np.angle(z*np.conj(pr))*48000/(2*np.pi);c=np.r_[self.fs,d];f=np.convolve(c,RRC,mode="valid");self.fs=c[-(len(RRC)-1):];self.samples=np.r_[self.samples,f];self._track();self._find()
   if len(self.samples)>48000:q=len(self.samples)-48000;self.samples=self.samples[q:];self.base+=q
  def _track(self):
   q=deque()
@@ -271,7 +276,7 @@ class DmrAirReceiver:
   self.tracked=q
  def _find(self):
   if len(self.samples)<1560:return
-  best=None
+  best=None;best_seen=0.0
   for phase in range(10):
    sy=self.samples[phase::10]
    for name,word in {**VOICE_SYNCS,**DATA_SYNCS}.items():
@@ -279,12 +284,17 @@ class DmrAirReceiver:
     if not len(co):continue
     for pos in np.argpartition(np.abs(co),-min(3,len(co)))[-3:]:
      y=sy[pos:pos+24];sc=float(np.dot(y-y.mean(),xc)/np.dot(xc,xc))
-     if sc<80:continue
-     ce=float(y.mean()-sc*x.mean());res=y-(ce+sc*x);qu=max(0.,1.-float(np.sqrt(np.mean(res*res)))/(sc*2))
+     # Q900/raw-IQ frequency orientation and receiver mixing can invert the
+     # discriminator. A negative slope is still the same valid DMR sync; the
+     # slicer already handles it because normalization divides by that slope.
+     if abs(sc)<80:continue
+     ce=float(y.mean()-sc*x.mean());res=y-(ce+sc*x);qu=max(0.,1.-float(np.sqrt(np.mean(res*res)))/(abs(sc)*2))
+     best_seen=max(best_seen,qu)
      st=self.base+phase+(int(pos)-54)*10
      if qu>=.72 and st>=self.base and not self._used(st) and (best is None or qu>best[0]):best=(qu,name,st,ce,sc)
+  self.status.acquisition_quality=max(self.status.acquisition_quality*0.85,best_seen)
   if not best:return
-  qu,name,st,ce,sc=best;sy=self._symbols(st)
+  qu,name,st,ce,sc=best;self.status.sync_polarity=1 if sc>=0 else -1;sy=self._symbols(st)
   if sy is None:return
   bits=levels_bits(sy,ce,sc);sl=self._slot(name)
   if name.endswith("DATA"):self._data(bits,name,sl,qu)
@@ -323,4 +333,11 @@ def self_test():
  got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})));m=Dmr4FskModulator(12000,False);z=m.modulate(dmo_cycle_bits(burst))
  for i in range(0,len(z),173):rx.feed(z[i:i+173],12000)
  assert any(s.source==lc.source and s.destination==lc.destination for s in got),[s.summary() for s in got]
+ rx.close()
+ # Repeat with the DMR deviation polarity inverted while keeping the +12 kHz
+ # carrier in place. Real receivers/mixers may present either sign.
+ n=np.arange(len(z));carrier=np.exp(1j*2*np.pi*12000*n/SAMPLE_RATE);zinv=carrier*np.conj(z/carrier)
+ got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})))
+ for i in range(0,len(zinv),173):rx.feed(zinv[i:i+173],12000)
+ assert any(s.source==lc.source and s.destination==lc.destination and s.sync_polarity==-1 for s in got),[s.summary() for s in got]
  rx.close()
