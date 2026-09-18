@@ -250,8 +250,8 @@ class DmrAirReceiver:
   self.audio_output=audio_output;self.status_output=status_output;self.status=DmrStatus();self.codec=None;self.codec_error=""
   try:self.codec=OpenDmrCodec(dec=True)
   except RuntimeError as e:self.codec_error=str(e)
-  self.prev=1+0j;self.count=0;self.fs=np.zeros(len(RRC)-1);self.samples=np.empty(0);self.base=0;self.done=deque(maxlen=128);self.tracked=deque()
- def reset(self):self.prev=1+0j;self.count=0;self.fs.fill(0);self.samples=np.empty(0);self.base=0;self.done.clear();self.tracked.clear();self.status=DmrStatus()
+  self.prev=1+0j;self.count=0;self.fs=np.zeros(len(RRC)-1);self.samples=np.empty(0);self.mags=np.empty(0);self.base=0;self.done=deque(maxlen=128);self.tracked=deque()
+ def reset(self):self.prev=1+0j;self.count=0;self.fs.fill(0);self.samples=np.empty(0);self.mags=np.empty(0);self.base=0;self.done.clear();self.tracked.clear();self.status=DmrStatus()
  def close(self):
   if self.codec:self.codec.close()
  def _slot(self,n):return 1 if n.startswith("DIRECT1") else 2 if n.startswith("DIRECT2") else None
@@ -268,8 +268,8 @@ class DmrAirReceiver:
   # phase *differences*, so a constant RF offset becomes a constant discriminator
   # centre that the sync fit removes. Pre-mixing can instead push a channel on
   # the opposite side of the Q900 IQ passband through +/-Fs/2 and destroy it.
-  self.count+=len(z);pr=np.r_[self.prev,z[:-1]];self.prev=z[-1] if len(z) else self.prev;d=np.angle(z*np.conj(pr))*48000/(2*np.pi);c=np.r_[self.fs,d];f=np.convolve(c,RRC,mode="valid");self.fs=c[-(len(RRC)-1):];self.samples=np.r_[self.samples,f];self._track();self._find()
-  if len(self.samples)>48000:q=len(self.samples)-48000;self.samples=self.samples[q:];self.base+=q
+  self.count+=len(z);pr=np.r_[self.prev,z[:-1]];self.prev=z[-1] if len(z) else self.prev;d=np.angle(z*np.conj(pr))*48000/(2*np.pi);c=np.r_[self.fs,d];f=np.convolve(c,RRC,mode="valid");self.fs=c[-(len(RRC)-1):];self.samples=np.r_[self.samples,f];self.mags=np.r_[self.mags,np.abs(z)];self._track();self._find()
+  if len(self.samples)>48000:q=len(self.samples)-48000;self.samples=self.samples[q:];self.mags=self.mags[q:];self.base+=q
  def _track(self):
   q=deque()
   while self.tracked:
@@ -282,11 +282,20 @@ class DmrAirReceiver:
   if len(self.samples)<1560:return
   candidates=[];best_seen=0.0
   for phase in range(10):
-   sy=self.samples[phase::10]
+   sy=self.samples[phase::10];amp=self.mags[phase::10]
+   if len(sy)<24:continue
+   # No-carrier IQ has almost zero magnitude but its FM discriminator spans
+   # nearly +/-Fs/2 at random. Magnitude-gate candidate selection so those
+   # meaningless off-slot samples cannot bury a real DMR sync correlation.
+   active=np.convolve(amp,np.ones(24)/24,mode="valid")
+   floor=float(np.percentile(amp,20));high=float(np.percentile(amp,90))
+   gate=floor+0.15*(high-floor)
    for name,word in {**VOICE_SYNCS,**DATA_SYNCS}.items():
     x=dibit_levels(sync_bits(word));xc=x-x.mean();co=np.correlate(sy,xc,mode="valid")
     if not len(co):continue
-    for pos in np.argpartition(np.abs(co),-min(3,len(co)))[-3:]:
+    score=np.where(active>=gate,np.abs(co),0.0)
+    for pos in np.argpartition(score,-min(5,len(score)))[-5:]:
+     if score[pos]<=0:continue
      y=sy[pos:pos+24];sc=float(np.dot(y-y.mean(),xc)/np.dot(xc,xc))
      if abs(sc)<80:continue
      ce=float(y.mean()-sc*x.mean());res=y-(ce+sc*x);qu=max(0.,1.-float(np.sqrt(np.mean(res*res)))/(abs(sc)*2))
@@ -359,6 +368,14 @@ def self_test():
  for i in range(0,len(z),173):rx.feed(z[i:i+173],12000)
  assert any(s.source==lc.source and s.destination==lc.destination for s in got),[s.summary() for s in got]
  assert any(abs(s.carrier_hz-12000)<500 for s in got if s.source==lc.source),[(s.carrier_hz,s.summary()) for s in got]
+ rx.close()
+ # Reproduce real TDMA idle slots: weak random-phase IQ produces huge random
+ # discriminator values and used to monopolize the top raw correlations.
+ rng=np.random.default_rng(12345);noise=(rng.normal(size=12000)+1j*rng.normal(size=12000)).astype(np.complex64)*0.002
+ noisy=np.r_[noise,z,noise]
+ got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})))
+ for i in range(0,len(noisy),173):rx.feed(noisy[i:i+173],12000)
+ assert any(s.source==lc.source and s.destination==lc.destination for s in got),[s.summary() for s in got]
  rx.close()
  # Repeat with the DMR deviation polarity inverted while keeping the +12 kHz
  # carrier in place. Real receivers/mixers may present either sign.
