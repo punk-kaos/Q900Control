@@ -6421,8 +6421,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("Use low power and an external receiver. Change one setting per test."))
         if self.sdr_receiver.mode == "WFM":
             layout.addWidget(QLabel("For WFM, 0 Hz gives the most margin inside the 48 kHz I/Q stream."))
+        dmr_controls = None
         if self.sdr_receiver.mode == "DMR":
             layout.addWidget(QLabel("DMR TX is direct/simplex; repeater slot alignment is not enabled yet."))
+            cfg = dmr.DmrConfig.from_env()
+            dmr_id = QSpinBox(); dmr_id.setRange(0, 0xFFFFFF); dmr_id.setValue(cfg.source_id)
+            dmr_target = QSpinBox(); dmr_target.setRange(0, 0xFFFFFF); dmr_target.setValue(cfg.destination_id)
+            dmr_cc = QSpinBox(); dmr_cc.setRange(0, 15); dmr_cc.setValue(cfg.color_code)
+            dmr_slot = QComboBox(); dmr_slot.addItem("Direct slot 1", 1); dmr_slot.addItem("Direct slot 2", 2)
+            dmr_slot.setCurrentIndex(max(0, dmr_slot.findData(cfg.slot)))
+            dmr_private = QCheckBox("Private call (unchecked = group/TG)")
+            dmr_private.setChecked(not cfg.group)
+            layout.addWidget(QLabel("DMR Radio ID")); layout.addWidget(dmr_id)
+            layout.addWidget(QLabel("DMR TG / target ID")); layout.addWidget(dmr_target)
+            layout.addWidget(QLabel("DMR color code")); layout.addWidget(dmr_cc)
+            layout.addWidget(dmr_slot); layout.addWidget(dmr_private)
+            dmr_controls = (dmr_id, dmr_target, dmr_cc, dmr_slot, dmr_private)
         offset = QComboBox()
         for value in (12_000, 0, -12_000):
             offset.addItem(f"{value:+d} Hz", value)
@@ -6457,6 +6471,13 @@ class MainWindow(QMainWindow):
             self._sdr_tx_offset_hz = int(offset.currentData())
             self._sdr_tx_swap_iq = swap.isChecked()
             self._sdr_tx_invert_q = invert.isChecked()
+            if dmr_controls is not None:
+                dmr_id, dmr_target, dmr_cc, dmr_slot, dmr_private = dmr_controls
+                os.environ["Q900_DMR_ID"] = str(dmr_id.value())
+                os.environ["Q900_DMR_TG"] = str(dmr_target.value())
+                os.environ["Q900_DMR_CC"] = str(dmr_cc.value())
+                os.environ["Q900_DMR_SLOT"] = str(int(dmr_slot.currentData()))
+                os.environ["Q900_DMR_PRIVATE"] = "1" if dmr_private.isChecked() else "0"
             self.status.setText(f"SDR TX calibration set: {current.text()}")
 
     def poll_sdr_stream(self) -> None:
