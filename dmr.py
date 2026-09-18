@@ -234,7 +234,7 @@ class DmrVoiceTransmitter:
 
 @dataclass(slots=True)
 class DmrStatus:
- sync:str="";slot:int|None=None;color_code:int|None=None;source:int|None=None;destination:int|None=None;group:bool|None=None;data_type:int|None=None;sync_quality:float=0.;corrected:int=0;ambe_frames:int=0;vocoder_errors:int=0;message:str="searching";input_dbfs:float=-120.;acquisition_quality:float=0.;sync_polarity:int=0
+ sync:str="";slot:int|None=None;color_code:int|None=None;source:int|None=None;destination:int|None=None;group:bool|None=None;data_type:int|None=None;sync_quality:float=0.;corrected:int=0;ambe_frames:int=0;vocoder_errors:int=0;message:str="searching";input_dbfs:float=-120.;acquisition_quality:float=0.;sync_polarity:int=0;carrier_hz:float=0.
  def summary(self):
   p=["DMR"]
   if self.color_code is not None:p.append(f"CC{self.color_code}")
@@ -264,7 +264,11 @@ class DmrAirReceiver:
   if len(z):
    rms=float(np.sqrt(np.mean(np.abs(z.astype(np.complex128))**2)))
    self.status.input_dbfs=20*np.log10(max(rms,1e-6))
-  ix=np.arange(self.count,self.count+len(z));self.count+=len(z);z=z*np.exp(-1j*2*np.pi*offset_hz*ix/48000);pr=np.r_[self.prev,z[:-1]];self.prev=z[-1] if len(z) else self.prev;d=np.angle(z*np.conj(pr))*48000/(2*np.pi);c=np.r_[self.fs,d];f=np.convolve(c,RRC,mode="valid");self.fs=c[-(len(RRC)-1):];self.samples=np.r_[self.samples,f];self._track();self._find()
+  # Do not pre-mix DMR by the analog SDR offset. 4FSK detection only needs
+  # phase *differences*, so a constant RF offset becomes a constant discriminator
+  # centre that the sync fit removes. Pre-mixing can instead push a channel on
+  # the opposite side of the Q900 IQ passband through +/-Fs/2 and destroy it.
+  self.count+=len(z);pr=np.r_[self.prev,z[:-1]];self.prev=z[-1] if len(z) else self.prev;d=np.angle(z*np.conj(pr))*48000/(2*np.pi);c=np.r_[self.fs,d];f=np.convolve(c,RRC,mode="valid");self.fs=c[-(len(RRC)-1):];self.samples=np.r_[self.samples,f];self._track();self._find()
   if len(self.samples)>48000:q=len(self.samples)-48000;self.samples=self.samples[q:];self.base+=q
  def _track(self):
   q=deque()
@@ -312,14 +316,14 @@ class DmrAirReceiver:
    # acquisition so complementary voice sync cannot win on a random FEC decode.
    if dtype in (DT_VOICE_LC_HEADER,DT_TERMINATOR_WITH_LC) and not parsed.get("lc_valid",False):
     continue
-   self.status.sync_polarity=1 if sc>=0 else -1
+   self.status.sync_polarity=1 if sc>=0 else -1;self.status.carrier_hz=ce
    self._data(bits,name,self._slot(name),qu)
    self.done.append(st)
    return
 
   # No structurally valid data burst: accept the strongest voice candidate.
   qu,name,st,ce,sc=next((c for c in candidates if c[1].endswith("VOICE")),candidates[0])
-  self.status.sync_polarity=1 if sc>=0 else -1;sy=self._symbols(st)
+  self.status.sync_polarity=1 if sc>=0 else -1;self.status.carrier_hz=ce;sy=self._symbols(st)
   if sy is None:return
   bits=levels_bits(sy,ce,sc);sl=self._slot(name)
   self._voice(bits,name,sl,qu,0)
@@ -354,6 +358,7 @@ def self_test():
  got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})));m=Dmr4FskModulator(12000,False);z=m.modulate(dmo_cycle_bits(burst))
  for i in range(0,len(z),173):rx.feed(z[i:i+173],12000)
  assert any(s.source==lc.source and s.destination==lc.destination for s in got),[s.summary() for s in got]
+ assert any(abs(s.carrier_hz-12000)<500 for s in got if s.source==lc.source),[(s.carrier_hz,s.summary()) for s in got]
  rx.close()
  # Repeat with the DMR deviation polarity inverted while keeping the +12 kHz
  # carrier in place. Real receivers/mixers may present either sign.

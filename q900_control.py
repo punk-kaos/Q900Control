@@ -6352,8 +6352,8 @@ class MainWindow(QMainWindow):
         polarity = "+" if ds.sync_polarity > 0 else "-" if ds.sync_polarity < 0 else "?"
         self.dmr_status_primary.setText(
             f"DMR RX  |  Input {ds.input_dbfs:.1f} dBFS  |  "
-            f"Acquire {ds.acquisition_quality:.3f}  |  Sync {sync}  |  "
-            f"Quality {ds.sync_quality:.3f}  |  Polarity {polarity}"
+            f"Acquire {ds.acquisition_quality:.3f}  |  Carrier {ds.carrier_hz:+.0f} Hz  |  "
+            f"Sync {sync}  |  Quality {ds.sync_quality:.3f}  |  Polarity {polarity}"
         )
         destination = "--"
         if ds.destination is not None:
