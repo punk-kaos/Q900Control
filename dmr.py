@@ -10,6 +10,8 @@ import numpy as np
 SAMPLE_RATE=48000; SYMBOL_RATE=4800; SPS=10
 SYMBOL_DEVIATION_HZ=648.0; BURST_BITS=264; BURST_SYMBOLS=132
 BURST_SAMPLES=1320; SLOT_SAMPLES=2880; AMBE_BITS=72; AMBE_BYTES=9
+DMR_TX_PREAMBLE_MS=int(os.getenv("Q900_DMR_TX_PREAMBLE_MS","200") or 200)
+if not 0<=DMR_TX_PREAMBLE_MS<=1000: raise ValueError("Q900_DMR_TX_PREAMBLE_MS must be 0..1000")
 SYNC_WORDS={
  "BS_VOICE":0x755FD7DF75F7,"BS_DATA":0xDFF57D75DF5D,
  "MS_VOICE":0x7F7D5DD57DFD,"MS_DATA":0xD5D7F77FD757,
@@ -152,8 +154,11 @@ def _embedded(lc):
  return raw
 def embedded_center(lc,cc,idx):
  raw=_embedded(lc);chunk=raw[(idx-1)*32:idx*32] if idx<=4 else np.zeros(32,dtype=np.uint8);lcss=(1,3,3,2,0)[idx-1];q=qr_encode(((cc&15)<<3)|lcss);return np.r_[q[:8],chunk,q[8:]]
-def build_voice_burst(frames,lc,cc,idx,slot=1):
- center=sync_bits(SYNC_WORDS[f"DIRECT{slot}_VOICE"]) if idx==0 else embedded_center(lc,cc,idx)
+def build_voice_burst(frames,lc,cc,idx,slot=1,voice_sync=None):
+ if idx==0:
+  sync=SYNC_WORDS[f"DIRECT{slot}_VOICE"] if voice_sync is None else int(voice_sync)
+  center=sync_bits(sync)
+ else:center=embedded_center(lc,cc,idx)
  return ambe_to_ota(frames,center)
 def voice_center_info(bits):
  c=np.asarray(bits)[108:156]
@@ -183,13 +188,17 @@ def dmo_cycle_bits(burst):return np.r_[np.asarray(burst,dtype=np.uint8).reshape(
 
 @dataclass(slots=True)
 class DmrConfig:
- source_id:int=0;destination_id:int=0;color_code:int=1;slot:int=1;group:bool=True
+ source_id:int=0;destination_id:int=0;color_code:int=1;slot:int=1;group:bool=True;tdma_direct:bool=False
  @classmethod
- def from_env(cls):return cls(int(os.getenv("Q900_DMR_ID","0")),int(os.getenv("Q900_DMR_TG","0")),int(os.getenv("Q900_DMR_CC","1")),int(os.getenv("Q900_DMR_SLOT","1")),os.getenv("Q900_DMR_PRIVATE","0").lower() not in ("1","true","yes"))
+ def from_env(cls):
+  return cls(int(os.getenv("Q900_DMR_ID","0")),int(os.getenv("Q900_DMR_TG","0")),int(os.getenv("Q900_DMR_CC","1")),int(os.getenv("Q900_DMR_SLOT","1")),os.getenv("Q900_DMR_PRIVATE","0").lower() not in ("1","true","yes"),os.getenv("Q900_DMR_TDMA_DIRECT","0").lower() in ("1","true","yes"))
  def validate_tx(self):
   if not 1<=self.source_id<=0xFFFFFF:raise ValueError("DMR TX needs Q900_DMR_ID")
   if not 1<=self.destination_id<=0xFFFFFF:raise ValueError("DMR TX needs Q900_DMR_TG")
   if not 0<=self.color_code<=15 or self.slot not in (1,2):raise ValueError("invalid DMR CC/slot")
+ def data_sync(self):return SYNC_WORDS[f"DIRECT{self.slot}_DATA"] if self.tdma_direct else SYNC_WORDS["MS_DATA"]
+ def voice_sync(self):return SYNC_WORDS[f"DIRECT{self.slot}_VOICE"] if self.tdma_direct else SYNC_WORDS["MS_VOICE"]
+ def tx_label(self):return f"TDMA-direct TS{self.slot}" if self.tdma_direct else "MS simplex"
 
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
@@ -202,6 +211,8 @@ class OpenDmrCodec:
   L.opendmr_decoder_destroy.argtypes=(ctypes.c_void_p,);L.opendmr_encoder_destroy.argtypes=(ctypes.c_void_p,)
   L.opendmr_decode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));L.opendmr_decode.restype=ctypes.c_bool
   L.opendmr_encode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_uint8));L.opendmr_encode.restype=ctypes.c_bool
+  if hasattr(L,"opendmr_encoder_reset"):L.opendmr_encoder_reset.argtypes=(ctypes.c_void_p,)
+  if hasattr(L,"opendmr_decoder_reset"):L.opendmr_decoder_reset.argtypes=(ctypes.c_void_p,)
   self.decoder=L.opendmr_decoder_create() if dec else None;self.encoder=L.opendmr_encoder_create() if enc else None
  def decode(self,frame):
   inp=(ctypes.c_uint8*9).from_buffer_copy(frame);out=(ctypes.c_int16*160)();err=ctypes.c_int()
@@ -216,21 +227,38 @@ class OpenDmrCodec:
   if self.encoder:self.lib.opendmr_encoder_destroy(self.encoder);self.encoder=None
 
 class DmrVoiceTransmitter:
- def __init__(self,config,offset_hz=12000,codec=None):
-  config.validate_tx();self.c=config;self.lc=LinkControl(config.source_id,config.destination_id,config.group);self.codec=codec or OpenDmrCodec(enc=True);self.mod=Dmr4FskModulator(offset_hz);self.pcm=np.empty(0,dtype=np.float32);self.ambe=deque();self.idx=0;self.started=False
+ def __init__(self,config,offset_hz=12000,codec=None,q900_orientation=True,preamble_ms=DMR_TX_PREAMBLE_MS):
+  config.validate_tx();self.c=config;self.lc=LinkControl(config.source_id,config.destination_id,config.group);self.codec=codec or OpenDmrCodec(enc=True);self.mod=Dmr4FskModulator(offset_hz,q900_orientation);self.pcm=np.empty(0,dtype=np.float32);self.ambe=deque();self.idx=0;self.started=False;self.preamble_ms=max(0,int(preamble_ms))
+  n=63;t=np.arange(n)-(n-1)/2;self._audio_taps=2*3400/SAMPLE_RATE*np.sinc(2*3400*t/SAMPLE_RATE)*np.hamming(n);self._audio_taps/=self._audio_taps.sum();self._audio_hist=np.zeros(n-1,dtype=np.float64)
  def _cycle(self,b):return self.mod.modulate(dmo_cycle_bits(b))
+ def _preamble(self):
+  # MMDVM DMO keys with repeated 0x5F (+3,+3,-3,-3) before the first burst.
+  # 4 symbols/byte at 4800 sym/s => 1.2 bytes per millisecond.
+  count=round(self.preamble_ms*SYMBOL_RATE/4000)
+  return self.mod.modulate(bytes_bits(bytes([0x5F])*count)) if count else np.empty(0,dtype=np.complex64)
  def start_iq(self):
-  self.started=True;s=SYNC_WORDS[f"DIRECT{self.c.slot}_DATA"];return self._cycle(build_data_burst(full_lc_payload(self.lc,1),self.c.color_code,1,s))
+  self.started=True
+  if hasattr(self.codec,"lib") and getattr(self.codec,"encoder",None) and hasattr(self.codec.lib,"opendmr_encoder_reset"):self.codec.lib.opendmr_encoder_reset(self.codec.encoder)
+  header=self._cycle(build_data_burst(full_lc_payload(self.lc,DT_VOICE_LC_HEADER),self.c.color_code,DT_VOICE_LC_HEADER,self.c.data_sync()))
+  pre=self._preamble()
+  return np.concatenate((pre,header)) if len(pre) else header
+ def _pcm8(self,frame48):
+  combined=np.r_[self._audio_hist,np.asarray(frame48,dtype=np.float64)]
+  filtered=np.convolve(combined,self._audio_taps,mode="valid")
+  self._audio_hist=combined[-(len(self._audio_taps)-1):]
+  return np.clip(np.rint(filtered[::6]*32767),-32768,32767).astype(np.int16)
  def feed_pcm(self,x):
   self.pcm=np.r_[self.pcm,np.asarray(x,dtype=np.float32).reshape(-1)];out=[]
   if not self.started:out.append(self.start_iq())
   while len(self.pcm)>=960:
-   f=self.pcm[:960];self.pcm=self.pcm[960:];t=np.arange(63)-31;h=2*3400/48000*np.sinc(2*3400*t/48000)*np.hamming(63);h/=h.sum();p=np.clip(np.rint(np.convolve(f,h,mode="same")[::6]*32767),-32768,32767).astype(np.int16);self.ambe.append(self.codec.encode(p))
+   f=self.pcm[:960];self.pcm=self.pcm[960:];self.ambe.append(self.codec.encode(self._pcm8(f)))
    if len(self.ambe)>=3:
-    frames=[self.ambe.popleft() for _ in range(3)];out.append(self._cycle(build_voice_burst(frames,self.lc,self.c.color_code,self.idx,self.c.slot)));self.idx=(self.idx+1)%6
+    frames=[self.ambe.popleft() for _ in range(3)]
+    burst=build_voice_burst(frames,self.lc,self.c.color_code,self.idx,self.c.slot,self.c.voice_sync())
+    out.append(self._cycle(burst));self.idx=(self.idx+1)%6
   return np.concatenate(out) if out else np.empty(0,dtype=np.complex64)
  def finish_iq(self):
-  s=SYNC_WORDS[f"DIRECT{self.c.slot}_DATA"];return self._cycle(build_data_burst(full_lc_payload(self.lc,2),self.c.color_code,2,s))
+  return self._cycle(build_data_burst(full_lc_payload(self.lc,DT_TERMINATOR_WITH_LC),self.c.color_code,DT_TERMINATOR_WITH_LC,self.c.data_sync()))
 
 @dataclass(slots=True)
 class DmrStatus:
@@ -372,6 +400,12 @@ def self_test():
  lc=LinkControl(1234567,91);burst=build_data_burst(full_lc_payload(lc,1),1,1,SYNC_WORDS["DIRECT1_DATA"]);r=parse_data_burst(burst);assert r["lc_valid"] and r["lc"]==lc
  a=(bytes(range(9)),bytes(range(9,18)),bytes(range(18,27)))
  for i in range(6):assert ota_to_ambe(build_voice_burst(a,lc,1,i,1))==a
+ # Normal/simplex TX uses MS-sourced sync, matching MMDVMHost duplex=false
+ # and the OTA handheld capture used to bring up this decoder.
+ cfg=DmrConfig(1234567,91,1,1,True,False)
+ assert cfg.data_sync()==SYNC_WORDS["MS_DATA"] and cfg.voice_sync()==SYNC_WORDS["MS_VOICE"]
+ direct=DmrConfig(1234567,91,1,2,True,True)
+ assert direct.data_sync()==SYNC_WORDS["DIRECT2_DATA"] and direct.voice_sync()==SYNC_WORDS["DIRECT2_VOICE"]
  # Regression for real TDMA captures: a high-energy key-up transient must
  # not outrank a lower-amplitude but correctly shaped sync sequence.
  ideal=dibit_levels(sync_bits(SYNC_WORDS["MS_VOICE"]))
@@ -382,6 +416,23 @@ def self_test():
  sy=noisy;sumy=np.convolve(sy,np.ones(24),mode="valid");sumy2=np.convolve(sy*sy,np.ones(24),mode="valid")
  energy=np.maximum(sumy2-sumy*sumy/24,1e-12);corr=np.correlate(sy,xc,mode="valid")/np.sqrt(energy*np.dot(xc,xc))
  assert int(np.argmax(np.abs(corr)))==80 and abs(corr[80])>.999
+ class FakeCodec:
+  def __init__(self):self.n=0
+  def encode(self,pcm):
+   self.n+=1;return bytes(((self.n+i*17)&255) for i in range(9))
+ fake=FakeCodec();tx=DmrVoiceTransmitter(cfg,12000,fake,q900_orientation=False,preamble_ms=0)
+ call=[tx.start_iq()]
+ # Six voice bursts = one complete superframe. PCM contents are irrelevant to
+ # FakeCodec but exercise the streaming 48->8 kHz frame cadence.
+ for k in range(18):call.append(tx.feed_pcm(np.sin(2*np.pi*700*np.arange(960)/48000).astype(np.float32)))
+ call.append(tx.finish_iq());call=np.concatenate([x for x in call if len(x)])
+ statuses=[];rxcall=DmrAirReceiver(status_output=lambda st:statuses.append(DmrStatus(**{f:getattr(st,f) for f in st.__dataclass_fields__})))
+ for i in range(0,len(call),173):rxcall.feed(call[i:i+173],12000)
+ assert any(st.sync=="MS_DATA" and st.source==cfg.source_id and st.destination==cfg.destination_id for st in statuses),[st.summary() for st in statuses]
+ assert any(st.sync=="MS_VOICE" and st.ambe_frames>=3 for st in statuses),[(st.sync,st.ambe_frames) for st in statuses]
+ assert any(st.message.startswith("terminator") for st in statuses),[(st.sync,st.message) for st in statuses]
+ rxcall.close()
+
  got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})));m=Dmr4FskModulator(12000,False);z=m.modulate(dmo_cycle_bits(burst))
  for i in range(0,len(z),173):rx.feed(z[i:i+173],12000)
  assert any(s.source==lc.source and s.destination==lc.destination for s in got),[s.summary() for s in got]
