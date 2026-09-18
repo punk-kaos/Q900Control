@@ -9472,10 +9472,12 @@ def udp_iq_sender(
                 if len(generated):
                     stereo = np.column_stack((generated.real, generated.imag)).astype(np.float32)
                     dmr_iq_pending = np.concatenate((dmr_iq_pending, stereo), axis=0)
-            ratio, ratio_trim, ratio_smooth = resample_ratio(
-                len(dmr_iq_pending), max(2_880, target_frames), ratio_trim, base_ratio, ratio_smooth)
+            # Do not servo a protocol waveform from queue depth. DMR is built
+            # on an exact nominal 48 kHz / 4800 sym/s timeline; the only legal
+            # conversion here is nominal-48k -> measured Q900 media clock.
+            # Let the 200 ms DMR preamble provide burst-generation cushion.
             converted_iq = resample_float_frames(
-                dmr_iq_pending, IQ_PACKET_FRAMES, ratio, dmr_resample_phase)
+                dmr_iq_pending, IQ_PACKET_FRAMES, base_ratio, dmr_resample_phase)
             if converted_iq is None:
                 underruns.value += 1
                 return None
@@ -9626,7 +9628,13 @@ def udp_iq_sender(
                     )
                     dmr_iq_pending = np.concatenate((dmr_iq_pending, tail), axis=0)
                 finish_phase = dmr_resample_phase
-                for _ in range(32):
+                finish_packets = 0
+                # Initial preamble intentionally leaves the voice timeline
+                # buffered behind it. Drain every already-generated voice sample
+                # plus the terminator instead of truncating at an arbitrary 32
+                # datagrams. A one-second cap is only a teardown failsafe.
+                finish_deadline = time.monotonic() + 1.0
+                while time.monotonic() < finish_deadline:
                     converted_iq = resample_float_frames(
                         dmr_iq_pending, IQ_PACKET_FRAMES, base_ratio, finish_phase
                     )
@@ -9637,8 +9645,17 @@ def udp_iq_sender(
                         (iq_frames[:, 0] + 1j * iq_frames[:, 1]) * IQ_TX_LEVEL,
                         swap_iq, invert_q
                     )
+                    # Mirror the steady-state ring accounting: one packet-time
+                    # elapsed since the previous send, then this datagram arrives.
+                    ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
                     send(finish_payload)
+                    finish_packets += 1
                     pause(period)
+                # Keep RF keyed until the radio has consumed what is still in its
+                # internal raw-IQ ring. Otherwise CAT PTT can cut the final LC
+                # terminator even though the host successfully sent it.
+                drain_s = min(0.25, max(0.02, ring_words[0] / RADIO_CONSUME_WORDS_PER_S))
+                pause(drain_s)
             except Exception:
                 pass
         try:
