@@ -6334,9 +6334,10 @@ class MainWindow(QMainWindow):
             if self._sdr_active and self.sdr_receiver.mode == "DMR":
                 ds = self.sdr_receiver.dmr_status
                 summary = f"{ds.summary()} | {summary}"
-                detail = (f"DMR sync={ds.sync or 'search'} quality={ds.sync_quality:.3f} "
-                          f"corrected={ds.corrected} AMBE={ds.ambe_frames} "
-                          f"vocoder-errors={ds.vocoder_errors}  {detail}").strip()
+                detail = (f"DMR input={ds.input_dbfs:.1f}dBFS acquire={ds.acquisition_quality:.3f} "
+                          f"sync={ds.sync or 'search'} quality={ds.sync_quality:.3f} "
+                          f"polarity={ds.sync_polarity:+d} corrected={ds.corrected} "
+                          f"AMBE={ds.ambe_frames} vocoder-errors={ds.vocoder_errors}  {detail}").strip()
             self.network_audio_status.setText(summary)
             self.network_audio_status.set_detail(detail)
         else:
