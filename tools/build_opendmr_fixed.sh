@@ -33,6 +33,16 @@ state_src = root / "decoder" / "ambe3600x2250_q900.c"
 # translation unit deliberately minimal so it is compiled against mbelib-neo's
 # current mbe_parms ABI.
 t = state_src.read_text()
+if '#include "mbelib.h"' not in t:
+    raise SystemExit("adapted DVMHost 2250 source is missing mbelib include")
+t = t.replace('#include "mbelib.h"', '#include "mbelib.h"\n#include "ambe3600x2450_const.h"', 1)
+# mbelib-neo keeps the DMR quantizer tables translation-unit local in this
+# internal header, so remove DVMHost's external declarations and compile a
+# private copy of the same constants into the predictor helper.
+t = "\n".join(
+    line for line in t.splitlines()
+    if not line.lstrip().startswith("extern const ")
+) + "\n"
 marker = "int mbe_dequantizeAmbeTone"
 pos = t.find(marker)
 if pos < 0:
