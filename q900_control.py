@@ -9410,7 +9410,10 @@ def udp_iq_sender(
 
     if mode == "DMR":
         try:
-            dmr_tx = dmr.DmrVoiceTransmitter(dmr.DmrConfig.from_env(), offset_hz)
+            dmr_tx = dmr.DmrVoiceTransmitter(
+                dmr.DmrConfig.from_env(), offset_hz,
+                diagnostic_prefix=TX_RECORD_PREFIX,
+            )
         except Exception as error:  # noqa: BLE001
             failure.value = f"DMR: {error}".encode()[:255]
             ready.set()
@@ -9680,8 +9683,8 @@ def udp_iq_sender(
             except Exception:
                 pass
         try:
-            if dmr_tx is not None and getattr(dmr_tx, "codec", None) is not None:
-                dmr_tx.codec.close()
+            if dmr_tx is not None:
+                dmr_tx.close()
         except Exception:
             pass
         try:
@@ -9752,8 +9755,46 @@ def analyze_dmr_tx_signal(signal: np.ndarray) -> list[dmr.DmrStatus]:
     return statuses
 
 
+def analyze_dmr_vocoder_recording(prefix: str) -> bool:
+    """Report the local PCM -> AMBE -> PCM diagnostic captured during DMR TX."""
+    path = f"{prefix}.dmr.vocoder.json"
+    try:
+        with open(path) as handle:
+            meta = json.load(handle)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError, TypeError) as error:
+        print(f"cannot read DMR vocoder diagnostic: {error}")
+        return False
+
+    frames = int(meta.get("frames") or 0)
+    duration = float(meta.get("duration_s") or 0.0)
+    print(
+        f"DMR vocoder: {frames} AMBE frames, {duration:.2f} s, "
+        f"codec {meta.get('codec_version') or 'unknown'}"
+    )
+    print(
+        f"  encoder input: rms {float(meta.get('mic_rms_dbfs', -120.0)):.1f} dBFS, "
+        f"peak {int(meta.get('mic_peak') or 0)} counts, "
+        f"clipped {int(meta.get('mic_clipped_samples') or 0)} sample(s)"
+    )
+    print(
+        f"  local decode: rms {float(meta.get('roundtrip_rms_dbfs', -120.0)):.1f} dBFS, "
+        f"peak {int(meta.get('roundtrip_peak') or 0)} counts, "
+        f"bit errors {int(meta.get('decode_errors') or 0)}, "
+        f"decode failures {int(meta.get('decode_failures') or 0)}"
+    )
+    print(f"  listen: {meta.get('mic_wav')}")
+    print(f"          {meta.get('roundtrip_wav')}")
+    print(f"  AMBE:   {meta.get('ambe_raw')}")
+    return True
+
+
 def analyze_iq_tx_recording(prefix: str) -> None:
     """Measure tone purity and packet timing in a recorded SDR I/Q stream."""
+    have_vocoder = analyze_dmr_vocoder_recording(prefix)
+    if have_vocoder:
+        print()
     try:
         with open(f"{prefix}.iq.tx.raw", "rb") as handle:
             raw = handle.read()
