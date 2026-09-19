@@ -55,5 +55,13 @@ jobs:
           with wave.open("/tmp/q900-dmr-vocoder.dmr.roundtrip.wav", "rb") as w:
               assert w.getframerate() == 8000 and w.getnframes() == 480
           assert len(open("/tmp/q900-dmr-vocoder.dmr.ambe.raw", "rb").read()) == 27
+
+          import q900_control
+          sweep = q900_control.generate_dmr_vocoder_gain_sweep("/tmp/q900-dmr-vocoder")
+          assert [row[0] for row in sweep] == [0.0, 6.0, 12.0, 18.0]
+          for gain_db, path, clipped, errors, failures in sweep:
+              assert errors == 0 and failures == 0
+              with wave.open(path, "rb") as w:
+                  assert w.getframerate() == 8000 and w.getnframes() == 480
           PY
       - run: QT_QPA_PLATFORM=offscreen python q900_control.py --self-test
