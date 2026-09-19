@@ -9594,56 +9594,124 @@ def udp_iq_sender(
             )
             ring_depth.value = ring_words[0]
 
-        deadline = mach_time() if mach_time else time.monotonic()
-        debt_packets = 0
-        while not stop.is_set():
-            ring_words[0] = max(0, ring_words[0] - packet_words)
+        if dmr_tx is not None:
+            # Digital 4FSK cannot tolerate the Q900 firmware's one-IQ-frame
+            # shallow/deep ring corrections. The analog scheduler below repays
+            # deadline debt with back-to-back datagrams; that is useful for
+            # speech but can drive the DMR ring through the >4608-word delete
+            # threshold and splice the 10-samples/symbol waveform.
+            #
+            # Account the ring from real elapsed wall time and recover a late
+            # packet gently (3 ms spacing for a 4 ms packet) until the target is
+            # restored. Never send a packet that would push the predicted ring
+            # into the deep-correction region.
+            dmr_shallow_events = 0
+            dmr_deep_avoids = 0
+            dmr_recovery_packets = 0
+            # The priming loop subtracts a gap after its final send even though
+            # no following priming packet waits that gap. Put that last gap back
+            # so the model matches the radio immediately after the burst.
+            ring_words[0] = min(
+                RADIO_RING_WORDS - 1,
+                ring_words[0] + int(burst_gap * RADIO_CONSUME_WORDS_PER_S),
+            )
             ring_depth.value = ring_words[0]
-            if not send_scheduled():
-                debt_packets = min(debt_packets + 1, max_debt_packets)
-            if debt_packets and send_scheduled():
-                debt_packets -= 1
-            if mach_time and mach_wait:
-                deadline += period_ticks
-                mach_wait(deadline)
-                lateness = (mach_time() - deadline) / ticks_per_second
-                late_ms.value = max(late_ms.value, lateness * 1000.0)
-                if lateness > period:
-                    behind = int(lateness / period)
-                    burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
-                    for _ in range(burst):
-                        ring_words[0] = max(0, ring_words[0] - packet_words)
-                        send_scheduled()
-                    deadline += burst * period_ticks
-                    if (mach_time() - deadline) / ticks_per_second > period:
-                        now = mach_time()
-                        shortfall = max(int((now - deadline) / ticks_per_second / period), 0)
-                        ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
-                        debt_packets = min(
-                            debt_packets + shortfall, max_debt_packets
-                        )
-                        deadline = now
-            else:
-                deadline += period
-                lateness = time.monotonic() - deadline
-                if lateness > 0:
+            ring_clock = time.monotonic()
+            recovery_gap = period * 0.75
+            deep_guard = max(
+                RADIO_RING_SHALLOW_WORDS,
+                RADIO_RING_DEEP_WORDS - packet_words - 64,
+            )
+            while not stop.is_set():
+                now = time.monotonic()
+                elapsed = max(0.0, now - ring_clock)
+                ring_words[0] = max(
+                    0, ring_words[0] - int(elapsed * RADIO_CONSUME_WORDS_PER_S)
+                )
+                ring_clock = now
+                ring_depth.value = ring_words[0]
+
+                if ring_words[0] < RADIO_RING_SHALLOW_WORDS:
+                    dmr_shallow_events += 1
+
+                if ring_words[0] > deep_guard:
+                    wait_s = (ring_words[0] - deep_guard) / RADIO_CONSUME_WORDS_PER_S
+                    dmr_deep_avoids += 1
+                    pause(wait_s)
+                    now = time.monotonic()
+                    elapsed = max(0.0, now - ring_clock)
+                    ring_words[0] = max(
+                        0, ring_words[0] - int(elapsed * RADIO_CONSUME_WORDS_PER_S)
+                    )
+                    ring_clock = now
+                    ring_depth.value = ring_words[0]
+
+                if not send_scheduled():
+                    # The 200 ms preamble should normally keep generated IQ well
+                    # ahead of this point. If it does not, do not synthesize or
+                    # skip protocol samples; wait for the next AMBE burst.
+                    pause(min(0.001, period / 4.0))
+                    continue
+
+                gap = period
+                if ring_words[0] < ring_target_words:
+                    gap = recovery_gap
+                    dmr_recovery_packets += 1
+                pause(gap)
+
+            # The DMR branch exits only via stop; the finally block below sends
+            # the padded final voice burst and terminator while CAT PTT stays keyed.
+        else:
+            deadline = mach_time() if mach_time else time.monotonic()
+            debt_packets = 0
+            while not stop.is_set():
+                ring_words[0] = max(0, ring_words[0] - packet_words)
+                ring_depth.value = ring_words[0]
+                if not send_scheduled():
+                    debt_packets = min(debt_packets + 1, max_debt_packets)
+                if debt_packets and send_scheduled():
+                    debt_packets -= 1
+                if mach_time and mach_wait:
+                    deadline += period_ticks
+                    mach_wait(deadline)
+                    lateness = (mach_time() - deadline) / ticks_per_second
                     late_ms.value = max(late_ms.value, lateness * 1000.0)
-                    behind = int(lateness / period)
-                    burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
-                    for _ in range(burst):
-                        ring_words[0] = max(0, ring_words[0] - packet_words)
-                        send_scheduled()
-                    deadline += burst * period
-                    if time.monotonic() - deadline > period:
-                        now = time.monotonic()
-                        shortfall = max(int((now - deadline) / period), 0)
-                        ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
-                        debt_packets = min(
-                            debt_packets + shortfall, max_debt_packets
-                        )
-                        deadline = now
+                    if lateness > period:
+                        behind = int(lateness / period)
+                        burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
+                        for _ in range(burst):
+                            ring_words[0] = max(0, ring_words[0] - packet_words)
+                            send_scheduled()
+                        deadline += burst * period_ticks
+                        if (mach_time() - deadline) / ticks_per_second > period:
+                            now = mach_time()
+                            shortfall = max(int((now - deadline) / ticks_per_second / period), 0)
+                            ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
+                            debt_packets = min(
+                                debt_packets + shortfall, max_debt_packets
+                            )
+                            deadline = now
                 else:
-                    time.sleep(-lateness)
+                    deadline += period
+                    lateness = time.monotonic() - deadline
+                    if lateness > 0:
+                        late_ms.value = max(late_ms.value, lateness * 1000.0)
+                        behind = int(lateness / period)
+                        burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
+                        for _ in range(burst):
+                            ring_words[0] = max(0, ring_words[0] - packet_words)
+                            send_scheduled()
+                        deadline += burst * period
+                        if time.monotonic() - deadline > period:
+                            now = time.monotonic()
+                            shortfall = max(int((now - deadline) / period), 0)
+                            ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
+                            debt_packets = min(
+                                debt_packets + shortfall, max_debt_packets
+                            )
+                            deadline = now
+                    else:
+                        time.sleep(-lateness)
     finally:
         # A DMR call ends with a terminator-with-LC. DMR stop paths keep CAT PTT
         # asserted until this child exits, so drain the pending voice waveform,
@@ -9687,7 +9755,10 @@ def udp_iq_sender(
                     pause(max(0.0, finish_send_at - time.monotonic()))
                     send(finish_payload)
                     finish_packets += 1
-                    finish_send_at += period
+                    # Never compress the DMR tail schedule to repay lateness.
+                    # Catch-up sends here can cross the same deep-ring threshold
+                    # as the old steady-state scheduler.
+                    finish_send_at = time.monotonic() + period
                 # Keep RF keyed until the radio has consumed what is still in its
                 # internal raw-IQ ring. Otherwise CAT PTT can cut the final LC
                 # terminator even though the host successfully sent it.
@@ -9740,6 +9811,9 @@ def udp_iq_sender(
                     "trim": trimmed.value, "err": send_errors.value,
                     "clip": clipped.value, "dspclip": dsp_clipped.value,
                     "late_ms": late_ms.value,
+                    "dmr_ring_shallow": locals().get("dmr_shallow_events", 0),
+                    "dmr_ring_deep_avoids": locals().get("dmr_deep_avoids", 0),
+                    "dmr_ring_recovery_packets": locals().get("dmr_recovery_packets", 0),
                 },
             }
             try:
