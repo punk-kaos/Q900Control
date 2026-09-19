@@ -346,11 +346,11 @@ class DmrVoiceTransmitter:
   self.started=True
   if hasattr(self.codec,"lib") and getattr(self.codec,"encoder",None) and hasattr(self.codec.lib,"opendmr_encoder_reset"):self.codec.lib.opendmr_encoder_reset(self.codec.encoder)
   pre=self._preamble()
-  header=self._cycle(build_data_burst(full_lc_payload(self.lc,DT_VOICE_LC_HEADER),self.c.color_code,DT_VOICE_LC_HEADER,self.c.data_sync()))
+  header_bits=build_data_burst(full_lc_payload(self.lc,DT_VOICE_LC_HEADER),self.c.color_code,DT_VOICE_LC_HEADER,self.c.data_sync())
   # Match the established MMDVM DMR call start: repeat the Voice LC Header
-  # three times before voice. This gives a simplex receiver multiple complete
-  # LC/data-sync opportunities without changing the 60 ms DMO cadence.
-  headers=np.concatenate((header,header,header))
+  # three times before voice. Modulate each cycle separately so CPM phase and
+  # the RRC filter state remain continuous across all three 60 ms slots.
+  headers=np.concatenate(tuple(self._cycle(header_bits) for _ in range(3)))
   return np.concatenate((pre,headers)) if len(pre) else headers
  def _pcm8(self,frame48):
   combined=np.r_[self._audio_hist,np.asarray(frame48,dtype=np.float64)]
