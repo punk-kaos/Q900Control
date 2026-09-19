@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
-import ctypes, os
+import ctypes, json, os, wave
 from pathlib import Path
 from typing import Callable, Iterable
 import numpy as np
@@ -281,9 +281,60 @@ class OpenDmrCodec:
   if self.decoder:self.lib.opendmr_decoder_destroy(self.decoder);self.decoder=None
   if self.encoder:self.lib.opendmr_encoder_destroy(self.encoder);self.encoder=None
 
+class DmrVocoderRecorder:
+ def __init__(self,prefix):
+  self.prefix=str(prefix);self.frames=0;self.decode_errors=0;self.decode_failures=0
+  self.mic_sum_sq=0.;self.round_sum_sq=0.;self.mic_samples=0;self.round_samples=0
+  self.mic_peak=0;self.round_peak=0;self.mic_clipped=0
+  self.decoder=OpenDmrCodec(dec=True)
+  self.mic=wave.open(f"{self.prefix}.dmr.mic.wav","wb");self.mic.setnchannels(1);self.mic.setsampwidth(2);self.mic.setframerate(8000)
+  self.round=wave.open(f"{self.prefix}.dmr.roundtrip.wav","wb");self.round.setnchannels(1);self.round.setsampwidth(2);self.round.setframerate(8000)
+  self.ambe=open(f"{self.prefix}.dmr.ambe.raw","wb")
+ def capture(self,pcm,frame):
+  p=np.ascontiguousarray(pcm,dtype="<i2").reshape(-1)
+  if len(p)!=160:raise ValueError("DMR diagnostic expects 160 PCM samples")
+  if len(frame)!=9:raise ValueError("DMR diagnostic expects a 9-byte AMBE frame")
+  self.mic.writeframesraw(p.tobytes());self.ambe.write(frame);self.frames+=1
+  pf=p.astype(np.float64);self.mic_sum_sq+=float(np.dot(pf,pf));self.mic_samples+=len(p)
+  self.mic_peak=max(self.mic_peak,int(np.max(np.abs(p.astype(np.int32)))))
+  self.mic_clipped+=int(np.count_nonzero(np.abs(p.astype(np.int32))>=32767))
+  try:
+   out,errs=self.decoder.decode(frame);self.decode_errors+=int(errs)
+  except Exception:
+   self.decode_failures+=1;out=np.zeros(160,dtype=np.int16)
+  o=np.ascontiguousarray(out,dtype="<i2").reshape(-1)
+  self.round.writeframesraw(o.tobytes());of=o.astype(np.float64)
+  self.round_sum_sq+=float(np.dot(of,of));self.round_samples+=len(o)
+  self.round_peak=max(self.round_peak,int(np.max(np.abs(o.astype(np.int32)))))
+ def close(self):
+  for h in (getattr(self,"mic",None),getattr(self,"round",None),getattr(self,"ambe",None)):
+   try:
+    if h:h.close()
+   except Exception:pass
+  try:self.decoder.close()
+  except Exception:pass
+  def dbfs(sum_sq,count):
+   return 20*np.log10(max(np.sqrt(sum_sq/max(count,1))/32768.0,1e-12))
+  meta={
+   "version":1,"frames":self.frames,"duration_s":self.frames*0.020,
+   "codec_version":getattr(self.decoder,"version",""),
+   "decode_errors":self.decode_errors,"decode_failures":self.decode_failures,
+   "mic_rms_dbfs":float(dbfs(self.mic_sum_sq,self.mic_samples)),
+   "roundtrip_rms_dbfs":float(dbfs(self.round_sum_sq,self.round_samples)),
+   "mic_peak":self.mic_peak,"roundtrip_peak":self.round_peak,
+   "mic_clipped_samples":self.mic_clipped,
+   "mic_wav":f"{self.prefix}.dmr.mic.wav",
+   "roundtrip_wav":f"{self.prefix}.dmr.roundtrip.wav",
+   "ambe_raw":f"{self.prefix}.dmr.ambe.raw",
+  }
+  try:
+   with open(f"{self.prefix}.dmr.vocoder.json","w") as h:json.dump(meta,h,indent=2)
+  except OSError:pass
+  return meta
+
 class DmrVoiceTransmitter:
- def __init__(self,config,offset_hz=12000,codec=None,q900_orientation=True,preamble_ms=DMR_TX_PREAMBLE_MS):
-  config.validate_tx();self.c=config;self.lc=LinkControl(config.source_id,config.destination_id,config.group);self.codec=codec or OpenDmrCodec(enc=True);self.mod=Dmr4FskModulator(offset_hz,q900_orientation);self.pcm=np.empty(0,dtype=np.float32);self.ambe=deque();self.idx=0;self.started=False;self.preamble_ms=max(0,int(preamble_ms))
+ def __init__(self,config,offset_hz=12000,codec=None,q900_orientation=True,preamble_ms=DMR_TX_PREAMBLE_MS,diagnostic_prefix=None):
+  config.validate_tx();self.c=config;self.lc=LinkControl(config.source_id,config.destination_id,config.group);self.codec=codec or OpenDmrCodec(enc=True);self.mod=Dmr4FskModulator(offset_hz,q900_orientation);self.pcm=np.empty(0,dtype=np.float32);self.ambe=deque();self.idx=0;self.started=False;self.preamble_ms=max(0,int(preamble_ms));self.diag=DmrVocoderRecorder(diagnostic_prefix) if diagnostic_prefix else None
   n=63;t=np.arange(n)-(n-1)/2;self._audio_taps=2*3400/SAMPLE_RATE*np.sinc(2*3400*t/SAMPLE_RATE)*np.hamming(n);self._audio_taps/=self._audio_taps.sum();self._audio_hist=np.zeros(n-1,dtype=np.float64)
  def _cycle(self,b):return self.mod.modulate(dmo_cycle_bits(b))
  def _preamble(self):
@@ -306,7 +357,9 @@ class DmrVoiceTransmitter:
   self.pcm=np.r_[self.pcm,np.asarray(x,dtype=np.float32).reshape(-1)];out=[]
   if not self.started:out.append(self.start_iq())
   while len(self.pcm)>=960:
-   f=self.pcm[:960];self.pcm=self.pcm[960:];self.ambe.append(self.codec.encode(self._pcm8(f)))
+   f=self.pcm[:960];self.pcm=self.pcm[960:];pcm8=self._pcm8(f);frame=self.codec.encode(pcm8)
+   if self.diag:self.diag.capture(pcm8,frame)
+   self.ambe.append(frame)
    if len(self.ambe)>=3:
     frames=[self.ambe.popleft() for _ in range(3)]
     burst=build_voice_burst(frames,self.lc,self.c.color_code,self.idx,self.c.slot,self.c.voice_sync())
@@ -314,6 +367,9 @@ class DmrVoiceTransmitter:
   return np.concatenate(out) if out else np.empty(0,dtype=np.complex64)
  def finish_iq(self):
   return self._cycle(build_data_burst(full_lc_payload(self.lc,DT_TERMINATOR_WITH_LC),self.c.color_code,DT_TERMINATOR_WITH_LC,self.c.data_sync()))
+ def close(self):
+  if self.diag:self.diag.close();self.diag=None
+  if hasattr(self.codec,"close"):self.codec.close()
 
 @dataclass(slots=True)
 class DmrStatus:
