@@ -344,11 +344,13 @@ decoder state. This detects an encoder input-level problem without repeating RF
 tests; the analyzer reports input clipping plus AMBE decode errors/failures.
 
 A second sweep leaves the PCM samples completely unchanged and varies only the
-AMBE encoder's internal gain calibration at 0, +6, +12, +15 and +18 dB, writing
-`<prefix>.dmr.roundtrip.vocoderGain+XXdB.wav`. This separates "the IMBE front-end
-needs hotter PCM" from "the AMBE gain quantizer is calibrated wrong." The fixed
-OpenDMR build maps this dB control into the additive gain-adjust term used by the
-OP25-derived DMR encoder.
+AMBE encoder's internal attenuation at 6, 8, 10, 12, 14, 16 and 18 dB. It writes
+both the raw decoded result,
+`<prefix>.dmr.roundtrip.vocoderAtten+XXdB.wav`, and a level-matched copy,
+`<prefix>.dmr.roundtrip.vocoderAtten+XXdB.matched.wav`. The matched files are
+normalized to comparable playback loudness (target -18 dBFS RMS with 1 dB peak
+headroom), so codec distortion can be judged independently of output volume. The
+analyzer also reports decoded RMS and peak levels for every sweep point.
 
 Repeater uplink transmit is intentionally not enabled yet. It needs RF-slot timing
 alignment to the repeater plus calibration of the Q900 network/ring/RF latency;
