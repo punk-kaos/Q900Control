@@ -51,6 +51,20 @@ jobs:
           canonical = dmr.bytes_bits(frame)
           assert dmr._ota_to_can(dmr._can_to_ota(frame)) == frame
           pcm, errors = codec.decode(frame)
+
+          # DmrVoiceTransmitter resets the native encoder at every call start.
+          # The calibrated q900fix5 operating point must survive that reset.
+          probe_t = np.arange(160, dtype=np.float64) / 8000.0
+          probe = np.rint(
+              9000.0 * np.sin(2 * np.pi * 173.0 * probe_t)
+              + 4500.0 * np.sin(2 * np.pi * 346.0 * probe_t)
+          ).astype(np.int16)
+          fresh = dmr.OpenDmrCodec(enc=True)
+          before_reset = fresh.encode(probe)
+          fresh.lib.opendmr_encoder_reset(fresh.encoder)
+          after_reset = fresh.encode(probe)
+          assert before_reset == after_reset, (before_reset.hex(), after_reset.hex())
+          fresh.close()
           assert len(pcm) == 160
           print("OpenDMR fixed TX bridge:", codec.lib._name, frame.hex(), "decode errors", errors)
           codec.close()
