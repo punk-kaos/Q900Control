@@ -9646,6 +9646,7 @@ def udp_iq_sender(
                     ring_clock = now
                     ring_depth.value = ring_words[0]
 
+                pre_send_ring = ring_words[0]
                 if not send_scheduled():
                     # The 200 ms preamble should normally keep generated IQ well
                     # ahead of this point. If it does not, do not synthesize or
@@ -9654,7 +9655,10 @@ def udp_iq_sender(
                     continue
 
                 gap = period
-                if ring_words[0] < ring_target_words:
+                if pre_send_ring < ring_target_words:
+                    # A 3 ms interval nets +96 words for a 192-frame DMR
+                    # datagram, restoring one millisecond of ring depth without
+                    # the old back-to-back catch-up burst.
                     gap = recovery_gap
                     dmr_recovery_packets += 1
                 pause(gap)
