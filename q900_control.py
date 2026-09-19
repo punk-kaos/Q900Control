@@ -9756,7 +9756,7 @@ def analyze_dmr_tx_signal(signal: np.ndarray) -> list[dmr.DmrStatus]:
     return statuses
 
 
-def generate_dmr_vocoder_gain_sweep(prefix: str) -> list[tuple[float, str, int, int]]:
+def generate_dmr_vocoder_gain_sweep(prefix: str) -> list[tuple[float, str, int, int, int]]:
     """Re-encode the captured 8 kHz mic WAV at several gains and decode locally."""
     source = f"{prefix}.dmr.mic.wav"
     try:
@@ -9805,7 +9805,7 @@ def generate_dmr_vocoder_gain_sweep(prefix: str) -> list[tuple[float, str, int, 
             handle.setsampwidth(2)
             handle.setframerate(8000)
             handle.writeframes(decoded.astype("<i2", copy=False).tobytes())
-        results.append((gain_db, output, clipped, errors + failures * 1000000))
+        results.append((gain_db, output, clipped, errors, failures))
     return results
 
 
@@ -9848,9 +9848,7 @@ def analyze_dmr_vocoder_recording(prefix: str) -> bool:
         sweep = []
     if sweep:
         print("  offline encoder gain sweep:")
-        for gain_db, output, clipped, packed_errors in sweep:
-            failures = packed_errors // 1000000
-            errors = packed_errors % 1000000
+        for gain_db, output, clipped, errors, failures in sweep:
             print(
                 f"    +{gain_db:.0f} dB -> {output} "
                 f"(input clips {clipped}, decode bit errors {errors}, failures {failures})"
