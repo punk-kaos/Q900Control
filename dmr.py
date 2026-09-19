@@ -226,7 +226,7 @@ def dmr_prng_mask(seed):
  for _ in range(23):p=(173*p+13849)&0xFFFF;mask=(mask<<1)|(p>>15)
  return mask
 
-OPENDMR_TX_VERSION="1.0.0-q900fix4"
+OPENDMR_TX_VERSION="1.0.0-q900fix5"
 
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
@@ -347,7 +347,11 @@ class DmrVoiceTransmitter:
   if hasattr(self.codec,"lib") and getattr(self.codec,"encoder",None) and hasattr(self.codec.lib,"opendmr_encoder_reset"):self.codec.lib.opendmr_encoder_reset(self.codec.encoder)
   pre=self._preamble()
   header=self._cycle(build_data_burst(full_lc_payload(self.lc,DT_VOICE_LC_HEADER),self.c.color_code,DT_VOICE_LC_HEADER,self.c.data_sync()))
-  return np.concatenate((pre,header)) if len(pre) else header
+  # Match the established MMDVM DMR call start: repeat the Voice LC Header
+  # three times before voice. This gives a simplex receiver multiple complete
+  # LC/data-sync opportunities without changing the 60 ms DMO cadence.
+  headers=np.concatenate((header,header,header))
+  return np.concatenate((pre,headers)) if len(pre) else headers
  def _pcm8(self,frame48):
   combined=np.r_[self._audio_hist,np.asarray(frame48,dtype=np.float64)]
   filtered=np.convolve(combined,self._audio_taps,mode="valid")
@@ -523,6 +527,13 @@ def self_test():
  # (which would produce ab26d56d569a80 for this vector).
  params=(0x55,0x12,0x0D,0x155,0x5A,0x15,0xA,0x6,0x5)
  assert bits_bytes(ambe_params_bits(params)).hex()=="a96aabaaeda880"
+ # External MMDVMHost silence vector. B9E881526173002A6B is the standard
+ # on-air 72-bit AMBE silence codeword used in DMR_SILENCE_DATA. Pin both
+ # directions so our canonical A+B+C <-> OTA interleave cannot validate itself.
+ silence_ota=bytes.fromhex("B9 E8 81 52 61 73 00 2A 6B")
+ silence_can=bytes.fromhex("F8 01 48 A8 2A 1B 3F 19 C1")
+ assert _ota_to_can(bytes_bits(silence_ota))==silence_can
+ assert bits_bytes(_can_to_ota(silence_can))[:9]==silence_ota
  for v in (0,1,0x5A,0xFF):
   c=golay_encode(v);assert golay_decode(c)==(v,0);n=c.copy();n[[0,7,19]]^=1;assert golay_decode(n)==(v,3)
  p=bytes(range(12));c=bptc_encode(p);assert bptc_decode(c)[0]==p
@@ -550,7 +561,9 @@ def self_test():
   def encode(self,pcm):
    self.n+=1;return bytes(((self.n+i*17)&255) for i in range(9))
  fake=FakeCodec();tx=DmrVoiceTransmitter(cfg,12000,fake,q900_orientation=False,preamble_ms=0)
- call=[tx.start_iq()]
+ start=tx.start_iq()
+ assert len(start)==3*SLOT_SAMPLES,len(start)
+ call=[start]
  # Six voice bursts = one complete superframe. PCM contents are irrelevant to
  # FakeCodec but exercise the streaming 48->8 kHz frame cadence.
  for k in range(18):call.append(tx.feed_pcm(np.sin(2*np.pi*700*np.arange(960)/48000).astype(np.float32)))
