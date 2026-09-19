@@ -3,11 +3,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REF="d28164b39ba4d91ad5948ff22707937f8944f70f"
+DVM_REF="435ff45b367887ffa94c89cb1a2779628e0f7bfb"
 WORK="${TMPDIR:-/tmp}/q900-opendmr-fixed"
+DVM_WORK="${TMPDIR:-/tmp}/q900-dvmhost-vocoder"
 
-rm -rf "$WORK"
+rm -rf "$WORK" "$DVM_WORK"
 git clone --quiet https://github.com/MW0MWZ/OpenDMR.git "$WORK"
 git -C "$WORK" checkout --quiet "$REF"
+git clone --quiet https://github.com/DVMProject/dvmhost.git "$DVM_WORK"
+git -C "$DVM_WORK" checkout --quiet "$DVM_REF"
+
+cp "$DVM_WORK/src/vocoder/ambe3600x2250.c" "$WORK/decoder/ambe3600x2250_q900.c"
+sed -i.bak 's#"vocoder/mbe.h"#"mbelib.h"#' "$WORK/decoder/ambe3600x2250_q900.c"
+rm -f "$WORK/decoder/ambe3600x2250_q900.c.bak"
 
 python3 - "$WORK" <<'PY'
 from pathlib import Path
@@ -16,6 +24,22 @@ import sys
 root = Path(sys.argv[1])
 mbe = root / "encoder" / "mbeenc.cpp"
 api = root / "opendmr.cpp"
+hdr = root / "decoder" / "mbelib.h"
+makefile = root / "Makefile"
+
+s = hdr.read_text()
+anchor = "MBE_API int mbe_decodeAmbe2450Parms(char* ambe_d, mbe_parms* cur_mp, mbe_parms* prev_mp);"
+if s.count(anchor) != 1:
+    raise SystemExit("OpenDMR mbelib header no longer matches pinned source")
+s = s.replace(anchor, anchor + "\nMBE_API int mbe_dequantizeAmbe2250Parms(mbe_parms* cur_mp, mbe_parms* prev_mp, const int* b);")
+hdr.write_text(s)
+
+s = makefile.read_text()
+anchor = "               decoder/ambe3600x2450.c \\\n"
+if s.count(anchor) != 1:
+    raise SystemExit("OpenDMR Makefile decoder list no longer matches pinned source")
+s = s.replace(anchor, anchor + "               decoder/ambe3600x2250_q900.c \\\n")
+makefile.write_text(s)
 
 s = mbe.read_text()
 old = """	/* Encode voice/unvoiced (b[1]) */
@@ -68,13 +92,35 @@ s = s.replace(old, new)
 if s.count(": d_gain_adjust(1.0f)") != 1:
     raise SystemExit("OpenDMR encoder default gain no longer matches pinned source")
 s = s.replace(": d_gain_adjust(1.0f)", ": d_gain_adjust(0.0f)")
+
+old_state = """	/* Update decoder state with quantized values */
+	uint8_t ambe_49[49];
+	encode_49bit(ambe_49, b);
+
+	char ambe_d[49];
+	for (int i = 0; i < 49; i++) {
+		ambe_d[i] = ambe_49[i];
+	}
+
+	mbe_decodeAmbe2450Parms(ambe_d, cur_mp, prev_mp);
+	mbe_moveMbeParms(cur_mp, prev_mp);
+"""
+new_state = """	/* Update the encoder predictor with the same DMR dequantizer used by
+	 * OP25/Dudestar/DVMHost. The 2450 decoder path is not an equivalent
+	 * predictor-state update and causes spectral prediction to drift. */
+	mbe_dequantizeAmbe2250Parms(cur_mp, prev_mp, b);
+	mbe_moveMbeParms(cur_mp, prev_mp);
+"""
+if s.count(old_state) != 1:
+    raise SystemExit("OpenDMR predictor-state block no longer matches pinned source")
+s = s.replace(old_state, new_state)
 mbe.write_text(s)
 
 s = api.read_text()
 if s.count('static const char *version_string = "1.0.0";') != 1:
     raise SystemExit("OpenDMR version string no longer matches pinned source")
 s = s.replace('static const char *version_string = "1.0.0";',
-              'static const char *version_string = "1.0.0-q900fix1";')
+              'static const char *version_string = "1.0.0-q900fix2";')
 pairs = [
     ("enc->enc->set_gain_adjust(1.0f);", "enc->enc->set_gain_adjust(0.0f);"),
     ("enc->enc->set_gain_adjust(powf(10.0f, enc->gain_db / 20.0f));",
