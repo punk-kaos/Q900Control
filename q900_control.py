@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import wave
 from typing import Callable, Sequence
 
 import numpy as np
@@ -9755,6 +9756,59 @@ def analyze_dmr_tx_signal(signal: np.ndarray) -> list[dmr.DmrStatus]:
     return statuses
 
 
+def generate_dmr_vocoder_gain_sweep(prefix: str) -> list[tuple[float, str, int, int]]:
+    """Re-encode the captured 8 kHz mic WAV at several gains and decode locally."""
+    source = f"{prefix}.dmr.mic.wav"
+    try:
+        with wave.open(source, "rb") as handle:
+            if handle.getnchannels() != 1 or handle.getsampwidth() != 2 or handle.getframerate() != 8000:
+                print("DMR gain sweep skipped: mic WAV is not 8 kHz mono S16")
+                return []
+            pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2").copy()
+    except (OSError, wave.Error) as error:
+        print(f"DMR gain sweep skipped: {error}")
+        return []
+
+    usable = len(pcm) - len(pcm) % 160
+    pcm = pcm[:usable]
+    if not len(pcm):
+        return []
+
+    results = []
+    for gain_db in (0.0, 6.0, 12.0, 18.0):
+        gain = 10.0 ** (gain_db / 20.0)
+        scaled_float = pcm.astype(np.float64) * gain
+        clipped = int(np.count_nonzero(np.abs(scaled_float) > 32767.0))
+        scaled = np.clip(np.rint(scaled_float), -32768, 32767).astype(np.int16)
+
+        codec = dmr.OpenDmrCodec(enc=True, dec=True)
+        decoded = np.empty_like(scaled)
+        errors = 0
+        failures = 0
+        try:
+            for start in range(0, len(scaled), 160):
+                frame = codec.encode(scaled[start:start + 160])
+                try:
+                    out, errs = codec.decode(frame)
+                    errors += int(errs)
+                    decoded[start:start + 160] = out
+                except Exception:
+                    failures += 1
+                    decoded[start:start + 160] = 0
+        finally:
+            codec.close()
+
+        tag = f"{int(gain_db):02d}"
+        output = f"{prefix}.dmr.roundtrip.gain+{tag}dB.wav"
+        with wave.open(output, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(decoded.astype("<i2", copy=False).tobytes())
+        results.append((gain_db, output, clipped, errors + failures * 1000000))
+    return results
+
+
 def analyze_dmr_vocoder_recording(prefix: str) -> bool:
     """Report the local PCM -> AMBE -> PCM diagnostic captured during DMR TX."""
     path = f"{prefix}.dmr.vocoder.json"
@@ -9787,6 +9841,20 @@ def analyze_dmr_vocoder_recording(prefix: str) -> bool:
     print(f"  listen: {meta.get('mic_wav')}")
     print(f"          {meta.get('roundtrip_wav')}")
     print(f"  AMBE:   {meta.get('ambe_raw')}")
+    try:
+        sweep = generate_dmr_vocoder_gain_sweep(prefix)
+    except Exception as error:  # noqa: BLE001 - diagnostics must not hide base report
+        print(f"  gain sweep failed: {error}")
+        sweep = []
+    if sweep:
+        print("  offline encoder gain sweep:")
+        for gain_db, output, clipped, packed_errors in sweep:
+            failures = packed_errors // 1000000
+            errors = packed_errors % 1000000
+            print(
+                f"    +{gain_db:.0f} dB -> {output} "
+                f"(input clips {clipped}, decode bit errors {errors}, failures {failures})"
+            )
     return True
 
 
