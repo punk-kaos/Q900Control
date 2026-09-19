@@ -337,6 +337,13 @@ encoding trouble: if the mic WAV is clean but the roundtrip WAV is not, the faul
 is at or inside the vocoder boundary. If both WAVs are intelligible, the remaining
 fault is downstream in DMR burst placement/modulation/RF.
 
+When a DMR vocoder capture is present, the analyzer also re-encodes that exact
+8 kHz mic recording offline at 0, +6, +12 and +18 dB and writes
+`<prefix>.dmr.roundtrip.gain+XXdB.wav` files. Each gain uses a fresh encoder and
+decoder state. This is specifically for detecting an encoder input-level problem
+without repeating RF tests; the analyzer reports how many input samples clipped
+at each gain plus AMBE decode errors/failures.
+
 Repeater uplink transmit is intentionally not enabled yet. It needs RF-slot timing
 alignment to the repeater plus calibration of the Q900 network/ring/RF latency;
 receive of repeater/base-station DMR does not have that restriction.
