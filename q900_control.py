@@ -9809,17 +9809,19 @@ def generate_dmr_vocoder_gain_sweep(prefix: str) -> list[tuple[float, str, int, 
     return results
 
 
-def generate_dmr_vocoder_internal_gain_sweep(prefix: str) -> list[tuple[float, str, int, int]]:
-    """Re-encode captured mic PCM while varying only AMBE's internal gain adjustment."""
+def generate_dmr_vocoder_internal_gain_sweep(
+    prefix: str,
+) -> list[tuple[float, str, str, float, float, int, int]]:
+    """Sweep AMBE internal attenuation and write raw plus level-matched roundtrips."""
     source = f"{prefix}.dmr.mic.wav"
     try:
         with wave.open(source, "rb") as handle:
             if handle.getnchannels() != 1 or handle.getsampwidth() != 2 or handle.getframerate() != 8000:
-                print("DMR internal gain sweep skipped: mic WAV is not 8 kHz mono S16")
+                print("DMR internal attenuation sweep skipped: mic WAV is not 8 kHz mono S16")
                 return []
             pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2").copy()
     except (OSError, wave.Error) as error:
-        print(f"DMR internal gain sweep skipped: {error}")
+        print(f"DMR internal attenuation sweep skipped: {error}")
         return []
 
     usable = len(pcm) - len(pcm) % 160
@@ -9827,39 +9829,60 @@ def generate_dmr_vocoder_internal_gain_sweep(prefix: str) -> list[tuple[float, s
     if not len(pcm):
         return []
 
+    def write_wav(path: str, samples: np.ndarray) -> None:
+        with wave.open(path, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(samples.astype("<i2", copy=False).tobytes())
+
     results = []
-    # q900fix maps this dB control to the encoder's additive gain_adjust term.
-    # Positive dB here is equivalent to raising the analyzed speech gain without
-    # changing the PCM samples themselves.
-    for gain_db in (0.0, 6.0, 12.0, 15.0, 18.0):
+    # Empirically, positive values through q900fix reduce decoded AMBE level.
+    # Call this attenuation in diagnostics so the label matches what the user hears.
+    for attenuation_db in (6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0):
         codec = dmr.OpenDmrCodec(enc=True, dec=True)
-        codec.set_gain_db(gain_db)
+        codec.set_gain_db(attenuation_db)
         decoded = np.empty_like(pcm)
         errors = 0
         failures = 0
         try:
-            for start in range(0, len(pcm), 160):
-                frame = codec.encode(pcm[start:start + 160])
+            for frame_start in range(0, len(pcm), 160):
+                frame = codec.encode(pcm[frame_start:frame_start + 160])
                 try:
                     out, errs = codec.decode(frame)
                     errors += int(errs)
-                    decoded[start:start + 160] = out
+                    decoded[frame_start:frame_start + 160] = out
                 except Exception:
                     failures += 1
-                    decoded[start:start + 160] = 0
+                    decoded[frame_start:frame_start + 160] = 0
         finally:
             codec.close()
 
-        tag = f"{int(gain_db):02d}"
-        output = f"{prefix}.dmr.roundtrip.vocoderGain+{tag}dB.wav"
-        with wave.open(output, "wb") as handle:
-            handle.setnchannels(1)
-            handle.setsampwidth(2)
-            handle.setframerate(8000)
-            handle.writeframes(decoded.astype("<i2", copy=False).tobytes())
-        results.append((gain_db, output, errors, failures))
-    return results
+        d = decoded.astype(np.float64)
+        rms = float(np.sqrt(np.mean(d * d))) if len(d) else 0.0
+        peak = float(np.max(np.abs(d))) if len(d) else 0.0
+        rms_dbfs = 20.0 * np.log10(max(rms / 32768.0, 1e-12))
+        peak_dbfs = 20.0 * np.log10(max(peak / 32768.0, 1e-12))
 
+        tag = f"{int(attenuation_db):02d}"
+        output = f"{prefix}.dmr.roundtrip.vocoderAtten+{tag}dB.wav"
+        write_wav(output, decoded)
+
+        # For listening comparisons, match decoded RMS to -18 dBFS while
+        # keeping at least 1 dB of peak headroom. Distortion already encoded
+        # into the AMBE frame remains; only playback loudness is normalized.
+        target_rms = 32768.0 * 10.0 ** (-18.0 / 20.0)
+        desired_scale = target_rms / max(rms, 1e-9)
+        peak_scale = (32767.0 * 10.0 ** (-1.0 / 20.0)) / max(peak, 1.0)
+        scale = min(desired_scale, peak_scale)
+        matched = np.clip(np.rint(d * scale), -32768, 32767).astype(np.int16)
+        matched_output = f"{prefix}.dmr.roundtrip.vocoderAtten+{tag}dB.matched.wav"
+        write_wav(matched_output, matched)
+
+        results.append(
+            (attenuation_db, output, matched_output, rms_dbfs, peak_dbfs, errors, failures)
+        )
+    return results
 
 def analyze_dmr_vocoder_recording(prefix: str) -> bool:
     """Report the local PCM -> AMBE -> PCM diagnostic captured during DMR TX."""
@@ -9911,12 +9934,14 @@ def analyze_dmr_vocoder_recording(prefix: str) -> bool:
         print(f"  internal vocoder gain sweep failed: {error}")
         internal = []
     if internal:
-        print("  offline AMBE internal-gain sweep (PCM unchanged):")
-        for gain_db, output, errors, failures in internal:
+        print("  offline AMBE attenuation sweep (PCM unchanged):")
+        for attenuation_db, output, matched, rms_dbfs, peak_dbfs, errors, failures in internal:
             print(
-                f"    +{gain_db:.0f} dB -> {output} "
-                f"(decode bit errors {errors}, failures {failures})"
+                f"    {attenuation_db:.0f} dB attenuation -> {output} "
+                f"(decoded rms {rms_dbfs:.1f} dBFS, peak {peak_dbfs:.1f} dBFS, "
+                f"bit errors {errors}, failures {failures})"
             )
+            print(f"      level-matched: {matched}")
     return True
 
 
