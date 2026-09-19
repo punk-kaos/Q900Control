@@ -9538,9 +9538,11 @@ def udp_iq_sender(
     last_send = [0]
     ring_words = [0]
     first_send_ns = None
+    last_send_ns = None
+    tail_start_packet = None
 
     def send(payload: bytes) -> bool:
-        nonlocal first_send_ns
+        nonlocal first_send_ns, last_send_ns
         if mach_time and mach_wait:
             now = mach_time()
             if last_send[0]:
@@ -9555,6 +9557,7 @@ def udp_iq_sender(
             send_errors.value += 1
             return False
         sent_at_ns = time.monotonic_ns()
+        last_send_ns = sent_at_ns
         if first_send_ns is None:
             first_send_ns = sent_at_ns
         packets.value += 1
@@ -9647,6 +9650,7 @@ def udp_iq_sender(
         # append the terminator, and pace it at the real radio rate before close.
         if dmr_tx is not None and first_send_ns is not None:
             try:
+                tail_start_packet = packets.value
                 term = dmr_tx.finish_iq()
                 term_stereo = np.column_stack((term.real, term.imag)).astype(np.float32)
                 dmr_iq_pending = np.concatenate((dmr_iq_pending, term_stereo), axis=0)
@@ -9662,6 +9666,10 @@ def udp_iq_sender(
                 # plus the terminator instead of truncating at an arbitrary 32
                 # datagrams. A one-second cap is only a teardown failsafe.
                 finish_deadline = time.monotonic() + 1.0
+                # A packet contains only `period` seconds of samples. Sleeping
+                # for that duration AFTER DSP/send work drains the radio ring.
+                # Continue on absolute deadlines from the last steady send.
+                finish_send_at = last_send_ns / 1e9 + period
                 while time.monotonic() < finish_deadline:
                     converted_iq = resample_float_frames(
                         dmr_iq_pending, packet_frames, base_ratio, finish_phase
@@ -9676,9 +9684,10 @@ def udp_iq_sender(
                     # Mirror the steady-state ring accounting: one packet-time
                     # elapsed since the previous send, then this datagram arrives.
                     ring_words[0] = max(0, ring_words[0] - packet_words)
+                    pause(max(0.0, finish_send_at - time.monotonic()))
                     send(finish_payload)
                     finish_packets += 1
-                    pause(period)
+                    finish_send_at += period
                 # Keep RF keyed until the radio has consumed what is still in its
                 # internal raw-IQ ring. Otherwise CAT PTT can cut the final LC
                 # terminator even though the host successfully sent it.
@@ -9724,6 +9733,7 @@ def udp_iq_sender(
                 "first_send_after_keyed_ms": (
                     (first_send_ns - keyed_at_ns) / 1e6 if first_send_ns is not None else None
                 ),
+                "tail_start_packet": tail_start_packet,
                 "counters": {
                     "packets": packets.value, "ovf": overflows.value,
                     "skip": underruns.value, "drop": dropped.value,

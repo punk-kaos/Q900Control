@@ -115,6 +115,20 @@ if s.count(": d_gain_adjust(1.0f)") != 1:
     raise SystemExit("OpenDMR encoder default gain no longer matches pinned source")
 s = s.replace(": d_gain_adjust(1.0f)", ": d_gain_adjust(0.0f)")
 
+old_prng = "unsigned int p = PRNG_TABLE[aOrig] >> 1;"
+new_prng = """/* DMR scrambles the 23-bit B codeword with an LCG mask selected by
+	 * the full 12-bit A payload. The pinned OpenDMR table has only 248 entries,
+	 * so indexing it with aOrig reads out of bounds for most voice frames. */
+	uint16_t pr = (uint16_t)(16U * aOrig);
+	unsigned int p = 0U;
+	for (unsigned int i = 0U; i < 23U; i++) {
+		pr = (uint16_t)((173U * (unsigned int)pr + 13849U) & 0xFFFFU);
+		p = (p << 1) | (pr >> 15);
+	}"""
+if s.count(old_prng) != 1:
+    raise SystemExit("OpenDMR B-block PRNG code no longer matches pinned source")
+s = s.replace(old_prng, new_prng)
+
 old_state = """	/* Update decoder state with quantized values */
 	uint8_t ambe_49[49];
 	encode_49bit(ambe_49, b);
@@ -142,7 +156,7 @@ s = api.read_text()
 if s.count('static const char *version_string = "1.0.0";') != 1:
     raise SystemExit("OpenDMR version string no longer matches pinned source")
 s = s.replace('static const char *version_string = "1.0.0";',
-              'static const char *version_string = "1.0.0-q900fix2";')
+              'static const char *version_string = "1.0.0-q900fix3";')
 pairs = [
     ("enc->enc->set_gain_adjust(1.0f);", "enc->enc->set_gain_adjust(0.0f);"),
     ("enc->enc->set_gain_adjust(powf(10.0f, enc->gain_db / 20.0f));",

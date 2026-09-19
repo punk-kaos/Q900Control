@@ -266,14 +266,14 @@ use the Q900Control fixed build:
 bash tools/build_opendmr_fixed.sh
 ```
 
-The builder pins MW0MWZ/OpenDMR 1.0, restores two DMR encoder details that were
-lost when its encoder was simplified from OP25, and writes
+The builder pins MW0MWZ/OpenDMR 1.0, corrects its DMR encoder against proven
+OP25/DVMHost/MMDVM implementations, and writes
 `libopendmr-q900fix.dylib` (macOS) or `libopendmr-q900fix.so` (Linux) beside
 `q900_control.py`. Q900Control prefers that file automatically. An explicit
 `Q900_OPENDMR_LIB=/path/to/library` still takes precedence.
 
-The fixed build restores three DMR encoder details from proven
-OP25/Dudestar/DVMHost implementations. First, OP25 groups the IMBE
+The fixed build restores four DMR encoder details from proven open-source
+implementations. First, OP25 groups the IMBE
 `v_uv_dsn` analysis vector in threes when evaluating DMR harmonics; OpenDMR 1.0
 indexes it directly by harmonic number. Second, the working encoders advance
 their predictive AMBE state after each 20 ms frame with
@@ -283,6 +283,10 @@ Because later spectral coefficients are quantized relative to the reconstructed
 previous frame, that difference can preserve pitch/cadence while keeping speech
 spectrally wrong. Third, the fixed build restores the neutral additive gain
 adjustment of `0.0` used by OP25 instead of OpenDMR 1.0's `1.0` default.
+Fourth, it replaces OpenDMR's truncated 248-entry B-codeword scrambling table
+with the standard generator for all 4,096 possible 12-bit A payloads. The
+original table is indexed by that full payload and therefore reads out of bounds
+for most voice frames, producing structurally invalid AMBE B codewords.
 
 Separately, Q900Control does **not** use OpenDMR 1.0's public
 `opendmr_encode()` frame builder. That path serializes the nine AMBE parameters

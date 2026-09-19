@@ -221,7 +221,12 @@ def ambe_params_bits(params):
  o[47]=(p[8]>>1)&1;o[48]=p[8]&1
  return o
 
-OPENDMR_TX_VERSION="1.0.0-q900fix2"
+def dmr_prng_mask(seed):
+ p=(16*int(seed))&0xFFFF;mask=0
+ for _ in range(23):p=(173*p+13849)&0xFFFF;mask=(mask<<1)|(p>>15)
+ return mask
+
+OPENDMR_TX_VERSION="1.0.0-q900fix3"
 
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
@@ -280,10 +285,12 @@ class OpenDmrCodec:
   words=np.ascontiguousarray(pcm,dtype=np.int16).reshape(-1)
   if len(words)!=160:raise ValueError("OpenDMR encode needs exactly 160 PCM samples")
   inp=(ctypes.c_int16*160).from_buffer_copy(words.tobytes());params=(ctypes.c_int*9)()
-  impl=self._encoder_impl();self._encode_params(impl,inp,params)
-  packed=bits_bytes(ambe_params_bits(params))
+  self._encode_params(self._encoder_impl(),inp,params)
+  return self._encode_49bit(ambe_params_bits(params))
+ def _encode_49bit(self,bits):
+  packed=bits_bytes(np.asarray(bits,dtype=np.uint8).reshape(49))
   raw=(ctypes.c_uint8*len(packed)).from_buffer_copy(packed);ota=(ctypes.c_uint8*9)()
-  self._encode_ota(impl,raw,ota)
+  self._encode_ota(self._encoder_impl(),raw,ota)
   # DmrVoiceTransmitter keeps AMBE frames in canonical A(24)+B(23)+C(25)
   # order and performs the final on-air placement when building each burst.
   return _ota_to_can(bytes_bits(bytes(ota)))
@@ -355,8 +362,8 @@ class DmrVoiceTransmitter:
  def start_iq(self):
   self.started=True
   if hasattr(self.codec,"lib") and getattr(self.codec,"encoder",None) and hasattr(self.codec.lib,"opendmr_encoder_reset"):self.codec.lib.opendmr_encoder_reset(self.codec.encoder)
-  header=self._cycle(build_data_burst(full_lc_payload(self.lc,DT_VOICE_LC_HEADER),self.c.color_code,DT_VOICE_LC_HEADER,self.c.data_sync()))
   pre=self._preamble()
+  header=self._cycle(build_data_burst(full_lc_payload(self.lc,DT_VOICE_LC_HEADER),self.c.color_code,DT_VOICE_LC_HEADER,self.c.data_sync()))
   return np.concatenate((pre,header)) if len(pre) else header
  def _pcm8(self,frame48):
   combined=np.r_[self._audio_hist,np.asarray(frame48,dtype=np.float64)]
@@ -527,6 +534,7 @@ class DmrAirReceiver:
   self._emit()
 
 def self_test():
+ assert dmr_prng_mask(0)==0x216623 and dmr_prng_mask(1)==0x0CEB7F and dmr_prng_mask(4095)==0x0B3F09
  # Independent vector for MW0MWZ/OpenDMR encoder/mbeenc.cpp encode_49bit().
  # The old public encoder incorrectly serialized these fields consecutively
  # (which would produce ab26d56d569a80 for this vector).

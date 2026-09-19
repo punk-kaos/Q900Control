@@ -31,6 +31,15 @@ jobs:
           codec = dmr.OpenDmrCodec(enc=True, dec=True)
           assert "q900fix" in str(codec.lib._name), codec.lib._name
           assert codec.version == dmr.OPENDMR_TX_VERSION, codec.version
+          # The original 248-entry table was indexed by a 12-bit value. Exhaust
+          # every seed against the independently calculated standard DMR mask.
+          for seed in range(4096):
+              bits = np.r_[dmr.int_bits(seed, 12), np.zeros(37, dtype=np.uint8)]
+              encoded = dmr.bytes_bits(codec._encode_49bit(bits))
+              actual = 0
+              for bit in encoded[24:47]:
+                  actual = (actual << 1) | int(bit)
+              assert actual == dmr.dmr_prng_mask(seed), (seed, actual)
           frame = codec.encode(np.zeros(160, dtype=np.int16))
           assert len(frame) == 9
           pcm, errors = codec.decode(frame)
