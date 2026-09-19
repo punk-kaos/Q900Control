@@ -563,6 +563,7 @@ def self_test():
  fake=FakeCodec();tx=DmrVoiceTransmitter(cfg,12000,fake,q900_orientation=False,preamble_ms=0)
  start=tx.start_iq()
  assert len(start)==3*SLOT_SAMPLES,len(start)
+ assert tx.mod.n==3*SLOT_SAMPLES,tx.mod.n
  call=[start]
  # Six voice bursts = one complete superframe. PCM contents are irrelevant to
  # FakeCodec but exercise the streaming 48->8 kHz frame cadence.
