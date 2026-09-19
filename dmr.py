@@ -236,6 +236,8 @@ class OpenDmrCodec:
    raise RuntimeError("DMR TX needs the fixed OpenDMR encoder; run: bash tools/build_opendmr_fixed.sh")
   L.opendmr_decode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));L.opendmr_decode.restype=ctypes.c_bool
   L.opendmr_encode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_uint8));L.opendmr_encode.restype=ctypes.c_bool
+  if hasattr(L,"opendmr_encoder_set_gain"):
+   L.opendmr_encoder_set_gain.argtypes=(ctypes.c_void_p,ctypes.c_int);L.opendmr_encoder_set_gain.restype=None
   if hasattr(L,"opendmr_encoder_reset"):L.opendmr_encoder_reset.argtypes=(ctypes.c_void_p,)
   if hasattr(L,"opendmr_decoder_reset"):L.opendmr_decoder_reset.argtypes=(ctypes.c_void_p,)
   self._encode_params=getattr(L,"_ZN10MBEEncoder17encode_dmr_paramsEPKsPi",None)
@@ -256,6 +258,11 @@ class OpenDmrCodec:
   impl=wrapper[0]
   if not impl:raise RuntimeError("OpenDMR internal encoder is unavailable")
   return impl
+ def set_gain_db(self,gain_db):
+  if not self.encoder:raise RuntimeError("OpenDMR encoder is not open")
+  fn=getattr(self.lib,"opendmr_encoder_set_gain",None)
+  if fn is None:raise RuntimeError("OpenDMR encoder gain API unavailable")
+  fn(self.encoder,int(round(gain_db)))
  def decode(self,frame):
   inp=(ctypes.c_uint8*9).from_buffer_copy(frame);out=(ctypes.c_int16*160)();err=ctypes.c_int()
   if not self.lib.opendmr_decode(self.decoder,inp,out,ctypes.byref(err)):raise RuntimeError("OpenDMR decode failed")
