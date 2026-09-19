@@ -10441,6 +10441,8 @@ def _sdr_tx_self_test() -> None:
         raw = pack_iq_words(tone, False, False)
 
         def recording_file(path: str, mode: str = "r"):
+            if path == "test.dmr.vocoder.json":
+                raise FileNotFoundError(path)
             if path == "test.iq.tx.json":
                 return io.StringIO(json.dumps({
                     "ptt_confirmation_ms": 125.0,
