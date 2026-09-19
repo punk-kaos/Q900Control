@@ -340,9 +340,15 @@ fault is downstream in DMR burst placement/modulation/RF.
 When a DMR vocoder capture is present, the analyzer also re-encodes that exact
 8 kHz mic recording offline at 0, +6, +12 and +18 dB and writes
 `<prefix>.dmr.roundtrip.gain+XXdB.wav` files. Each gain uses a fresh encoder and
-decoder state. This is specifically for detecting an encoder input-level problem
-without repeating RF tests; the analyzer reports how many input samples clipped
-at each gain plus AMBE decode errors/failures.
+decoder state. This detects an encoder input-level problem without repeating RF
+tests; the analyzer reports input clipping plus AMBE decode errors/failures.
+
+A second sweep leaves the PCM samples completely unchanged and varies only the
+AMBE encoder's internal gain calibration at 0, +6, +12, +15 and +18 dB, writing
+`<prefix>.dmr.roundtrip.vocoderGain+XXdB.wav`. This separates "the IMBE front-end
+needs hotter PCM" from "the AMBE gain quantizer is calibrated wrong." The fixed
+OpenDMR build maps this dB control into the additive gain-adjust term used by the
+OP25-derived DMR encoder.
 
 Repeater uplink transmit is intentionally not enabled yet. It needs RF-slot timing
 alignment to the repeater plus calibration of the Q900 network/ring/RF latency;
