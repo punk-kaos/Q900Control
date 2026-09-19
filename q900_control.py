@@ -10036,6 +10036,50 @@ def analyze_dmr_vocoder_recording(prefix: str) -> bool:
     return True
 
 
+def replay_q900_tx_ring(
+    stamps: np.ndarray, packet_frames: int, prime_packets: int = 0
+) -> dict[str, float | int | None]:
+    """Replay firmware TX-ring depth from actual host send timestamps.
+
+    Firmware checks depth before appending each datagram. Below the shallow
+    threshold it duplicates one stereo frame; above the deep threshold it drops
+    one. The replay includes that +/-2-word correction and reports post-prime
+    crossings separately because startup corrections occur only in the DMR
+    preamble/LC acquisition cushion.
+    """
+    ts=np.asarray(stamps,dtype=np.uint64).reshape(-1)
+    packet_words=int(packet_frames)*2
+    depth=0.0;prev=None;minimum=float("inf");maximum=0.0
+    shallow=deep=post_shallow=post_deep=0
+    first_post=None
+    for index,stamp in enumerate(ts):
+        now=int(stamp)
+        if prev is not None:
+            depth=max(0.0,depth-(now-prev)*1e-9*RADIO_CONSUME_WORDS_PER_S)
+        prev=now
+        minimum=min(minimum,depth);maximum=max(maximum,depth)
+        correction=0
+        if depth<RADIO_RING_SHALLOW_WORDS:
+            shallow+=1;correction=2
+            if index>=prime_packets:
+                post_shallow+=1
+                if first_post is None:first_post=index
+        elif depth>RADIO_RING_DEEP_WORDS:
+            deep+=1;correction=-2
+            if index>=prime_packets:
+                post_deep+=1
+                if first_post is None:first_post=index
+        depth=min(float(RADIO_RING_WORDS-1),max(0.0,depth+packet_words+correction))
+    return {
+        "min_pre_words":0.0 if not len(ts) else minimum,
+        "max_pre_words":maximum,
+        "shallow":shallow,"deep":deep,
+        "post_prime_shallow":post_shallow,"post_prime_deep":post_deep,
+        "first_post_prime_packet":first_post,
+        "final_words":depth,
+    }
+
+
 def analyze_iq_tx_recording(prefix: str) -> None:
     """Measure tone purity and packet timing in a recorded SDR I/Q stream."""
     have_vocoder = analyze_dmr_vocoder_recording(prefix)
@@ -10103,6 +10147,23 @@ def analyze_iq_tx_recording(prefix: str) -> None:
                 f"  send gaps: median {np.median(gaps_ms):.3f} ms, "
                 f"p99 {np.percentile(gaps_ms, 99):.3f} ms, max {np.max(gaps_ms):.3f} ms"
             )
+        prime_count=int(metadata.get("prime_packets") or 0)
+        ring_replay=replay_q900_tx_ring(stamps,packet_frames,prime_count)
+        print(
+            f"  timestamp ring replay: pre-send min {ring_replay['min_pre_words']:.0f}, "
+            f"max {ring_replay['max_pre_words']:.0f} words; "
+            f"post-prime shallow {ring_replay['post_prime_shallow']}, "
+            f"deep {ring_replay['post_prime_deep']}"
+        )
+        if ring_replay["post_prime_shallow"] or ring_replay["post_prime_deep"]:
+            first=ring_replay["first_post_prime_packet"]
+            when=(int(stamps[int(first)])-int(stamps[0]))/1e9 if first is not None else 0.0
+            print(
+                f"  WARNING: Q900 firmware sample correction predicted after priming "
+                f"(first at packet {first}, {when:.3f} s)"
+            )
+        else:
+            print("  timestamp ring replay: no correction threshold crossing after priming")
         if metadata:
             print(
                 f"  ring: target {metadata.get('ring_target_words')} words, "
@@ -10308,6 +10369,28 @@ def _dmr_tx_continuity_self_test() -> None:
     # both sides that a normal scheduler hiccup cannot trigger sample insertion.
     assert pre_send - RADIO_RING_SHALLOW_WORDS >= int(0.018 * RADIO_CONSUME_WORDS_PER_S)
     assert RADIO_RING_DEEP_WORDS - settled >= int(0.006 * RADIO_CONSUME_WORDS_PER_S)
+
+    # Replay real send timestamps using the firmware's pre-append correction
+    # test. Normal priming + 4 ms DMR cadence must stay correction-free once
+    # priming is complete.
+    prime_ns=np.arange(prime,dtype=np.uint64)*int(gap*1e9)
+    steady_start=int(prime_ns[-1])+int(period*1e9)
+    steady_ns=steady_start+np.arange(100,dtype=np.uint64)*int(period*1e9)
+    safe=np.r_[prime_ns,steady_ns]
+    replay=replay_q900_tx_ring(safe,DMR_IQ_PACKET_FRAMES,prime)
+    assert replay["post_prime_shallow"]==0 and replay["post_prime_deep"]==0,replay
+
+    # A long host stall must be visible as a shallow correction prediction.
+    starved=safe.copy()
+    starved[prime:]+=30_000_000
+    replay=replay_q900_tx_ring(starved,DMR_IQ_PACKET_FRAMES,prime)
+    assert replay["post_prime_shallow"]>0,replay
+
+    # The old analog-style 1 ms catch-up burst grows the ring by about 288
+    # words per packet and must cross the deep threshold after priming.
+    catchup=np.r_[prime_ns,steady_start+np.arange(6,dtype=np.uint64)*1_000_000]
+    replay=replay_q900_tx_ring(catchup,DMR_IQ_PACKET_FRAMES,prime)
+    assert replay["post_prime_deep"]>0,replay
 
 
 def _rx_continuity_self_test() -> None:
