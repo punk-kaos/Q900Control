@@ -113,7 +113,7 @@ if s.count(old) != 1:
 s = s.replace(old, new)
 if s.count(": d_gain_adjust(1.0f)") != 1:
     raise SystemExit("OpenDMR encoder default gain no longer matches pinned source")
-s = s.replace(": d_gain_adjust(1.0f)", ": d_gain_adjust(0.0f)")
+s = s.replace(": d_gain_adjust(1.0f)", ": d_gain_adjust(2.5f)")
 
 old_prng = "unsigned int p = PRNG_TABLE[aOrig] >> 1;"
 new_prng = """/* DMR scrambles the 23-bit B codeword with an LCG mask selected by
@@ -156,7 +156,7 @@ s = api.read_text()
 if s.count('static const char *version_string = "1.0.0";') != 1:
     raise SystemExit("OpenDMR version string no longer matches pinned source")
 s = s.replace('static const char *version_string = "1.0.0";',
-              'static const char *version_string = "1.0.0-q900fix4";')
+              'static const char *version_string = "1.0.0-q900fix5";')
 
 # The upstream public encoder claims to return DVSI/canonical A+B+C frames, but
 # it serializes b[0]..b[8] consecutively instead of using DMR's 49-bit parameter
@@ -231,10 +231,15 @@ if s.count(hook_anchor) != 1:
     raise SystemExit("OpenDMR public encode function anchor no longer matches pinned source")
 s = s.replace(hook_anchor, hook)
 
+# USRP2DMR, a long-running OP25-derived DMR bridge, explicitly uses a 2.5
+# AMBE model gain adjustment. Keep that operating point for normal Q900 TX,
+# including after opendmr_encoder_reset(); DmrVoiceTransmitter resets at every
+# call start. Non-zero diagnostic values retain the existing q900 dB sweep
+# conversion so prior recordings remain directly comparable.
 pairs = [
-    ("enc->enc->set_gain_adjust(1.0f);", "enc->enc->set_gain_adjust(0.0f);"),
+    ("enc->enc->set_gain_adjust(1.0f);", "enc->enc->set_gain_adjust(2.5f);"),
     ("enc->enc->set_gain_adjust(powf(10.0f, enc->gain_db / 20.0f));",
-     "enc->enc->set_gain_adjust(-((float)enc->gain_db / 6.020599913f));"),
+     "enc->enc->set_gain_adjust(enc->gain_db == 0 ? 2.5f : -((float)enc->gain_db / 6.020599913f));"),
 ]
 for old, new in pairs:
     count = s.count(old)
