@@ -9809,6 +9809,58 @@ def generate_dmr_vocoder_gain_sweep(prefix: str) -> list[tuple[float, str, int, 
     return results
 
 
+def generate_dmr_vocoder_internal_gain_sweep(prefix: str) -> list[tuple[float, str, int, int]]:
+    """Re-encode captured mic PCM while varying only AMBE's internal gain adjustment."""
+    source = f"{prefix}.dmr.mic.wav"
+    try:
+        with wave.open(source, "rb") as handle:
+            if handle.getnchannels() != 1 or handle.getsampwidth() != 2 or handle.getframerate() != 8000:
+                print("DMR internal gain sweep skipped: mic WAV is not 8 kHz mono S16")
+                return []
+            pcm = np.frombuffer(handle.readframes(handle.getnframes()), dtype="<i2").copy()
+    except (OSError, wave.Error) as error:
+        print(f"DMR internal gain sweep skipped: {error}")
+        return []
+
+    usable = len(pcm) - len(pcm) % 160
+    pcm = pcm[:usable]
+    if not len(pcm):
+        return []
+
+    results = []
+    # q900fix maps this dB control to the encoder's additive gain_adjust term.
+    # Positive dB here is equivalent to raising the analyzed speech gain without
+    # changing the PCM samples themselves.
+    for gain_db in (0.0, 6.0, 12.0, 15.0, 18.0):
+        codec = dmr.OpenDmrCodec(enc=True, dec=True)
+        codec.set_gain_db(gain_db)
+        decoded = np.empty_like(pcm)
+        errors = 0
+        failures = 0
+        try:
+            for start in range(0, len(pcm), 160):
+                frame = codec.encode(pcm[start:start + 160])
+                try:
+                    out, errs = codec.decode(frame)
+                    errors += int(errs)
+                    decoded[start:start + 160] = out
+                except Exception:
+                    failures += 1
+                    decoded[start:start + 160] = 0
+        finally:
+            codec.close()
+
+        tag = f"{int(gain_db):02d}"
+        output = f"{prefix}.dmr.roundtrip.vocoderGain+{tag}dB.wav"
+        with wave.open(output, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(8000)
+            handle.writeframes(decoded.astype("<i2", copy=False).tobytes())
+        results.append((gain_db, output, errors, failures))
+    return results
+
+
 def analyze_dmr_vocoder_recording(prefix: str) -> bool:
     """Report the local PCM -> AMBE -> PCM diagnostic captured during DMR TX."""
     path = f"{prefix}.dmr.vocoder.json"
@@ -9847,11 +9899,23 @@ def analyze_dmr_vocoder_recording(prefix: str) -> bool:
         print(f"  gain sweep failed: {error}")
         sweep = []
     if sweep:
-        print("  offline encoder gain sweep:")
+        print("  offline PCM gain sweep:")
         for gain_db, output, clipped, errors, failures in sweep:
             print(
                 f"    +{gain_db:.0f} dB -> {output} "
                 f"(input clips {clipped}, decode bit errors {errors}, failures {failures})"
+            )
+    try:
+        internal = generate_dmr_vocoder_internal_gain_sweep(prefix)
+    except Exception as error:  # noqa: BLE001
+        print(f"  internal vocoder gain sweep failed: {error}")
+        internal = []
+    if internal:
+        print("  offline AMBE internal-gain sweep (PCM unchanged):")
+        for gain_db, output, errors, failures in internal:
+            print(
+                f"    +{gain_db:.0f} dB -> {output} "
+                f"(decode bit errors {errors}, failures {failures})"
             )
     return True
 
