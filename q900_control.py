@@ -9453,6 +9453,9 @@ def udp_iq_sender(
     settled_words = prime_packets * packet_words - int(
         prime_packets * burst_gap * RADIO_CONSUME_WORDS_PER_S
     )
+    max_debt_packets = max(
+        1, (settled_words - RADIO_RING_SHALLOW_WORDS) // max(packet_words, 1)
+    )
     ratio_trim = 0.0
     ratio_smooth = (0.0, 0.0)
     resample_phase = 0.0
@@ -9594,7 +9597,7 @@ def udp_iq_sender(
             ring_words[0] = max(0, ring_words[0] - packet_words)
             ring_depth.value = ring_words[0]
             if not send_scheduled():
-                debt_packets = min(debt_packets + 1, IQ_MAX_DEBT_PACKETS)
+                debt_packets = min(debt_packets + 1, max_debt_packets)
             if debt_packets and send_scheduled():
                 debt_packets -= 1
             if mach_time and mach_wait:
@@ -9606,7 +9609,7 @@ def udp_iq_sender(
                     behind = int(lateness / period)
                     burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
                     for _ in range(burst):
-                        ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+                        ring_words[0] = max(0, ring_words[0] - packet_words)
                         send_scheduled()
                     deadline += burst * period_ticks
                     if (mach_time() - deadline) / ticks_per_second > period:
@@ -9614,7 +9617,7 @@ def udp_iq_sender(
                         shortfall = max(int((now - deadline) / ticks_per_second / period), 0)
                         ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
                         debt_packets = min(
-                            debt_packets + shortfall, IQ_MAX_DEBT_PACKETS
+                            debt_packets + shortfall, max_debt_packets
                         )
                         deadline = now
             else:
@@ -9625,15 +9628,15 @@ def udp_iq_sender(
                     behind = int(lateness / period)
                     burst = min(behind, NETWORK_TX_MAX_CATCHUP_PACKETS)
                     for _ in range(burst):
-                        ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+                        ring_words[0] = max(0, ring_words[0] - packet_words)
                         send_scheduled()
                     deadline += burst * period
                     if time.monotonic() - deadline > period:
                         now = time.monotonic()
                         shortfall = max(int((now - deadline) / period), 0)
-                        ring_words[0] = max(0, ring_words[0] - shortfall * IQ_PACKET_WORDS)
+                        ring_words[0] = max(0, ring_words[0] - shortfall * packet_words)
                         debt_packets = min(
-                            debt_packets + shortfall, IQ_MAX_DEBT_PACKETS
+                            debt_packets + shortfall, max_debt_packets
                         )
                         deadline = now
                 else:
@@ -9672,7 +9675,7 @@ def udp_iq_sender(
                     )
                     # Mirror the steady-state ring accounting: one packet-time
                     # elapsed since the previous send, then this datagram arrives.
-                    ring_words[0] = max(0, ring_words[0] - IQ_PACKET_WORDS)
+                    ring_words[0] = max(0, ring_words[0] - packet_words)
                     send(finish_payload)
                     finish_packets += 1
                     pause(period)

@@ -221,6 +221,8 @@ def ambe_params_bits(params):
  o[47]=(p[8]>>1)&1;o[48]=p[8]&1
  return o
 
+OPENDMR_TX_VERSION="1.0.0-q900fix2"
+
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
   paths=[os.getenv("Q900_OPENDMR_LIB"),str(Path(__file__).with_name("libopendmr-q900fix.dylib")),str(Path(__file__).with_name("libopendmr-q900fix.so")),str(Path(__file__).with_name("libopendmr.dylib")),str(Path(__file__).with_name("libopendmr.so")),"/usr/local/lib/libopendmr.dylib","/usr/local/lib/libopendmr.so"];self.lib=None
@@ -232,8 +234,9 @@ class OpenDmrCodec:
   L.opendmr_decoder_create.restype=ctypes.c_void_p;L.opendmr_encoder_create.restype=ctypes.c_void_p
   L.opendmr_decoder_destroy.argtypes=(ctypes.c_void_p,);L.opendmr_encoder_destroy.argtypes=(ctypes.c_void_p,)
   allow_stock=os.getenv("Q900_DMR_ALLOW_STOCK_OPENDMR","0").lower() in ("1","true","yes")
-  if enc and "q900fix" not in self.version and not allow_stock:
-   raise RuntimeError("DMR TX needs the fixed OpenDMR encoder; run: bash tools/build_opendmr_fixed.sh")
+  if enc and self.version!=OPENDMR_TX_VERSION and not allow_stock:
+   loaded=getattr(L,"_name","OpenDMR")
+   raise RuntimeError(f"DMR TX needs {OPENDMR_TX_VERSION}; loaded {self.version or 'unknown'} from {loaded}. Run: bash tools/build_opendmr_fixed.sh")
   L.opendmr_decode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));L.opendmr_decode.restype=ctypes.c_bool
   L.opendmr_encode.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_uint8));L.opendmr_encode.restype=ctypes.c_bool
   if hasattr(L,"opendmr_encoder_set_gain"):
@@ -360,20 +363,32 @@ class DmrVoiceTransmitter:
   filtered=np.convolve(combined,self._audio_taps,mode="valid")
   self._audio_hist=combined[-(len(self._audio_taps)-1):]
   return np.clip(np.rint(filtered[::6]*32767),-32768,32767).astype(np.int16)
+ def _queue_audio_frame(self,frame48):
+  pcm8=self._pcm8(frame48);frame=self.codec.encode(pcm8)
+  if self.diag:self.diag.capture(pcm8,frame)
+  self.ambe.append(frame)
+ def _emit_ready_voice(self,out):
+  while len(self.ambe)>=3:
+   frames=[self.ambe.popleft() for _ in range(3)]
+   burst=build_voice_burst(frames,self.lc,self.c.color_code,self.idx,self.c.slot,self.c.voice_sync())
+   out.append(self._cycle(burst));self.idx=(self.idx+1)%6
  def feed_pcm(self,x):
   self.pcm=np.r_[self.pcm,np.asarray(x,dtype=np.float32).reshape(-1)];out=[]
   if not self.started:out.append(self.start_iq())
   while len(self.pcm)>=960:
-   f=self.pcm[:960];self.pcm=self.pcm[960:];pcm8=self._pcm8(f);frame=self.codec.encode(pcm8)
-   if self.diag:self.diag.capture(pcm8,frame)
-   self.ambe.append(frame)
-   if len(self.ambe)>=3:
-    frames=[self.ambe.popleft() for _ in range(3)]
-    burst=build_voice_burst(frames,self.lc,self.c.color_code,self.idx,self.c.slot,self.c.voice_sync())
-    out.append(self._cycle(burst));self.idx=(self.idx+1)%6
+   f=self.pcm[:960];self.pcm=self.pcm[960:];self._queue_audio_frame(f)
+   self._emit_ready_voice(out)
   return np.concatenate(out) if out else np.empty(0,dtype=np.complex64)
  def finish_iq(self):
-  return self._cycle(build_data_burst(full_lc_payload(self.lc,DT_TERMINATOR_WITH_LC),self.c.color_code,DT_TERMINATOR_WITH_LC,self.c.data_sync()))
+  out=[]
+  if not self.started:out.append(self.start_iq())
+  if len(self.pcm):
+   final=np.zeros(960,dtype=np.float32);final[:len(self.pcm)]=self.pcm
+   self.pcm=np.empty(0,dtype=np.float32);self._queue_audio_frame(final)
+  while self.ambe and len(self.ambe)<3:self._queue_audio_frame(np.zeros(960,dtype=np.float32))
+  self._emit_ready_voice(out)
+  out.append(self._cycle(build_data_burst(full_lc_payload(self.lc,DT_TERMINATOR_WITH_LC),self.c.color_code,DT_TERMINATOR_WITH_LC,self.c.data_sync())))
+  return np.concatenate(out) if len(out)>1 else out[0]
  def close(self):
   if self.diag:self.diag.close();self.diag=None
   if hasattr(self.codec,"close"):self.codec.close()
@@ -555,6 +570,14 @@ def self_test():
  assert any(st.sync=="MS_VOICE" and st.ambe_frames>=3 for st in statuses),[(st.sync,st.ambe_frames) for st in statuses]
  assert any(st.message.startswith("terminator") for st in statuses),[(st.sync,st.message) for st in statuses]
  rxcall.close()
+ # PTT release must not discard a partial 20 ms PCM frame or 1-2 AMBE frames.
+ # Four full frames plus half a frame become six AMBE frames: the partial PCM
+ # is zero-padded once, then one silence AMBE frame completes the 60 ms burst.
+ tail_fake=FakeCodec();tail_tx=DmrVoiceTransmitter(cfg,12000,tail_fake,q900_orientation=False,preamble_ms=0)
+ tail_tx.start_iq();tail_tx.feed_pcm(np.ones(960*4+480,dtype=np.float32)*.1)
+ tail_end=tail_tx.finish_iq()
+ assert tail_fake.n==6 and len(tail_tx.pcm)==0 and len(tail_tx.ambe)==0
+ assert len(tail_end)==2*SLOT_SAMPLES,len(tail_end)
 
  got=[];rx=DmrAirReceiver(status_output=lambda s:got.append(DmrStatus(**{f:getattr(s,f) for f in s.__dataclass_fields__})));m=Dmr4FskModulator(12000,False);z=m.modulate(dmo_cycle_bits(burst))
  for i in range(0,len(z),173):rx.feed(z[i:i+173],12000)

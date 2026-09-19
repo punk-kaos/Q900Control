@@ -2,7 +2,7 @@ name: SDR DMR self-test
 
 on:
   push:
-    branches: ["feature/sdr-dmr"]
+    branches: ["main", "feature/sdr-dmr"]
   pull_request:
     paths:
       - "dmr.py"
@@ -30,6 +30,7 @@ jobs:
           import dmr
           codec = dmr.OpenDmrCodec(enc=True, dec=True)
           assert "q900fix" in str(codec.lib._name), codec.lib._name
+          assert codec.version == dmr.OPENDMR_TX_VERSION, codec.version
           frame = codec.encode(np.zeros(160, dtype=np.int16))
           assert len(frame) == 9
           pcm, errors = codec.decode(frame)
@@ -42,7 +43,15 @@ jobs:
               cfg, codec=dmr.OpenDmrCodec(enc=True),
               diagnostic_prefix="/tmp/q900-dmr-vocoder", preamble_ms=0,
           )
-          tx.feed_pcm(np.zeros(960 * 3, dtype=np.float32))
+          t = np.arange(960 * 3, dtype=np.float64) / dmr.SAMPLE_RATE
+          voiced = (
+              0.30 * np.sin(2 * np.pi * 137 * t)
+              + 0.18 * np.sin(2 * np.pi * 274 * t)
+              + 0.10 * np.sin(2 * np.pi * 411 * t)
+              + 0.06 * np.sin(2 * np.pi * 685 * t)
+          )
+          voiced *= 0.75 + 0.25 * np.sin(2 * np.pi * 7 * t)
+          tx.feed_pcm(voiced.astype(np.float32))
           tx.close()
           import json, wave
           with open("/tmp/q900-dmr-vocoder.dmr.vocoder.json") as h:
@@ -52,8 +61,15 @@ jobs:
           assert meta["decode_errors"] == 0
           with wave.open("/tmp/q900-dmr-vocoder.dmr.mic.wav", "rb") as w:
               assert w.getframerate() == 8000 and w.getnframes() == 480
+              mic = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64)
           with wave.open("/tmp/q900-dmr-vocoder.dmr.roundtrip.wav", "rb") as w:
               assert w.getframerate() == 8000 and w.getnframes() == 480
+              roundtrip = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64)
+          mic_rms = float(np.sqrt(np.mean(mic * mic)))
+          round_rms = float(np.sqrt(np.mean(roundtrip * roundtrip)))
+          assert mic_rms > 1000.0, mic_rms
+          assert round_rms > 100.0, round_rms
+          assert np.max(np.abs(roundtrip)) > 500.0
           assert len(open("/tmp/q900-dmr-vocoder.dmr.ambe.raw", "rb").read()) == 27
 
           import q900_control
