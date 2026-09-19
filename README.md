@@ -323,8 +323,19 @@ python3 q900_control.py --analyze-iq-tx /tmp/dmrtx
 
 For a DMR recording the analyzer decodes the exact host-to-Q900 I/Q stream and
 reports sync quality, source, destination/TG, color code, AMBE count and sender
-timing. This separates an air-interface/framing problem from anything introduced
-inside the radio after UDP ingress.
+timing. It also records the vocoder boundary itself:
+
+- `<prefix>.dmr.mic.wav` — exact 8 kHz PCM presented to the AMBE encoder
+- `<prefix>.dmr.ambe.raw` — consecutive 9-byte AMBE frames produced by the encoder
+- `<prefix>.dmr.roundtrip.wav` — those same AMBE frames immediately decoded back to PCM
+- `<prefix>.dmr.vocoder.json` — frame count, codec version, RMS/peak levels, clipping,
+  decoder bit-error count and decode failures
+
+The analyzer prints those vocoder statistics before the I/Q report. Listening to
+the two WAV files cleanly separates microphone/decimator trouble from AMBE
+encoding trouble: if the mic WAV is clean but the roundtrip WAV is not, the fault
+is at or inside the vocoder boundary. If both WAVs are intelligible, the remaining
+fault is downstream in DMR burst placement/modulation/RF.
 
 Repeater uplink transmit is intentionally not enabled yet. It needs RF-slot timing
 alignment to the repeater plus calibration of the Q900 network/ring/RF latency;
