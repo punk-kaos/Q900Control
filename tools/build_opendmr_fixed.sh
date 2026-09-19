@@ -26,6 +26,18 @@ mbe = root / "encoder" / "mbeenc.cpp"
 api = root / "opendmr.cpp"
 hdr = root / "decoder" / "mbelib.h"
 makefile = root / "Makefile"
+state_src = root / "decoder" / "ambe3600x2250_q900.c"
+
+# DVMHost's file also contains tone helpers that depend on its older public
+# mbe_tone type. Q900Control only needs the DMR predictor dequantizer; keep that
+# translation unit deliberately minimal so it is compiled against mbelib-neo's
+# current mbe_parms ABI.
+t = state_src.read_text()
+marker = "int mbe_dequantizeAmbeTone"
+pos = t.find(marker)
+if pos < 0:
+    raise SystemExit("DVMHost 2250 source no longer contains expected tone helper marker")
+state_src.write_text(t[:pos])
 
 s = hdr.read_text()
 anchor = "MBE_API int mbe_decodeAmbe2450Parms(char* ambe_d, mbe_parms* cur_mp, mbe_parms* prev_mp);"
