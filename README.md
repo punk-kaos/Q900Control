@@ -272,13 +272,17 @@ lost when its encoder was simplified from OP25, and writes
 `q900_control.py`. Q900Control prefers that file automatically. An explicit
 `Q900_OPENDMR_LIB=/path/to/library` still takes precedence.
 
-The first fixed detail is AMBE voiced/unvoiced analysis. OP25 groups the IMBE
+The fixed build restores three DMR encoder details from proven
+OP25/Dudestar/DVMHost implementations. First, OP25 groups the IMBE
 `v_uv_dsn` analysis vector in threes when evaluating DMR harmonics; OpenDMR 1.0
-indexes it directly by harmonic number. That preserves speech pitch and cadence
-but corrupts the harmonic voicing pattern, producing speech-shaped yet
-unintelligible audio. The fixed build restores the OP25 DMR indexing. It also
-restores the encoder's neutral gain-adjust default: OP25 uses an additive
-`0.0`, whereas OpenDMR 1.0 initializes that parameter to `1.0`.
+indexes it directly by harmonic number. Second, the working encoders advance
+their predictive AMBE state after each 20 ms frame with
+`mbe_dequantizeAmbe2250Parms()`; OpenDMR 1.0 instead repacks the 49 bits and
+calls `mbe_decodeAmbe2450Parms()`, which is not the same predictor-state update.
+Because later spectral coefficients are quantized relative to the reconstructed
+previous frame, that difference can preserve pitch/cadence while keeping speech
+spectrally wrong. Third, the fixed build restores the neutral additive gain
+adjustment of `0.0` used by OP25 instead of OpenDMR 1.0's `1.0` default.
 
 Separately, Q900Control does **not** use OpenDMR 1.0's public
 `opendmr_encode()` frame builder. That path serializes the nine AMBE parameters
