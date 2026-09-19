@@ -156,7 +156,81 @@ s = api.read_text()
 if s.count('static const char *version_string = "1.0.0";') != 1:
     raise SystemExit("OpenDMR version string no longer matches pinned source")
 s = s.replace('static const char *version_string = "1.0.0";',
-              'static const char *version_string = "1.0.0-q900fix3";')
+              'static const char *version_string = "1.0.0-q900fix4";')
+
+# The upstream public encoder claims to return DVSI/canonical A+B+C frames, but
+# it serializes b[0]..b[8] consecutively instead of using DMR's 49-bit parameter
+# permutation, and it does not drop the extended Golay parity bit from B. Patch
+# that public path so Q900Control can use opendmr_encode() directly and stop
+# depending on private/mangled MBEEncoder C++ symbols.
+old_pack = """    /* Pack b[9] into 49 bits */
+    static const int b_lengths[9] = {7, 5, 5, 9, 7, 5, 4, 4, 3};
+    uint8_t bits49[49];
+    int pos = 0;
+    for (int i = 0; i < 9; i++) {
+        int val = b[i];
+        for (int j = b_lengths[i] - 1; j >= 0; j--) {
+            bits49[pos++] = (val >> j) & 1;
+        }
+    }
+"""
+new_pack = """    /* DMR AMBE 3600x2450 parameter permutation (OP25/OpenDMR encode_49bit). */
+    uint8_t bits49[49] = {0};
+    bits49[0] = (b[0] >> 6) & 1; bits49[1] = (b[0] >> 5) & 1;
+    bits49[2] = (b[0] >> 4) & 1; bits49[3] = (b[0] >> 3) & 1;
+    bits49[4] = (b[1] >> 4) & 1; bits49[5] = (b[1] >> 3) & 1;
+    bits49[6] = (b[1] >> 2) & 1; bits49[7] = (b[1] >> 1) & 1;
+    bits49[8] = (b[2] >> 4) & 1; bits49[9] = (b[2] >> 3) & 1;
+    bits49[10] = (b[2] >> 2) & 1; bits49[11] = (b[2] >> 1) & 1;
+    bits49[12] = (b[3] >> 8) & 1; bits49[13] = (b[3] >> 7) & 1;
+    bits49[14] = (b[3] >> 6) & 1; bits49[15] = (b[3] >> 5) & 1;
+    bits49[16] = (b[3] >> 4) & 1; bits49[17] = (b[3] >> 3) & 1;
+    bits49[18] = (b[3] >> 2) & 1; bits49[19] = (b[3] >> 1) & 1;
+    bits49[20] = (b[4] >> 6) & 1; bits49[21] = (b[4] >> 5) & 1;
+    bits49[22] = (b[4] >> 4) & 1; bits49[23] = (b[4] >> 3) & 1;
+    bits49[24] = (b[5] >> 4) & 1; bits49[25] = (b[5] >> 3) & 1;
+    bits49[26] = (b[5] >> 2) & 1; bits49[27] = (b[5] >> 1) & 1;
+    bits49[28] = (b[6] >> 3) & 1; bits49[29] = (b[6] >> 2) & 1;
+    bits49[30] = (b[6] >> 1) & 1; bits49[31] = (b[7] >> 3) & 1;
+    bits49[32] = (b[7] >> 2) & 1; bits49[33] = (b[7] >> 1) & 1;
+    bits49[34] = (b[8] >> 2) & 1; bits49[35] = b[1] & 1;
+    bits49[36] = b[2] & 1; bits49[37] = (b[0] >> 2) & 1;
+    bits49[38] = (b[0] >> 1) & 1; bits49[39] = b[0] & 1;
+    bits49[40] = b[3] & 1; bits49[41] = (b[4] >> 2) & 1;
+    bits49[42] = (b[4] >> 1) & 1; bits49[43] = b[4] & 1;
+    bits49[44] = b[5] & 1; bits49[45] = b[6] & 1;
+    bits49[46] = b[7] & 1; bits49[47] = (b[8] >> 1) & 1;
+    bits49[48] = b[8] & 1;
+"""
+if s.count(old_pack) != 1:
+    raise SystemExit("OpenDMR public AMBE packer no longer matches pinned source")
+s = s.replace(old_pack, new_pack)
+
+old_b = "    uint32_t b_codeword = CGolay24128::encode23127(c1);"
+new_b = "    uint32_t b_codeword = CGolay24128::encode23127(c1) >> 1;"
+if s.count(old_b) != 1:
+    raise SystemExit("OpenDMR public B Golay code no longer matches pinned source")
+s = s.replace(old_b, new_b)
+
+# Stable test hook for verifying canonical frame construction without relying on
+# private C++ ABI. Runtime TX uses opendmr_encode(); this helper is CI-only.
+hook_anchor = """bool opendmr_encode(opendmr_encoder_t *enc,
+                    const int16_t pcm[OPENDMR_PCM_SAMPLES],
+                    uint8_t ambe[OPENDMR_AMBE_FRAME_BYTES])
+"""
+hook = """extern "C" bool opendmr_q900_encode_params(const int b[9], uint8_t ambe[OPENDMR_AMBE_FRAME_BYTES])
+{
+    if (!b || !ambe)
+        return false;
+    encode_ambe_frame(b, ambe);
+    return true;
+}
+
+""" + hook_anchor
+if s.count(hook_anchor) != 1:
+    raise SystemExit("OpenDMR public encode function anchor no longer matches pinned source")
+s = s.replace(hook_anchor, hook)
+
 pairs = [
     ("enc->enc->set_gain_adjust(1.0f);", "enc->enc->set_gain_adjust(0.0f);"),
     ("enc->enc->set_gain_adjust(powf(10.0f, enc->gain_db / 20.0f));",

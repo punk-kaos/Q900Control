@@ -31,17 +31,25 @@ jobs:
           codec = dmr.OpenDmrCodec(enc=True, dec=True)
           assert "q900fix" in str(codec.lib._name), codec.lib._name
           assert codec.version == dmr.OPENDMR_TX_VERSION, codec.version
-          # The original 248-entry table was indexed by a 12-bit value. Exhaust
-          # every seed against the independently calculated standard DMR mask.
+          # The public encoder now returns documented DVSI A+B+C order directly.
+          # Exhaust all 4096 A payloads with C1=0: canonical B must then be the
+          # independently calculated 23-bit DMR whitening mask.
           for seed in range(4096):
-              bits = np.r_[dmr.int_bits(seed, 12), np.zeros(37, dtype=np.uint8)]
-              encoded = dmr.bytes_bits(codec._encode_49bit(bits))
+              params = (
+                  ((seed >> 8) & 0xF) << 3,
+                  ((seed >> 4) & 0xF) << 1,
+                  (seed & 0xF) << 1,
+                  0, 0, 0, 0, 0, 0,
+              )
+              encoded = dmr.bytes_bits(codec._encode_params_frame(params))
               actual = 0
               for bit in encoded[24:47]:
                   actual = (actual << 1) | int(bit)
               assert actual == dmr.dmr_prng_mask(seed), (seed, actual)
           frame = codec.encode(np.zeros(160, dtype=np.int16))
           assert len(frame) == 9
+          canonical = dmr.bytes_bits(frame)
+          assert dmr._ota_to_can(dmr._can_to_ota(frame)) == frame
           pcm, errors = codec.decode(frame)
           assert len(pcm) == 160
           print("OpenDMR fixed TX bridge:", codec.lib._name, frame.hex(), "decode errors", errors)

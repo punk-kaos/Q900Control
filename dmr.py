@@ -226,7 +226,7 @@ def dmr_prng_mask(seed):
  for _ in range(23):p=(173*p+13849)&0xFFFF;mask=(mask<<1)|(p>>15)
  return mask
 
-OPENDMR_TX_VERSION="1.0.0-q900fix3"
+OPENDMR_TX_VERSION="1.0.0-q900fix4"
 
 class OpenDmrCodec:
  def __init__(self,enc=False,dec=False):
@@ -248,24 +248,10 @@ class OpenDmrCodec:
    L.opendmr_encoder_set_gain.argtypes=(ctypes.c_void_p,ctypes.c_int);L.opendmr_encoder_set_gain.restype=None
   if hasattr(L,"opendmr_encoder_reset"):L.opendmr_encoder_reset.argtypes=(ctypes.c_void_p,)
   if hasattr(L,"opendmr_decoder_reset"):L.opendmr_decoder_reset.argtypes=(ctypes.c_void_p,)
-  self._encode_params=getattr(L,"_ZN10MBEEncoder17encode_dmr_paramsEPKsPi",None)
-  self._encode_ota=getattr(L,"_ZN10MBEEncoder10encode_dmrEPKhPh",None)
-  if self._encode_params is not None:
-   self._encode_params.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_int16),ctypes.POINTER(ctypes.c_int));self._encode_params.restype=None
-  if self._encode_ota is not None:
-   self._encode_ota.argtypes=(ctypes.c_void_p,ctypes.POINTER(ctypes.c_uint8),ctypes.POINTER(ctypes.c_uint8));self._encode_ota.restype=None
+  self._encode_params_test=getattr(L,"opendmr_q900_encode_params",None)
+  if self._encode_params_test is not None:
+   self._encode_params_test.argtypes=(ctypes.POINTER(ctypes.c_int),ctypes.POINTER(ctypes.c_uint8));self._encode_params_test.restype=ctypes.c_bool
   self.decoder=L.opendmr_decoder_create() if dec else None;self.encoder=L.opendmr_encoder_create() if enc else None
-  if enc and (self._encode_params is None or self._encode_ota is None):
-   if self.encoder:L.opendmr_encoder_destroy(self.encoder);self.encoder=None
-   raise RuntimeError("OpenDMR TX compatibility symbols unavailable; rebuild MW0MWZ/OpenDMR without hidden C++ symbols")
- def _encoder_impl(self):
-  if not self.encoder:raise RuntimeError("OpenDMR encoder is not open")
-  # opendmr_encoder's first field is its MBEEncoder*. Read it each time because
-  # opendmr_encoder_reset() destroys/recreates that object and changes the pointer.
-  wrapper=ctypes.cast(ctypes.c_void_p(self.encoder),ctypes.POINTER(ctypes.c_void_p))
-  impl=wrapper[0]
-  if not impl:raise RuntimeError("OpenDMR internal encoder is unavailable")
-  return impl
  def set_gain_db(self,gain_db):
   if not self.encoder:raise RuntimeError("OpenDMR encoder is not open")
   fn=getattr(self.lib,"opendmr_encoder_set_gain",None)
@@ -276,24 +262,21 @@ class OpenDmrCodec:
   if not self.lib.opendmr_decode(self.decoder,inp,out,ctypes.byref(err)):raise RuntimeError("OpenDMR decode failed")
   return np.ctypeslib.as_array(out).copy(),err.value
  def encode(self,pcm):
-  # MW0MWZ/OpenDMR 1.0's public opendmr_encode() reconstructs the 49 AMBE
-  # parameter bits in simple b[0]..b[8] order. DMR's AMBE 3600x2450 layout is
-  # not sequential, and that public path also omits the established >>1 on the
-  # Golay(23,12) B codeword. Use the library's older OP25-derived encoder path
-  # instead: obtain b[0..8], apply its encode_49bit() permutation here, then let
-  # MBEEncoder::encode_dmr() perform the proven Golay/whitening/OTA interleave.
-  words=np.ascontiguousarray(pcm,dtype=np.int16).reshape(-1)
+  # q900fix4 repairs OpenDMR's public encoder so it returns exactly the documented
+  # DVSI/canonical 72-bit frame: A(24) + B(23) + C(25). Keep that canonical frame
+  # here; DmrVoiceTransmitter performs the one and only OTA interleave later.
+  words=np.ascontiguousarray(pcm,dtype="<i2").reshape(-1)
   if len(words)!=160:raise ValueError("OpenDMR encode needs exactly 160 PCM samples")
-  inp=(ctypes.c_int16*160).from_buffer_copy(words.tobytes());params=(ctypes.c_int*9)()
-  self._encode_params(self._encoder_impl(),inp,params)
-  return self._encode_49bit(ambe_params_bits(params))
- def _encode_49bit(self,bits):
-  packed=bits_bytes(np.asarray(bits,dtype=np.uint8).reshape(49))
-  raw=(ctypes.c_uint8*len(packed)).from_buffer_copy(packed);ota=(ctypes.c_uint8*9)()
-  self._encode_ota(self._encoder_impl(),raw,ota)
-  # DmrVoiceTransmitter keeps AMBE frames in canonical A(24)+B(23)+C(25)
-  # order and performs the final on-air placement when building each burst.
-  return _ota_to_can(bytes_bits(bytes(ota)))
+  inp=(ctypes.c_int16*160).from_buffer_copy(words.tobytes());out=(ctypes.c_uint8*9)()
+  if not self.lib.opendmr_encode(self.encoder,inp,out):raise RuntimeError("OpenDMR encode failed")
+  return bytes(out)
+ def _encode_params_frame(self,params):
+  if self._encode_params_test is None:raise RuntimeError("q900fix parameter test hook unavailable")
+  values=np.ascontiguousarray(params,dtype=np.int32).reshape(-1)
+  if len(values)!=9:raise ValueError("AMBE parameter test needs 9 values")
+  inp=(ctypes.c_int*9)(*[int(x) for x in values]);out=(ctypes.c_uint8*9)()
+  if not self._encode_params_test(inp,out):raise RuntimeError("OpenDMR parameter test encode failed")
+  return bytes(out)
  def close(self):
   if self.decoder:self.lib.opendmr_decoder_destroy(self.decoder);self.decoder=None
   if self.encoder:self.lib.opendmr_encoder_destroy(self.encoder);self.encoder=None
