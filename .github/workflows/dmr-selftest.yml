@@ -2,7 +2,7 @@ name: SDR DMR self-test
 
 on:
   push:
-    branches: ["main", "feature/sdr-dmr"]
+    branches: ["main", "feature/sdr-dmr", "fix/dmr-tx-path-review"]
   pull_request:
     paths:
       - "dmr.py"
