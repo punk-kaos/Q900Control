@@ -65,10 +65,12 @@ jobs:
                   assert w.getframerate() == 8000 and w.getnframes() == 480
 
           internal = q900_control.generate_dmr_vocoder_internal_gain_sweep("/tmp/q900-dmr-vocoder")
-          assert [row[0] for row in internal] == [0.0, 6.0, 12.0, 15.0, 18.0]
-          for gain_db, path, errors, failures in internal:
+          assert [row[0] for row in internal] == [6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0]
+          for attenuation_db, path, matched, rms_dbfs, peak_dbfs, errors, failures in internal:
               assert errors == 0 and failures == 0
-              with wave.open(path, "rb") as w:
-                  assert w.getframerate() == 8000 and w.getnframes() == 480
+              assert rms_dbfs <= 0.0 and peak_dbfs <= 0.0
+              for wav_path in (path, matched):
+                  with wave.open(wav_path, "rb") as w:
+                      assert w.getframerate() == 8000 and w.getnframes() == 480
           PY
       - run: QT_QPA_PLATFORM=offscreen python q900_control.py --self-test
